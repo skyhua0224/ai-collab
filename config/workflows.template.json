@@ -1,0 +1,340 @@
+{
+  "design-review": {
+    "description": "Visual design workflow with Gemini as primary and Claude as reviewer",
+    "phases": [
+      {
+        "agent": "gemini",
+        "action": "design",
+        "output": "HTML/CSS mockup or design implementation",
+        "timeout": 600,
+        "skills": ["frontend-mockup-designer", "responsive-layout", "dark-mode-consistency"]
+      },
+      {
+        "agent": "claude",
+        "action": "review",
+        "output": "Design review and improvement suggestions",
+        "timeout": 120,
+        "skills": ["code-review", "accessibility-check"]
+      }
+    ]
+  },
+  "architecture-review": {
+    "description": "Architecture design workflow with Claude as primary and Codex/Gemini validators",
+    "phases": [
+      {
+        "agent": "claude",
+        "action": "design",
+        "output": "Architecture design and technical decisions",
+        "timeout": 180,
+        "skills": ["architecture-review", "tradeoff-analysis"]
+      },
+      {
+        "agent": "codex",
+        "action": "validate-implementation",
+        "output": "Implementation feasibility and decomposition",
+        "timeout": 180,
+        "skills": ["implementation-check", "dependency-map"]
+      },
+      {
+        "agent": "gemini",
+        "action": "validate-ecosystem",
+        "output": "Ecosystem and tooling alternatives",
+        "timeout": 240,
+        "skills": ["ecosystem-research", "alternatives-matrix"]
+      }
+    ]
+  },
+  "code-review": {
+    "description": "Code implementation workflow with Codex as primary and Claude as reviewer",
+    "phases": [
+      {
+        "agent": "codex",
+        "action": "implement",
+        "output": "Feature implementation",
+        "timeout": 300,
+        "skills": ["feature-implementation", "tests-first"]
+      },
+      {
+        "agent": "claude",
+        "action": "review",
+        "output": "Code quality review and suggestions",
+        "timeout": 120,
+        "skills": ["code-review", "security-review"]
+      },
+      {
+        "agent": "codex",
+        "action": "refine",
+        "output": "Final patched implementation",
+        "timeout": 240,
+        "skills": ["integration-check", "regression-fix"]
+      }
+    ]
+  },
+  "full-stack": {
+    "description": "Full-stack development workflow for superapp projects",
+    "phases": [
+      {
+        "agent": "claude",
+        "action": "plan",
+        "output": "Technical plan and architecture boundaries",
+        "timeout": 180,
+        "skills": ["architecture-review", "scope-control"]
+      },
+      {
+        "agent": "gemini",
+        "action": "design-frontend",
+        "output": "Mockup/UI strategy and interaction drafts",
+        "timeout": 600,
+        "skills": ["frontend-mockup-designer", "ux-flow"]
+      },
+      {
+        "agent": "codex",
+        "action": "implement-core",
+        "output": "Backend/frontend integration and core business logic",
+        "timeout": 420,
+        "skills": ["api-integration", "state-management", "integration-check"]
+      },
+      {
+        "agent": "claude",
+        "action": "review-gate",
+        "output": "Final review and go/no-go recommendation",
+        "timeout": 180,
+        "skills": ["code-review", "security-review", "release-readiness"]
+      }
+    ]
+  },
+  "native-macos": {
+    "description": "Native macOS Swift workflow",
+    "phases": [
+      {
+        "agent": "gemini",
+        "action": "ux-and-api-survey",
+        "output": "Interaction and API alternatives",
+        "timeout": 300,
+        "skills": ["apple-hig-check", "ecosystem-research"]
+      },
+      {
+        "agent": "codex",
+        "action": "implement-swift",
+        "output": "Swift/AppKit/SwiftUI implementation",
+        "timeout": 360,
+        "skills": ["swift-native", "lifecycle-handling", "audio-pipeline"]
+      },
+      {
+        "agent": "claude",
+        "action": "review-and-risk",
+        "output": "Review findings with risk and remediation",
+        "timeout": 180,
+        "skills": ["code-review", "stability-audit"]
+      }
+    ]
+  },
+  "mobile-native": {
+    "description": "Android/iOS native workflow",
+    "phases": [
+      {
+        "agent": "gemini",
+        "action": "design-flow",
+        "output": "Mobile UX flow and platform constraints",
+        "timeout": 300,
+        "skills": ["mobile-ux", "platform-guidelines"]
+      },
+      {
+        "agent": "codex",
+        "action": "implement-native",
+        "output": "Kotlin/Swift implementation and state handling",
+        "timeout": 360,
+        "skills": ["mobile-native", "offline-sync", "performance"]
+      },
+      {
+        "agent": "claude",
+        "action": "security-and-quality-review",
+        "output": "Security/privacy and quality review",
+        "timeout": 180,
+        "skills": ["security-review", "code-review"]
+      }
+    ]
+  },
+  "systems-tooling": {
+    "description": "Tooling workflow for bash/python/node/rust projects",
+    "phases": [
+      {
+        "agent": "claude",
+        "action": "scope-and-interface",
+        "output": "CLI contract, edge cases, and failure modes",
+        "timeout": 150,
+        "skills": ["interface-design", "failure-analysis"]
+      },
+      {
+        "agent": "codex",
+        "action": "implement-tooling",
+        "output": "Implementation across scripting/runtime stack",
+        "timeout": 360,
+        "skills": ["automation", "cli-tooling", "release-pipeline"]
+      },
+      {
+        "agent": "claude",
+        "action": "review-hardening",
+        "output": "Reliability and maintainability hardening",
+        "timeout": 150,
+        "skills": ["code-review", "operational-hardening"]
+      }
+    ]
+  },
+  "game-dev": {
+    "description": "Game workflow for Unity/UE/Ren'Py",
+    "phases": [
+      {
+        "agent": "gemini",
+        "action": "gameplay-design",
+        "output": "Gameplay loop, level/event pacing, UI flow",
+        "timeout": 420,
+        "skills": ["game-design", "level-flow", "ui-mockup"]
+      },
+      {
+        "agent": "codex",
+        "action": "system-implementation",
+        "output": "Core gameplay systems and data flow",
+        "timeout": 420,
+        "skills": ["state-machine", "performance", "save-load"]
+      },
+      {
+        "agent": "claude",
+        "action": "balance-and-risk-review",
+        "output": "Review on balance, exploits, and maintenance risks",
+        "timeout": 180,
+        "skills": ["code-review", "risk-analysis"]
+      }
+    ]
+  },
+  "debug-fix-verify": {
+    "description": "Debug workflow with rapid diagnosis and verification",
+    "phases": [
+      {
+        "agent": "codex",
+        "action": "diagnose",
+        "output": "Root-cause analysis",
+        "timeout": 240,
+        "skills": ["systematic-debugging", "trace-analysis"]
+      },
+      {
+        "agent": "codex",
+        "action": "fix",
+        "output": "Patch implementation",
+        "timeout": 300,
+        "skills": ["targeted-fix", "regression-check"]
+      },
+      {
+        "agent": "claude",
+        "action": "verify",
+        "output": "Validation report and residual risks",
+        "timeout": 150,
+        "skills": ["verification", "risk-review"]
+      }
+    ]
+  },
+  "security-remediation": {
+    "description": "Security audit and remediation workflow",
+    "phases": [
+      {
+        "agent": "claude",
+        "action": "audit",
+        "output": "Security findings and severity",
+        "timeout": 210,
+        "skills": ["owasp-checklist", "threat-model"]
+      },
+      {
+        "agent": "codex",
+        "action": "remediate",
+        "output": "Mitigation patches",
+        "timeout": 300,
+        "skills": ["secure-implementation", "hardening"]
+      },
+      {
+        "agent": "gemini",
+        "action": "cross-check",
+        "output": "Alternative mitigation and ecosystem checks",
+        "timeout": 210,
+        "skills": ["ecosystem-research", "security-variants"]
+      }
+    ]
+  },
+  "research-synthesis": {
+    "description": "Research workflow with synthesis and implementation recommendation",
+    "phases": [
+      {
+        "agent": "gemini",
+        "action": "research",
+        "output": "Landscape and options",
+        "timeout": 300,
+        "skills": ["ecosystem-research", "alternatives-matrix"]
+      },
+      {
+        "agent": "claude",
+        "action": "synthesize",
+        "output": "Decision framework with trade-offs",
+        "timeout": 180,
+        "skills": ["tradeoff-analysis", "decision-log"]
+      },
+      {
+        "agent": "codex",
+        "action": "execution-plan",
+        "output": "Pragmatic implementation plan",
+        "timeout": 180,
+        "skills": ["implementation-plan", "risk-reduction"]
+      }
+    ]
+  },
+  "test-driven": {
+    "description": "TDD workflow with red-green-refactor",
+    "phases": [
+      {
+        "agent": "codex",
+        "action": "write-tests",
+        "output": "Failing tests (red)",
+        "timeout": 180,
+        "skills": ["tdd", "test-design"]
+      },
+      {
+        "agent": "codex",
+        "action": "implement-to-pass",
+        "output": "Passing implementation (green)",
+        "timeout": 240,
+        "skills": ["minimal-implementation", "regression-guard"]
+      },
+      {
+        "agent": "claude",
+        "action": "review-refactor",
+        "output": "Refactor recommendations and quality checks",
+        "timeout": 150,
+        "skills": ["code-review", "maintainability"]
+      }
+    ]
+  },
+  "docs-review": {
+    "description": "Documentation/blog drafting workflow",
+    "phases": [
+      {
+        "agent": "claude",
+        "action": "draft",
+        "output": "Structured draft and key arguments",
+        "timeout": 150,
+        "skills": ["technical-writing", "structure-design"]
+      },
+      {
+        "agent": "gemini",
+        "action": "expand-and-polish",
+        "output": "Examples, alternatives, and readability polish",
+        "timeout": 180,
+        "skills": ["reader-experience", "examples-crafting"]
+      },
+      {
+        "agent": "codex",
+        "action": "format-and-publish",
+        "output": "Final markdown formatting and publication checklist",
+        "timeout": 120,
+        "skills": ["formatting", "publication-checklist"]
+      }
+    ]
+  }
+}

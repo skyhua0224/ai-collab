@@ -1,0 +1,8 @@
+include README.md
+include README_EN.md
+include LICENSE
+include pyproject.toml
+include setup.py
+recursive-include ai_collab *.py
+recursive-include config *.json
+recursive-include tests *.py
