@@ -114,6 +114,13 @@ python3 -m build
 python3 -m twine check dist/*
 ```
 
+## Contact
+
+- 📧 Email: dev@sky-hua.xyz
+- 💬 Telegram: @skyhua
+- 🐧 QQ: 2110591491
+- 🔗 GitHub Issues: [Open an issue](https://github.com/skyhua0224/ai-collab/issues)
+
 ## License
 
 [MIT](./LICENSE)

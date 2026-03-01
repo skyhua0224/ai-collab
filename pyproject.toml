@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-collab"
-version = "0.1.2"
+version = "0.1.3"
 description = "AI Collaboration System / 智能多 Agent 协作编排框架"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [
-    {name = "Sky Hua", email = "skyhua@users.noreply.github.com"}
+    {name = "Sky Hua", email = "dev@sky-hua.xyz"}
 ]
 keywords = ["ai", "collaboration", "cli", "workflow", "orchestration"]
 classifiers = [

@@ -1,8 +1,8 @@
 """AI Collaboration System - Multi-AI orchestration and workflow management."""
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __author__ = "Sky Hua"
-__email__ = "skyhua@users.noreply.github.com"
+__email__ = "dev@sky-hua.xyz"
 
 from ai_collab.core.config import Config
 from ai_collab.core.detector import CollaborationDetector
