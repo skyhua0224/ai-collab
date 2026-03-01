@@ -2,7 +2,7 @@
 
 A terminal-first multi-agent orchestration framework for `Codex`, `Claude`, and `Gemini`.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/skyhua/ai-collab/ci.yml?branch=main)](https://github.com/skyhua/ai-collab/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/skyhua0224/ai-collab/ci.yml?branch=main)](https://github.com/skyhua0224/ai-collab/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/ai-collab)](https://pypi.org/project/ai-collab/)
 [![Python](https://img.shields.io/pypi/pyversions/ai-collab)](https://pypi.org/project/ai-collab/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -36,7 +36,7 @@ ai-collab run --help
 ### Install from Source
 
 ```bash
-git clone https://github.com/skyhua/ai-collab.git
+git clone https://github.com/skyhua0224/ai-collab.git
 cd ai-collab
 python3 -m pip install -e .
 ```

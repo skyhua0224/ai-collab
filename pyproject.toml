@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-collab"
-version = "0.1.1"
+version = "0.1.2"
 description = "AI Collaboration System / 智能多 Agent 协作编排框架"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -42,8 +42,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/skyhua/ai-collab"
-Repository = "https://github.com/skyhua/ai-collab"
+Homepage = "https://github.com/skyhua0224/ai-collab"
+Repository = "https://github.com/skyhua0224/ai-collab"
 
 [project.scripts]
 ai-collab = "ai_collab.cli:project_main"

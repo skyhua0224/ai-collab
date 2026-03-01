@@ -18,7 +18,7 @@ which codex claude gemini tmux
 ## 1) 安装
 
 ```bash
-git clone https://github.com/skyhua/ai-collab.git
+git clone https://github.com/skyhua0224/ai-collab.git
 cd ai-collab
 python3 -m pip install -e .
 ```
