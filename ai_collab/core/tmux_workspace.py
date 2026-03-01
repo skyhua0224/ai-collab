@@ -17,6 +17,7 @@ import tempfile
 import time
 from uuid import uuid4
 from pathlib import Path
+from typing import Optional
 
 AGENTS = ["codex", "claude", "gemini"]
 CONTROLLER_PANE_TITLE = "ai-collab:controller"
@@ -67,7 +68,7 @@ def current_tmux_pane_id() -> str:
     return _run_tmux_capture(["display-message", "-p", "#{pane_id}"])
 
 
-def current_tmux_session_name(*, pane_id: str | None = None) -> str:
+def current_tmux_session_name(*, pane_id: Optional[str] = None) -> str:
     """Return tmux session name for a pane (or current pane)."""
     args = ["display-message", "-p", "#{session_name}"]
     if pane_id:
@@ -172,7 +173,7 @@ def create_inline_controller_workspace(
     *,
     cwd: Path,
     controller: str,
-    parent_pane: str | None = None,
+    parent_pane: Optional[str] = None,
     autorun: bool = True,
     split_percent: int = 45,
 ) -> tuple[str, str]:

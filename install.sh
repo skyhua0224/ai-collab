@@ -7,10 +7,10 @@ echo "🚀 Installing AI Collaboration System..."
 
 # Check Python version
 PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}' | cut -d. -f1,2)
-REQUIRED_VERSION="3.8"
+REQUIRED_VERSION="3.9"
 
 if [ "$(printf '%s\n' "$REQUIRED_VERSION" "$PYTHON_VERSION" | sort -V | head -n1)" != "$REQUIRED_VERSION" ]; then
-    echo "❌ Error: Python 3.8 or higher is required"
+    echo "❌ Error: Python 3.9 or higher is required"
     echo "   Current version: $PYTHON_VERSION"
     exit 1
 fi

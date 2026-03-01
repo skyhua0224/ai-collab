@@ -1,4 +1,4 @@
-# AI Collaboration System
+# AI Collaboration System / 智能协作系统
 
 面向 Codex / Claude / Gemini 的终端多 Agent 协作编排框架。
 
@@ -24,7 +24,6 @@
 
 - **执行任务**：`ai-collab "<task>"`
 - **管理操作**：`ai-collab <subcommand>`（如 `init`、`status`、`config`）
-- **兼容说明**：不再提供旧命令 `auto-collab` 别名
 
 查看完整执行参数：
 

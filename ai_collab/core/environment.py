@@ -9,7 +9,7 @@ import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Optional
 
 from ai_collab.core.config import ProviderConfig
 
@@ -25,7 +25,7 @@ class ProviderRuntimeStatus:
     version: str = ""
 
 
-def detect_os_name(system_name: str | None = None) -> str:
+def detect_os_name(system_name: Optional[str] = None) -> str:
     """Return normalized OS name: windows/linux/macos/unknown."""
     raw = (system_name or platform.system()).strip().lower()
     if raw.startswith("darwin"):
@@ -37,7 +37,7 @@ def detect_os_name(system_name: str | None = None) -> str:
     return "unknown"
 
 
-def resolve_executable(cli: str, *, os_name: str | None = None) -> str:
+def resolve_executable(cli: str, *, os_name: Optional[str] = None) -> str:
     """Extract executable token from provider CLI string."""
     normalized_os = detect_os_name(os_name)
     posix = normalized_os != "windows"
@@ -72,7 +72,7 @@ def _read_version(executable: str) -> str:
 def detect_provider_status(
     providers: Mapping[str, ProviderConfig],
     *,
-    os_name: str | None = None,
+    os_name: Optional[str] = None,
 ) -> dict[str, ProviderRuntimeStatus]:
     """Detect local availability for each provider CLI."""
     normalized_os = detect_os_name(os_name)
@@ -89,4 +89,3 @@ def detect_provider_status(
             version=_read_version(exe) if available else "",
         )
     return statuses
-

@@ -1,4 +1,4 @@
-# AI Collaboration System
+# AI Collaboration System / 智能协作系统
 
 A terminal-first multi-agent orchestration framework for `Codex`, `Claude`, and `Gemini`.
 
@@ -24,7 +24,6 @@ The project exposes one command: `ai-collab`.
 
 1. **Run tasks**: `ai-collab "<task>"`
 2. **Admin actions**: `ai-collab <subcommand>` (`init`, `status`, `config`, etc.)
-3. **Compatibility note**: the legacy `auto-collab` alias is no longer supported
 
 Show runner options:
 

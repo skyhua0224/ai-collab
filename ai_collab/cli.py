@@ -448,7 +448,7 @@ def _discover_provider_models(provider: str, provider_config, *, timeout_sec: in
     return uniq
 
 
-def _questionary_style(questionary_module, provider: str | None = None):
+def _questionary_style(questionary_module, provider: Optional[str] = None):
     base = [
         ("qmark", "fg:#94A3B8 bold"),
         ("question", "fg:#E5E7EB bold"),
@@ -559,8 +559,8 @@ def _select_decision(
     options: list[tuple[str, str]],
     *,
     questionary_module,
-    default_value: str | None = None,
-    provider: str | None = None,
+    default_value: Optional[str] = None,
+    provider: Optional[str] = None,
 ):
     """Choose one option from list[(value, label)] with tui/text UI."""
     if questionary_module:
@@ -586,7 +586,7 @@ def _ask_yes_no(
     lang: str,
     questionary_module,
     default_yes: bool = True,
-    provider: str | None = None,
+    provider: Optional[str] = None,
 ) -> bool:
     """Localized yes/no prompt for both TUI and text mode."""
     yes_value = _msg(lang, "yes_value")
@@ -1277,7 +1277,7 @@ def _ask_text_input(prompt: str, *, questionary_module, default_value: str = "")
 def _collect_runner_inputs(
     *,
     args,
-    provider_prefix: str | None,
+    provider_prefix: Optional[str],
     default_provider: str,
     providers: list[str],
     lang: str,
@@ -1345,7 +1345,7 @@ def _write_controller_prompt_file(*, cwd: Path, controller: str, text: str) -> P
     return path
 
 
-def _resolve_editor_command() -> list[str] | None:
+def _resolve_editor_command() -> Optional[list[str]]:
     """Resolve preferred editor command."""
     candidates: list[str] = []
     editor_raw = os.environ.get("EDITOR", "").strip()
@@ -1555,8 +1555,8 @@ def _prepare_controller_prompt_document(
     decision_ui,
     interactive: bool,
     edit_prompt: bool,
-    prompt_text_override: str | None = None,
-) -> str | None:
+    prompt_text_override: Optional[str] = None,
+) -> Optional[str]:
     """Generate/edit/confirm controller prompt doc. Return final prompt or None if canceled."""
     prompt_text = prompt_text_override or _build_controller_prompt_document(
         task=task,
@@ -1719,7 +1719,7 @@ Mandatory constraints:
 """
 
 
-def _extract_json_object(text: str) -> dict[str, Any] | None:
+def _extract_json_object(text: str) -> Optional[dict[str, Any]]:
     """Extract first JSON object from arbitrary text."""
     decoder = json.JSONDecoder()
     for idx, char in enumerate(text):
@@ -1739,7 +1739,7 @@ def _request_controller_plan(
     config: Config,
     controller: str,
     prompt_text: str,
-) -> tuple[dict[str, Any] | None, str | None]:
+) -> Tuple[Optional[dict[str, Any]], Optional[str]]:
     """Ask controller model for orchestration plan JSON."""
     provider_config = config.providers.get(controller)
     if not provider_config:
@@ -2361,7 +2361,7 @@ def _launch_tmux_orchestration(
     session: str = "ai-collab-live",
     lang: str = "en-US",
     prewarm_subagents: bool = False,
-    controller_prompt_override: str | None = None,
+    controller_prompt_override: Optional[str] = None,
     tmux_target: str = "session",
 ) -> bool:
     if not _can_launch_tmux(result):
@@ -3005,12 +3005,12 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
         else:
             _print_orchestration_plan(result, lang=lang)
 
-        controller_plan: dict[str, Any] | None = None
+        controller_plan: Optional[dict[str, Any]] = None
         controller_plan_checked = False
         controller_plan_rejected = False
         controller_plan_adjustment_notes = ""
 
-        def ensure_controller_plan() -> dict[str, Any] | None:
+        def ensure_controller_plan() -> Optional[dict[str, Any]]:
             nonlocal controller_plan, controller_plan_checked, controller_plan_rejected, controller_plan_adjustment_notes
             if controller_plan_checked:
                 return controller_plan
@@ -3088,15 +3088,15 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
             controller_plan = plan
             return controller_plan
 
-        prepared_controller_prompt: str | None = None
+        prepared_controller_prompt: Optional[str] = None
         prompt_prepared = False
 
-        def ensure_controller_prompt() -> str | None:
+        def ensure_controller_prompt() -> Optional[str]:
             nonlocal prepared_controller_prompt, prompt_prepared
             if prompt_prepared:
                 return prepared_controller_prompt
             prompt_prepared = True
-            prompt_override: str | None = None
+            prompt_override: Optional[str] = None
             plan = ensure_controller_plan()
             if controller_plan_rejected:
                 return None

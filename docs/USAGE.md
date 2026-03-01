@@ -8,7 +8,6 @@ This guide covers production usage patterns for the unified `ai-collab` command.
 
 1. **Runner mode**: `ai-collab "<task>"`
 2. **Admin mode**: `ai-collab <subcommand>`
-3. **Compatibility**: legacy `auto-collab` alias is not supported
 
 Runner option reference:
 

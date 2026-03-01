@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -42,12 +42,12 @@ class ProjectProfile(BaseModel):
 class ProjectProfiler:
     """Infers project categories from workspace files."""
 
-    def __init__(self, root: Path | None = None, *, max_scan_seconds: float = 1.5, max_walk_entries: int = 12000):
+    def __init__(self, root: Optional[Path] = None, *, max_scan_seconds: float = 1.5, max_walk_entries: int = 12000):
         self.root = Path(root or Path.cwd()).resolve()
         self.max_scan_seconds = max(0.2, float(max_scan_seconds))
         self.max_walk_entries = max(200, int(max_walk_entries))
         self._scan_deadline = 0.0
-        self._candidate_cache: List[str] | None = None
+        self._candidate_cache: Optional[List[str]] = None
         self._fast_mode = False
 
     def detect(self) -> ProjectProfile:

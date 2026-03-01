@@ -4,7 +4,7 @@
 
 ## 前置条件
 
-1. Python 版本 `>=3.8`
+1. Python 版本 `>=3.9`
 2. 已安装至少一个 Agent CLI 工具：`codex` / `claude` / `gemini`
 3. 如需可视化协作过程，需安装 `tmux`
 
