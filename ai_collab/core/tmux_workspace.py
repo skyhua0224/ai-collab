@@ -10,6 +10,7 @@ Design:
 
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 import subprocess
@@ -57,6 +58,45 @@ def _interactive_cmd(agent: str) -> str:
         "claude": "claude",
         "gemini": "gemini",
     }.get(agent, agent)
+
+
+def _interactive_shell() -> str:
+    """Return interactive shell executable for pane bootstrap."""
+    return os.environ.get("SHELL", "zsh")
+
+
+def _dispatch_delay_seconds() -> float:
+    """Delay before command dispatch to avoid racing shell startup."""
+    raw = os.environ.get("AI_COLLAB_PANE_DISPATCH_DELAY_SECONDS", "").strip()
+    if not raw:
+        return 0.6
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.6
+    if value < 0:
+        return 0.6
+    return min(value, 5.0)
+
+
+def _dispatch_agent_command(*, pane_id: str, command: str) -> None:
+    """
+    Method-1 dispatch: open shell pane first, then send command.
+
+    This avoids missing input when provider CLI starts slower than injected text.
+    """
+    wait_for_pane_quiet(
+        pane_id=pane_id,
+        timeout_seconds=4.0,
+        stable_checks=1,
+        poll_interval=0.2,
+    )
+    send_pane_text(
+        pane_id=pane_id,
+        text=command,
+        press_enter=True,
+        delay_seconds=_dispatch_delay_seconds(),
+    )
 
 
 def _set_pane_title(*, pane_id: str, title: str) -> None:
@@ -138,6 +178,7 @@ def create_controller_workspace(
             str(cwd),
             "-n",
             "ai-collab",
+            _interactive_shell(),
         ]
     )
 
@@ -151,21 +192,15 @@ def create_controller_workspace(
         session=session,
     )
     _set_pane_title(pane_id=controller_pane, title=CONTROLLER_PANE_TITLE)
-    controller_script = _controller_script(
-        agent=controller,
-        cwd=cwd,
-        autorun=autorun,
-    )
-    _run_tmux(
-        [
-            "send-keys",
-            "-t",
-            controller_pane,
-            f"zsh -lc {shlex.quote(controller_script)}",
-            "C-m",
-        ]
-    )
-
+    if autorun:
+        _dispatch_agent_command(
+            pane_id=controller_pane,
+            command=_controller_script(
+                agent=controller,
+                cwd=cwd,
+                autorun=True,
+            ),
+        )
     return controller_pane
 
 
@@ -206,6 +241,7 @@ def create_inline_controller_workspace(
             str(pct),
             "-c",
             str(cwd),
+            _interactive_shell(),
         ]
     )
 
@@ -215,42 +251,33 @@ def create_inline_controller_workspace(
         session=session,
     )
     _set_pane_title(pane_id=controller_pane, title=CONTROLLER_PANE_TITLE)
-    controller_script = _controller_script(
-        agent=controller,
-        cwd=cwd,
-        autorun=autorun,
-    )
-    _run_tmux(
-        [
-            "send-keys",
-            "-t",
-            controller_pane,
-            f"zsh -lc {shlex.quote(controller_script)}",
-            "C-m",
-        ]
-    )
+    if autorun:
+        _dispatch_agent_command(
+            pane_id=controller_pane,
+            command=_controller_script(
+                agent=controller,
+                cwd=cwd,
+                autorun=True,
+            ),
+        )
     return session, controller_pane
 
 
 def _controller_script(*, agent: str, cwd: Path, autorun: bool) -> str:
-    """Generate script for controller pane."""
-    heading = ""
-    tips = ""
+    """Generate startup command for controller pane."""
+    base = "export AI_COLLAB_ACTIVE=1; export AI_COLLAB_ROLE=controller"
 
     if autorun:
         cmd = _interactive_cmd(agent)
-        launch = (
-            "export AI_COLLAB_ACTIVE=1; export AI_COLLAB_ROLE=controller; "
+        return (
+            f"{base}; "
             f"if command -v {shlex.quote(cmd)} >/dev/null 2>&1; then "
             f"{cmd}; "
             "else "
             f"echo 'Command not found: {cmd}'; "
-            "fi; "
+            "fi"
         )
-    else:
-        launch = "export AI_COLLAB_ACTIVE=1; export AI_COLLAB_ROLE=controller; "
-
-    return f"{heading}{tips}{launch}exec $SHELL"
+    return base
 
 
 def spawn_subagent_pane(
@@ -306,6 +333,7 @@ def spawn_subagent_pane(
             *split_args,
             "-c",
             str(cwd),
+            _interactive_shell(),
         ]
     )
 
@@ -319,39 +347,28 @@ def spawn_subagent_pane(
         pane_id=new_pane,
         title=f"{SUBAGENT_PANE_TITLE_PREFIX}{agent}",
     )
-    subagent_script = _subagent_script(
-        agent=agent,
-        cwd=cwd,
-        task_description=task_description,
+    _dispatch_agent_command(
+        pane_id=new_pane,
+        command=_subagent_script(
+            agent=agent,
+            cwd=cwd,
+            task_description=task_description,
+        ),
     )
-    _run_tmux(
-        [
-            "send-keys",
-            "-t",
-            new_pane,
-            f"zsh -lc {shlex.quote(subagent_script)}",
-            "C-m",
-        ]
-    )
-
     return new_pane
 
 
 def _subagent_script(*, agent: str, cwd: Path, task_description: str) -> str:
-    """Generate script for sub-agent pane."""
-    heading = ""
-
+    """Generate startup command for sub-agent pane."""
     cmd = _interactive_cmd(agent)
-    launch = (
+    return (
         f"export AI_COLLAB_ACTIVE=1; export AI_COLLAB_ROLE=subagent; export AI_COLLAB_TASK={shlex.quote(task_description)}; "
         f"if command -v {shlex.quote(cmd)} >/dev/null 2>&1; then "
         f"{cmd}; "
         "else "
         f"echo 'Command not found: {cmd}'; "
-        "fi; "
+        "fi"
     )
-
-    return f"{heading}{launch}exec $SHELL"
 
 
 def close_subagent_pane(*, pane_id: str) -> None:
@@ -378,6 +395,37 @@ def send_pane_text(*, pane_id: str, text: str, press_enter: bool = True, delay_s
         _run_tmux(["send-keys", "-t", pane_id, "C-m"])
 
 
+def type_pane_text(
+    *,
+    pane_id: str,
+    text: str,
+    press_enter: bool = True,
+    char_delay_seconds: float = 0.015,
+    delay_seconds: float = 0.0,
+) -> None:
+    """
+    Type text into a pane character-by-character.
+
+    Useful for interactive chat CLIs that treat instant line injection as pasted text.
+    """
+    if delay_seconds > 0:
+        time.sleep(delay_seconds)
+
+    if text:
+        delay = max(0.0, char_delay_seconds)
+        for char in text:
+            if char == "\n":
+                _run_tmux(["send-keys", "-t", pane_id, "C-m"])
+            else:
+                _run_tmux(["send-keys", "-t", pane_id, "-l", "--", char])
+            if delay > 0:
+                time.sleep(delay)
+        if press_enter:
+            _run_tmux(["send-keys", "-t", pane_id, "C-m"])
+    elif press_enter:
+        _run_tmux(["send-keys", "-t", pane_id, "C-m"])
+
+
 def paste_pane_text(*, pane_id: str, text: str, press_enter: bool = True, delay_seconds: float = 0.0) -> None:
     """
     Send text to a pane as one block using tmux paste-buffer.
@@ -399,7 +447,11 @@ def paste_pane_text(*, pane_id: str, text: str, press_enter: bool = True, delay_
             handle.write(text)
             temp_path = handle.name
         _run_tmux(["load-buffer", "-b", buffer_name, temp_path])
-        _run_tmux(["paste-buffer", "-d", "-p", "-b", buffer_name, "-t", pane_id])
+        paste_args = ["paste-buffer", "-d", "-b", buffer_name, "-t", pane_id]
+        bracketed = os.environ.get("AI_COLLAB_BRACKETED_PASTE", "").strip().lower()
+        if bracketed in {"1", "true", "yes", "on"}:
+            paste_args.insert(2, "-p")
+        _run_tmux(paste_args)
     finally:
         if temp_path:
             Path(temp_path).unlink(missing_ok=True)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-collab"
-version = "0.1.3"
+version = "0.1.4"
 description = "AI Collaboration System / 智能多 Agent 协作编排框架"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -52,6 +52,9 @@ ai-collab = "ai_collab.cli:project_main"
 where = ["."]
 include = ["ai_collab*"]
 exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+ai_collab = ["skills/**/*.md"]
 
 [tool.black]
 line-length = 100

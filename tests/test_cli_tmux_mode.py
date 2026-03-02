@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import ai_collab.cli as cli
 from ai_collab.core.config import Config
+from ai_collab.core.detector import CollaborationResult
 
 
 def _sample_result() -> SimpleNamespace:
@@ -80,7 +81,7 @@ def test_tmux_launch_injects_controller_prompt_text(monkeypatch) -> None:
     monkeypatch.setattr(
         cli,
         "_inject_prompt_to_pane",
-        lambda **kwargs: sent_text.append(str(kwargs.get("text", ""))),
+        lambda **kwargs: (sent_text.append(str(kwargs.get("text", ""))), True)[1],
     )
     monkeypatch.setattr(cli, "attach_session", lambda **_kwargs: None)
 
@@ -93,7 +94,7 @@ def test_tmux_launch_injects_controller_prompt_text(monkeypatch) -> None:
 
     assert ok is True
     assert sent_text
-    assert "User task" in sent_text[0]
+    assert ".ai-collab/briefings/" in sent_text[0]
 
 
 def test_tmux_launch_prints_log_directory(monkeypatch, tmp_path) -> None:
@@ -179,9 +180,61 @@ def test_build_subagent_prompt_enforces_completion_protocol() -> None:
     )
 
     assert "不要问用户" in prompt
+    assert "禁止先运行 `--help` / `-h` / `--version`" in prompt
+    assert "NEED_ELEVATION: <command> | reason=<error>" in prompt
     assert "STEP_DONE: <step_id>" in prompt
     assert "HANDOFF_TO: codex" in prompt
     assert "=== SUBAGENT_COMPLETE ===" in prompt
+
+
+def test_build_controller_execution_prompt_forbids_probe_commands() -> None:
+    """Controller execution prompt should forbid preflight probes and require elevation marker."""
+    prompt = cli._build_controller_execution_prompt(
+        plan={"controller": "codex", "steps": [{"id": "S1", "owner": "codex"}]},
+        lang="zh-CN",
+    )
+
+    assert "禁止运行 `--help` / `-h` / `--version`" in prompt
+    assert "NEED_ELEVATION: <command> | reason=<error>" in prompt
+
+
+def test_build_controller_planning_request_forbids_probe_commands() -> None:
+    """Controller planning request should include no-probe and elevation constraints."""
+    config = Config(
+        providers={},
+        quality_gate={"enabled": True, "threshold": 75},
+    )
+    result = SimpleNamespace(
+        available_agents=[
+            {
+                "agent": "codex",
+                "selected_model": "gpt-5.3-codex",
+                "model_profile": "high",
+                "strengths": "implementation",
+            }
+        ]
+    )
+
+    prompt = cli._build_controller_planning_request(
+        task="实现极小待办",
+        controller="codex",
+        result=result,
+        config=config,
+        lang="zh-CN",
+    )
+
+    assert "禁止先运行 `--help` / `-h` / `--version`" in prompt
+    assert "NEED_ELEVATION: <command> | reason=<error>" in prompt
+
+
+def test_resolve_orchestrator_skill_source_uses_packaged_skill() -> None:
+    """Init skill installer should resolve packaged orchestrator skill source."""
+    source = cli._resolve_orchestrator_skill_source()
+
+    assert source is not None
+    assert source.name == "ai-collab-orchestrator"
+    assert source.parent.name == "skills"
+    assert (source / "SKILL.md").exists()
 
 
 def test_resolve_prompt_injection_delay_defaults(monkeypatch) -> None:
@@ -202,17 +255,195 @@ def test_resolve_prompt_injection_delay_env_override(monkeypatch) -> None:
     assert cli._resolve_prompt_injection_delay("codex") == 1.2
 
 
-def test_relay_to_controller_input_enabled_default_false(monkeypatch) -> None:
-    """Relay input injection should be disabled unless explicitly enabled."""
-    monkeypatch.delenv("AI_COLLAB_RELAY_TO_CONTROLLER_INPUT", raising=False)
-    assert cli._relay_to_controller_input_enabled() is False
+def test_result_for_tmux_launch_prefers_controller_plan_multi_agent() -> None:
+    """Approved controller multi-agent plan should enable tmux launch payload."""
+    result = CollaborationResult(
+        need_collaboration=True,
+        execution_mode="single-agent",
+        orchestration_plan=[],
+        selected_agents=["codex"],
+    )
+    controller_plan = {
+        "requires_multi_agent": True,
+        "agents": [
+            {"name": "codex", "model": "gpt-5.3-codex"},
+            {"name": "claude", "model": "claude-sonnet-4-6"},
+        ],
+        "steps": [
+            {"id": "S1", "owner": "codex", "goal": "controller step"},
+            {"id": "S2", "owner": "claude", "goal": "review step"},
+        ],
+    }
 
-    monkeypatch.setenv("AI_COLLAB_RELAY_TO_CONTROLLER_INPUT", "1")
+    launch_result = cli._result_for_tmux_launch(result, controller_plan)
+
+    assert launch_result.execution_mode == "multi-agent"
+    assert len(launch_result.orchestration_plan) == 2
+    assert launch_result.selected_agents == ["codex", "claude"]
+
+
+def test_resolve_agent_ready_timeout_defaults(monkeypatch) -> None:
+    """Agent readiness timeout should use safer short defaults."""
+    monkeypatch.delenv("AI_COLLAB_AGENT_READY_TIMEOUT_SECONDS", raising=False)
+
+    assert cli._resolve_agent_ready_timeout("codex") == 15.0
+    assert cli._resolve_agent_ready_timeout("claude") == 25.0
+    assert cli._resolve_agent_ready_timeout("gemini") == 25.0
+
+
+def test_wait_for_agent_ready_codex_auto_confirms_directory_trust(monkeypatch) -> None:
+    """Codex readiness check should auto-confirm trust gate instead of blocking."""
+    snapshots = iter(
+        [
+            "Do you trust the contents of this directory?\nPress enter to continue",
+            "OpenAI Codex\nReady",
+        ]
+    )
+    sent = {"count": 0}
+
+    monkeypatch.setattr(
+        cli,
+        "capture_pane_text",
+        lambda **_kwargs: next(snapshots, "OpenAI Codex\nReady"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "send_pane_text",
+        lambda **_kwargs: sent.__setitem__("count", sent["count"] + 1),
+    )
+
+    ready = cli._wait_for_agent_ready(pane_id="%1", agent="codex", timeout_seconds=1.0)
+
+    assert ready is True
+    assert sent["count"] >= 1
+
+
+def test_wait_for_agent_ready_claude_auto_confirms_directory_trust(monkeypatch) -> None:
+    """Claude readiness check should auto-confirm trust gate before injection."""
+    snapshots = iter(
+        [
+            "Security guide\nYes, I trust this folder\nEnter to confirm",
+            "Claude Code\nready",
+        ]
+    )
+    sent = {"count": 0}
+
+    monkeypatch.setattr(
+        cli,
+        "capture_pane_text",
+        lambda **_kwargs: next(snapshots, "Claude Code\nready"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "send_pane_text",
+        lambda **_kwargs: sent.__setitem__("count", sent["count"] + 1),
+    )
+
+    ready = cli._wait_for_agent_ready(pane_id="%1", agent="claude", timeout_seconds=1.0)
+
+    assert ready is True
+    assert sent["count"] >= 1
+
+
+def test_wait_for_agent_ready_does_not_accept_shell_output(monkeypatch) -> None:
+    """Generic shell output should not be treated as agent-ready."""
+    monkeypatch.setattr(cli, "capture_pane_text", lambda **_kwargs: "zsh prompt output")
+
+    ready = cli._wait_for_agent_ready(pane_id="%1", agent="codex", timeout_seconds=0.1)
+
+    assert ready is False
+
+
+def test_inject_prompt_to_pane_returns_false_when_agent_not_ready(monkeypatch) -> None:
+    """Prompt injection must not write into shell when readiness check fails."""
+    monkeypatch.setattr(cli, "_wait_for_agent_ready", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        cli,
+        "paste_pane_text",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("should not paste when not ready")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "send_pane_text",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("should not send when not ready")),
+    )
+
+    ok = cli._inject_prompt_to_pane(pane_id="%1", text="hello", agent="codex")
+
+    assert ok is False
+
+
+def test_inject_prompt_to_pane_uses_literal_send_for_short_dispatch(monkeypatch) -> None:
+    """Short dispatch prompts should be typed, not pasted, to avoid pasted-mode issues."""
+    called = {"type": 0, "send": 0, "paste": 0}
+
+    monkeypatch.setattr(cli, "_wait_for_agent_ready", lambda **_kwargs: True)
+    monkeypatch.setattr(cli, "wait_for_pane_quiet", lambda **_kwargs: True)
+    monkeypatch.setattr(cli, "_pane_contains_probe", lambda **_kwargs: True)
+    monkeypatch.setattr(cli, "type_pane_text", lambda **_kwargs: called.__setitem__("type", called["type"] + 1))
+    monkeypatch.setattr(cli, "send_pane_text", lambda **_kwargs: called.__setitem__("send", called["send"] + 1))
+    monkeypatch.setattr(cli, "paste_pane_text", lambda **_kwargs: called.__setitem__("paste", called["paste"] + 1))
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+
+    ok = cli._inject_prompt_to_pane(
+        pane_id="%1",
+        text="读取并执行文件:\n/tmp/briefing.txt\n完成后结束。",
+        agent="codex",
+    )
+
+    assert ok is True
+    assert called["type"] >= 1
+    assert called["send"] >= 1
+    assert called["paste"] == 0
+
+
+def test_prompt_probe_uses_stable_prefix_for_colon_messages() -> None:
+    """Probe should avoid long path suffix to survive wrapped terminal output."""
+    text = "Read and execute task file: /Users/skyhua/test/.ai-collab/briefings/abc.txt"
+    probe = cli._prompt_probe(text)
+    assert probe == "read and execute task file"
+
+
+def test_resolve_runtime_language_prefers_system_chinese(monkeypatch) -> None:
+    """Runtime language should follow zh locale when no CLI override is passed."""
+    monkeypatch.setenv("LANG", "zh_CN.UTF-8")
+    monkeypatch.delenv("LC_ALL", raising=False)
+    monkeypatch.delenv("LC_MESSAGES", raising=False)
+    monkeypatch.setenv("AI_COLLAB_PREFER_SYSTEM_LANG", "1")
+
+    resolved = cli._resolve_runtime_language(cli_lang=None, config_lang="en-US")
+
+    assert resolved == "zh-CN"
+
+
+def test_resolve_runtime_language_uses_macos_applelanguages_when_lang_neutral(monkeypatch) -> None:
+    """On macOS, language fallback should read AppleLanguages when LANG is neutral."""
+    class _Result:
+        stdout = "(\n    \"zh-Hans-CN\",\n    \"en-US\"\n)\n"
+
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    monkeypatch.delenv("LC_ALL", raising=False)
+    monkeypatch.delenv("LC_MESSAGES", raising=False)
+    monkeypatch.setenv("AI_COLLAB_PREFER_SYSTEM_LANG", "1")
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+    monkeypatch.setattr(cli.subprocess, "run", lambda *_a, **_k: _Result())
+
+    resolved = cli._resolve_runtime_language(cli_lang=None, config_lang="en-US")
+
+    assert resolved == "zh-CN"
+
+
+def test_relay_to_controller_input_enabled_default_true(monkeypatch) -> None:
+    """Relay input injection should be enabled by default for controller visibility."""
+    monkeypatch.delenv("AI_COLLAB_RELAY_TO_CONTROLLER_INPUT", raising=False)
     assert cli._relay_to_controller_input_enabled() is True
 
+    monkeypatch.setenv("AI_COLLAB_RELAY_TO_CONTROLLER_INPUT", "0")
+    assert cli._relay_to_controller_input_enabled() is False
 
-def test_emit_relay_event_writes_log_without_input_injection(monkeypatch, tmp_path) -> None:
-    """Relay event should always write event log and skip pane input by default."""
+
+def test_emit_relay_event_writes_log_and_injects_input_by_default(monkeypatch, tmp_path) -> None:
+    """Relay event should always write event log and inject pane input by default."""
     sent = {"count": 0}
 
     monkeypatch.delenv("AI_COLLAB_RELAY_TO_CONTROLLER_INPUT", raising=False)
@@ -232,7 +463,28 @@ def test_emit_relay_event_writes_log_without_input_injection(monkeypatch, tmp_pa
     event_file = tmp_path / ".ai-collab" / "logs" / "ai-collab-live" / "events.log"
     assert event_file.exists()
     assert "gemini step done -> S2" in event_file.read_text(encoding="utf-8")
-    assert sent["count"] == 0
+    assert sent["count"] == 1
+
+
+def test_extract_handoff_targets_accepts_live_line_suffix_noise() -> None:
+    """Terminal spinner noise after marker should not block extraction."""
+    text = "HANDOFF_TO: gemini•Marking step completion"
+    assert cli._extract_handoff_targets(text) == ["gemini"]
+
+
+def test_extract_step_done_ids_accepts_live_line_suffix_noise() -> None:
+    """STEP_DONE markers should parse even with inline summary suffix."""
+    text = "STEP_DONE: S2 | 已完成阶段输出"
+    assert cli._extract_step_done_ids(text) == ["S2"]
+
+
+def test_normalize_terminal_text_for_markers_strips_ansi_and_carriage() -> None:
+    """Marker normalization should convert carriage updates into parsable plain lines."""
+    raw = "A\r\x1b[31mHANDOFF_TO: claude\x1b[0m\rSTEP_DONE: S3"
+    normalized = cli._normalize_terminal_text_for_markers(raw)
+    assert "HANDOFF_TO: claude" in normalized
+    assert "STEP_DONE: S3" in normalized
+    assert "\\x1b[" not in normalized
 
 
 def test_runner_blocks_nested_orchestration(monkeypatch) -> None:
@@ -528,3 +780,35 @@ def test_prepare_controller_prompt_document_no_auto_editor(monkeypatch, tmp_path
 
     assert prompt is not None
     assert "主控 Agent 执行文档" in prompt
+
+
+def test_extract_handoff_targets_ignores_instructional_text() -> None:
+    """Instructional bullet/codeblock text must not trigger sub-agent spawning."""
+    text = """
+- HANDOFF_TO: gemini
+`SPAWN_AGENT: claude`
+done_when: 输出 HANDOFF_TO: codex
+"""
+    targets = cli._extract_handoff_targets(text)
+    assert targets == []
+
+
+def test_extract_handoff_targets_accepts_plain_control_lines() -> None:
+    """Plain control marker lines should be parsed for watcher routing."""
+    text = """
+STEP_DONE: S1
+HANDOFF_TO: gemini
+SPAWN_AGENT: claude
+"""
+    targets = cli._extract_handoff_targets(text)
+    assert targets == ["gemini", "claude"]
+
+
+def test_extract_step_done_ids_accepts_plain_lines_only() -> None:
+    """STEP_DONE extraction should ignore placeholder/instructional lines."""
+    text = """
+- STEP_DONE: <step_id>
+STEP_DONE: S2
+"""
+    step_ids = cli._extract_step_done_ids(text)
+    assert step_ids == ["S2"]

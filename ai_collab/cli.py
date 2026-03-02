@@ -39,11 +39,13 @@ from ai_collab.core.tmux_workspace import (
     paste_pane_text,
     send_pane_text,
     spawn_subagent_pane,
+    type_pane_text,
     wait_for_pane_quiet,
 )
 from ai_collab.core.workflow import WorkflowManager
 
 console = Console(force_terminal=True, legacy_windows=False)
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\].*?\x1b\\")
 
 
 I18N = {
@@ -291,6 +293,54 @@ def _msg(lang: str, key: str, **kwargs: str) -> str:
     return raw.format(**kwargs)
 
 
+def _system_prefers_zh_locale() -> bool:
+    """Detect whether current terminal locale prefers Chinese UI."""
+    locale_hint = " ".join(
+        part
+        for part in (
+            os.environ.get("LC_ALL", ""),
+            os.environ.get("LC_MESSAGES", ""),
+            os.environ.get("LANG", ""),
+        )
+        if part
+    ).lower()
+    if locale_hint:
+        zh_tokens = ("zh", "chinese", "hans", "hant")
+        if any(token in locale_hint for token in zh_tokens):
+            return True
+
+    # macOS users often keep LANG=C.UTF-8 while system UI is Chinese.
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["defaults", "read", "-g", "AppleLanguages"],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                check=False,
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        output = (result.stdout or "").lower()
+        return "zh" in output
+    return False
+
+
+def _resolve_runtime_language(*, cli_lang: Optional[str], config_lang: str) -> str:
+    """Resolve runtime language from CLI override, config, and system locale."""
+    if cli_lang in I18N:
+        return str(cli_lang)
+
+    prefer_system = os.environ.get("AI_COLLAB_PREFER_SYSTEM_LANG", "1").strip().lower()
+    prefer_system_lang = prefer_system not in {"0", "false", "no", "off"}
+    if prefer_system_lang and _system_prefers_zh_locale():
+        return "zh-CN"
+
+    if config_lang in I18N:
+        return config_lang
+    return "en-US"
+
+
 def _provider_display_plain(name: str, *, include_brand: bool = False) -> str:
     theme = PROVIDER_THEME.get(name, {"icon_plain": "●"})
     label = _msg("en-US", f"provider_{name}")
@@ -357,7 +407,7 @@ def _extract_model_ids(text: str) -> list[str]:
 
 def _quick_health_check(provider: str, *, timeout_sec: int = 3) -> tuple[bool, str]:
     """
-    Quick health check for a provider by running --version or --help.
+    Quick availability check for a provider command without invoking the CLI.
     Returns (success: bool, error_message: str).
     """
     from ai_collab.core.config import Config
@@ -370,34 +420,11 @@ def _quick_health_check(provider: str, *, timeout_sec: int = 3) -> tuple[bool, s
     if not executable:
         return False, f"Executable not found: {provider_config.cli}"
 
-    # Fast availability probe.
-    cmd: list[str]
-    if provider == "claude":
-        cmd = [executable, "--version"]
-    elif provider == "gemini":
-        cmd = [executable, "--version"]
-    elif provider == "codex":
-        cmd = [executable, "--version"]
-    else:
+    if provider not in {"claude", "gemini", "codex"}:
         return False, f"Unknown provider: {provider}"
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
-            check=False,
-        )
-        # Any output indicates the command is reachable.
-        if result.returncode == 0 or result.stdout or result.stderr:
-            return True, ""
-        else:
-            return False, "No output from command"
-    except subprocess.TimeoutExpired:
-        return False, f"Timeout after {timeout_sec}s"
-    except OSError as e:
-        return False, f"OS error: {e}"
+    if not os.access(executable, os.X_OK):
+        return False, f"Command is not executable: {executable}"
+    return True, ""
 
 
 def _discover_provider_models(provider: str, provider_config, *, timeout_sec: int = 3) -> list[str]:
@@ -848,7 +875,7 @@ def list_workflows(ctx: click.Context) -> None:
 def status(ctx: click.Context) -> None:
     """Show current configuration status."""
     config_obj = ctx.obj["config"]
-    lang = config_obj.ui_language if config_obj.ui_language in I18N else "en-US"
+    lang = _resolve_runtime_language(cli_lang=None, config_lang=config_obj.ui_language)
     os_name = detect_os_name()
     runtime = detect_provider_status(config_obj.providers)
 
@@ -1145,6 +1172,8 @@ AUTO_COLLAB_I18N = {
         "role_assignment": "Role Assignment",
         "tmux_ready": "tmux live orchestration ready",
         "tmux_fallback": "tmux mode unavailable, falling back to direct execution.",
+        "tmux_required_abort": "tmux mode was explicitly requested but launch failed. Aborting instead of direct fallback.",
+        "tmux_required_unavailable": "tmux mode was explicitly requested, but current orchestration result cannot launch tmux (non-multi-agent or empty plan).",
         "tmux_failed": "Failed to launch tmux controller workspace:",
         "choose_action": "Collaboration detected. Choose action",
         "opt_execute": "Run collaboration workflow",
@@ -1192,6 +1221,7 @@ AUTO_COLLAB_I18N = {
         "tmux_logs": "Pane logs: {path}",
         "tmux_session_renamed": "Session '{old}' is active; using '{new}' to preserve existing run.",
         "prompt_inject_failed": "Prompt injection may have failed for {agent} (pane={pane}). Check pane/logs and resend if needed.",
+        "watcher_skipped": "Handoff watcher skipped because controller prompt was not injected successfully.",
     },
     "zh-CN": {
         "start": "🤝 启动多 AI 协作流程",
@@ -1207,6 +1237,8 @@ AUTO_COLLAB_I18N = {
         "role_assignment": "角色分工",
         "tmux_ready": "tmux 协作会话已就绪",
         "tmux_fallback": "tmux 模式不可用，回退到直接执行。",
+        "tmux_required_abort": "你已显式选择 tmux，但启动失败；已停止执行，不再回退到 direct。",
+        "tmux_required_unavailable": "你已显式选择 tmux，但当前编排结果不满足 tmux 启动条件（非多 Agent 或计划为空）。",
         "tmux_failed": "启动 tmux 主控工作区失败：",
         "choose_action": "检测到协作任务，选择动作",
         "opt_execute": "执行协作流程",
@@ -1254,6 +1286,7 @@ AUTO_COLLAB_I18N = {
         "tmux_logs": "窗格日志: {path}",
         "tmux_session_renamed": "检测到会话 '{old}' 正在运行，为保留历史会话改用 '{new}'。",
         "prompt_inject_failed": "向 {agent} 注入提示词可能失败（pane={pane}），请检查窗格/日志后重发。",
+        "watcher_skipped": "由于主控提示词注入失败，已跳过自动交接监听器。",
     },
 }
 
@@ -1343,6 +1376,13 @@ def _write_controller_prompt_file(*, cwd: Path, controller: str, text: str) -> P
     path = folder / f"{timestamp}-{controller}-controller-prompt.md"
     path.write_text(text.rstrip() + "\n", encoding="utf-8")
     return path
+
+
+def _build_prompt_dispatch_message(*, lang: str, path: Path, role: str, agent: str) -> str:
+    """Build a short prompt that asks agent to read briefing file."""
+    if lang == "zh-CN":
+        return f"读取并执行任务文件：{path}"
+    return f"Read and execute task file: {path}"
 
 
 def _resolve_editor_command() -> Optional[list[str]]:
@@ -1479,12 +1519,13 @@ def _build_controller_prompt_document(
 2. 用户同意后，按 `steps` 顺序逐步执行。
 3. 子 Agent 调度必须在 tmux 可视窗格中进行，禁止在主控后台 shell 里直接调用 claude/gemini。
 4. 需要切换执行者时，输出 `HANDOFF_TO: <agent>` 或 `SPAWN_AGENT: <agent>` 以触发可视窗格。
-5. 若命令遇到权限/审批拦截，先输出 `NEED_ELEVATION: <command> | reason=<error>`，等待用户处理，不得静默降级。
-6. 每步完成后输出：
+5. 禁止使用 `--help` / `-h` / `--version` 或自定义探活脚本检查 Agent；直接执行当前步骤。
+6. 若命令遇到权限/审批拦截，先输出 `NEED_ELEVATION: <command> | reason=<error>`，等待用户处理，不得静默降级。
+7. 每步完成后输出：
    - `STEP_DONE: <id>`
    - `HANDOFF_TO: <next_owner>`
    - 简短结果摘要
-7. 全部结束后输出 `=== TASK_COMPLETE ===`。
+8. 全部结束后输出 `=== TASK_COMPLETE ===`。
 """
 
     return f"""# Controller Execution Doc (Editable)
@@ -1536,12 +1577,13 @@ First, return JSON only (no extra explanation) using this schema:
 2. After approval, execute steps in order.
 3. Sub-agent execution must stay visible in tmux panes. Do not run claude/gemini through hidden background shell commands in controller pane.
 4. When switching owner, output `HANDOFF_TO: <agent>` or `SPAWN_AGENT: <agent>` to trigger visible panes.
-5. If any command is blocked by permissions/approval, output `NEED_ELEVATION: <command> | reason=<error>` and wait; do not silently downgrade.
-6. After each step output:
+5. Do not run provider probes such as `--help` / `-h` / `--version` or custom health scripts before execution; execute assigned steps directly.
+6. If any command is blocked by permissions/approval, output `NEED_ELEVATION: <command> | reason=<error>` and wait; do not silently downgrade.
+7. After each step output:
    - `STEP_DONE: <id>`
    - `HANDOFF_TO: <next_owner>`
    - short result summary
-7. End with `=== TASK_COMPLETE ===`.
+8. End with `=== TASK_COMPLETE ===`.
 """
 
 
@@ -1673,7 +1715,8 @@ persona_skill_map:
 额外约束（必须写入计划并执行）:
 - 子 Agent 必须在 tmux 可视窗格执行，禁止后台 shell 调用 claude/gemini。
 - 交接时必须输出 `HANDOFF_TO: <agent>` 或 `SPAWN_AGENT: <agent>`。
-- 若命令被权限/审批拦截，先输出 `NEED_ELEVATION: <command> | reason=<error>`。
+- 禁止先运行 `--help` / `-h` / `--version` 或任何探活脚本；必须直接执行分配步骤。
+- 若命令被权限/审批拦截，先输出 `NEED_ELEVATION: <command> | reason=<error>` 并等待，不得静默降级。
 """
 
     return f"""You are the controller agent: {controller}.
@@ -1715,7 +1758,8 @@ Return JSON only (no markdown, no explanation) with this schema:
 Mandatory constraints:
 - Sub-agents must run in visible tmux panes. Do not call claude/gemini via hidden background shell commands.
 - On handoff, output `HANDOFF_TO: <agent>` or `SPAWN_AGENT: <agent>`.
-- If any command is blocked by permission/approval, output `NEED_ELEVATION: <command> | reason=<error>`.
+- Do not run probe commands such as `--help` / `-h` / `--version` or ad-hoc health scripts before execution.
+- If any command is blocked by permission/approval, output `NEED_ELEVATION: <command> | reason=<error>` and wait (no silent downgrade).
 """
 
 
@@ -1805,8 +1849,9 @@ def _build_controller_execution_prompt(
 2. 子 Agent 必须在 tmux 可视窗格执行，禁止后台 shell 调用 claude/gemini。
 3. 每步结束输出 `STEP_DONE: <id>` 与简短结果。
 4. 交接下一位时输出 `HANDOFF_TO: <agent>` 或 `SPAWN_AGENT: <agent>`。
-5. 若命令被权限/审批拦截，输出 `NEED_ELEVATION: <command> | reason=<error>`，等待用户处理。
-6. 全部完成输出 `=== TASK_COMPLETE ===`。
+5. 禁止运行 `--help` / `-h` / `--version` 或探活脚本；直接执行步骤。
+6. 若命令被权限/审批拦截，立即输出 `NEED_ELEVATION: <command> | reason=<error>`，等待用户处理。
+7. 全部完成输出 `=== TASK_COMPLETE ===`。
 """
     extra = ""
     if notes_block:
@@ -1821,8 +1866,9 @@ Execution rules:
 2. Run sub-agents in visible tmux panes only. Do not call claude/gemini via hidden background shell commands.
 3. After each step output `STEP_DONE: <id>` with short summary.
 4. When handing off, output `HANDOFF_TO: <agent>` or `SPAWN_AGENT: <agent>`.
-5. If blocked by permission/approval, output `NEED_ELEVATION: <command> | reason=<error>` and wait.
-6. Finish with `=== TASK_COMPLETE ===`.
+5. Do not run probe commands (`--help` / `-h` / `--version`) or ad-hoc health scripts before execution.
+6. If blocked by permission/approval, output `NEED_ELEVATION: <command> | reason=<error>` and wait.
+7. Finish with `=== TASK_COMPLETE ===`.
 """
 
 
@@ -1902,15 +1948,86 @@ def _show_controller_plan(plan: dict[str, Any], *, lang: str) -> None:
     console.print(_render_controller_plan(plan, lang=lang))
 
 
+def _controller_plan_to_tmux_payload(plan: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Convert approved controller JSON plan into tmux orchestration payload."""
+    if not isinstance(plan, dict) or not bool(plan.get("requires_multi_agent", False)):
+        return None
+    steps_raw = plan.get("steps", [])
+    if not isinstance(steps_raw, list) or not steps_raw:
+        return None
+
+    agent_models: dict[str, str] = {}
+    agents_raw = plan.get("agents", [])
+    if isinstance(agents_raw, list):
+        for item in agents_raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            model = str(item.get("model", "")).strip()
+            if name:
+                agent_models[name] = model
+
+    orchestration_plan: list[dict[str, str]] = []
+    selected_agents: list[str] = []
+    for idx, item in enumerate(steps_raw, 1):
+        if not isinstance(item, dict):
+            continue
+        owner = str(item.get("owner", "")).strip()
+        if not owner:
+            continue
+        role = str(item.get("goal", "")).strip() or str(item.get("id", f"S{idx}")).strip() or f"S{idx}"
+        orchestration_plan.append(
+            {
+                "role": role,
+                "agent": owner,
+                "selected_model": agent_models.get(owner, ""),
+                "selected_cli": "",
+                "profile": "controller-plan",
+                "reason": "controller-plan",
+            }
+        )
+        if owner not in selected_agents:
+            selected_agents.append(owner)
+
+    if len(selected_agents) <= 1 or not orchestration_plan:
+        return None
+    return {
+        "execution_mode": "multi-agent",
+        "orchestration_plan": orchestration_plan,
+        "selected_agents": selected_agents,
+    }
+
+
+def _result_for_tmux_launch(result, controller_plan: Optional[dict[str, Any]]):
+    """Prefer approved controller multi-agent plan when preparing tmux launch."""
+    payload = _controller_plan_to_tmux_payload(controller_plan or {})
+    if not payload:
+        return result
+    if hasattr(result, "model_copy"):
+        try:
+            return result.model_copy(update=payload)
+        except Exception:  # noqa: BLE001
+            return result
+    return result
+
+
 def _wait_for_agent_ready(*, pane_id: str, agent: str, timeout_seconds: float = 25.0) -> bool:
     """Wait until pane output contains a known ready marker for the selected agent."""
     markers = {
-        "codex": ["openai codex", "tip: use /skills", "gpt-5"],
+        "codex": [
+            "openai codex",
+            "tip: use /skills",
+            "gpt-5",
+            "do you trust the contents of this directory",
+            "press enter to continue",
+        ],
         "claude": ["claude", "sonnet", "opus"],
         "gemini": ["gemini"],
     }
     deadline = time.monotonic() + max(timeout_seconds, 0.1)
     expected = markers.get(agent, [])
+    codex_trust_confirmed = False
+    claude_trust_confirmed = False
     while time.monotonic() < deadline:
         try:
             snapshot = capture_pane_text(pane_id=pane_id, start_line=-200)
@@ -1918,6 +2035,28 @@ def _wait_for_agent_ready(*, pane_id: str, agent: str, timeout_seconds: float = 
             time.sleep(0.5)
             continue
         lower = snapshot.lower()
+        if agent == "codex":
+            has_trust_gate = (
+                "do you trust the contents of this directory" in lower
+                or "press enter to continue" in lower
+                or "yes, continue" in lower
+            )
+            if has_trust_gate and not codex_trust_confirmed:
+                codex_trust_confirmed = True
+                send_pane_text(pane_id=pane_id, text="", press_enter=True, delay_seconds=0.0)
+                time.sleep(0.6)
+                continue
+        if agent == "claude":
+            has_trust_gate = (
+                "yes, i trust this folder" in lower
+                or ("enter to confirm" in lower and "security guide" in lower)
+                or ("claude code'll be able to read" in lower and "yes, i trust this folder" in lower)
+            )
+            if has_trust_gate and not claude_trust_confirmed:
+                claude_trust_confirmed = True
+                send_pane_text(pane_id=pane_id, text="", press_enter=True, delay_seconds=0.0)
+                time.sleep(0.8)
+                continue
         if any(token in lower for token in expected):
             return True
         time.sleep(0.5)
@@ -1928,9 +2067,19 @@ def _prompt_probe(text: str) -> str:
     for line in text.splitlines():
         candidate = line.strip()
         if len(candidate) >= 8:
-            return re.sub(r"\s+", " ", candidate.lower())[:72]
+            normalized = re.sub(r"\s+", " ", candidate.lower())
+            if ":" in normalized:
+                prefix = normalized.split(":", 1)[0].strip()
+                if len(prefix) >= 8:
+                    return prefix[:48]
+            return normalized[:48]
     fallback = text.strip()
-    return re.sub(r"\s+", " ", fallback.lower())[:72] if fallback else ""
+    normalized = re.sub(r"\s+", " ", fallback.lower()) if fallback else ""
+    if ":" in normalized:
+        prefix = normalized.split(":", 1)[0].strip()
+        if len(prefix) >= 8:
+            return prefix[:48]
+    return normalized[:48]
 
 
 def _pane_contains_probe(*, pane_id: str, probe: str) -> bool:
@@ -1946,8 +2095,22 @@ def _pane_contains_probe(*, pane_id: str, probe: str) -> bool:
 
 def _relay_to_controller_input_enabled() -> bool:
     """Whether relay watcher should inject status text into controller input."""
-    value = os.environ.get("AI_COLLAB_RELAY_TO_CONTROLLER_INPUT", "").strip().lower()
+    value = os.environ.get("AI_COLLAB_RELAY_TO_CONTROLLER_INPUT", "1").strip().lower()
     return value in {"1", "true", "yes", "on"}
+
+
+def _resolve_dispatch_typing_char_delay() -> float:
+    """Resolve character delay for short dispatch typing."""
+    raw = os.environ.get("AI_COLLAB_DISPATCH_TYPE_CHAR_DELAY_SECONDS", "").strip()
+    if not raw:
+        return 0.015
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return 0.015
+    if parsed < 0:
+        return 0.015
+    return min(parsed, 0.2)
 
 
 def _tmux_events_log_path(*, cwd: Path, session: str) -> Path:
@@ -1998,6 +2161,26 @@ def _resolve_prompt_injection_delay(agent: str) -> float:
     return parsed
 
 
+def _resolve_agent_ready_timeout(agent: str) -> float:
+    """Resolve readiness wait timeout in seconds."""
+    defaults = {
+        "codex": 15.0,
+        "claude": 25.0,
+        "gemini": 25.0,
+    }
+    base = defaults.get(agent, 8.0)
+    raw = os.environ.get("AI_COLLAB_AGENT_READY_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return base
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return base
+    if parsed <= 0:
+        return base
+    return parsed
+
+
 def _inject_prompt_to_pane(*, pane_id: str, text: str, agent: str) -> bool:
     """
     Inject a prompt to an interactive pane.
@@ -2005,15 +2188,21 @@ def _inject_prompt_to_pane(*, pane_id: str, text: str, agent: str) -> bool:
     Prefer single-block paste to avoid partial line submissions.
     """
     probe = _prompt_probe(text)
-    for _attempt in range(3):
+    ready_timeout = _resolve_agent_ready_timeout(agent)
+    max_attempts = 2
+    for attempt in range(max_attempts):
         ready = _wait_for_agent_ready(
             pane_id=pane_id,
             agent=agent,
-            timeout_seconds=25.0,
+            timeout_seconds=ready_timeout,
         )
         settle_delay = _resolve_prompt_injection_delay(agent)
         if not ready:
-            settle_delay = max(settle_delay, 2.5)
+            # Never inject prompt to shell fallback when target CLI is not ready.
+            if attempt < max_attempts - 1:
+                time.sleep(max(0.6, min(settle_delay, 1.2)))
+                continue
+            return False
         if settle_delay > 0:
             time.sleep(settle_delay)
         wait_for_pane_quiet(
@@ -2022,13 +2211,31 @@ def _inject_prompt_to_pane(*, pane_id: str, text: str, agent: str) -> bool:
             stable_checks=2,
             poll_interval=0.5,
         )
+        lines = text.splitlines()
+        use_literal_send = len(lines) <= 6 and len(text) <= 700
         try:
-            paste_pane_text(
-                pane_id=pane_id,
-                text=text,
-                press_enter=True,
-                delay_seconds=0.2,
-            )
+            if use_literal_send:
+                type_pane_text(
+                    pane_id=pane_id,
+                    text=text,
+                    char_delay_seconds=_resolve_dispatch_typing_char_delay(),
+                    press_enter=True,
+                    delay_seconds=0.0,
+                )
+                # Some interactive CLIs keep first Enter as input commit but not submit.
+                send_pane_text(
+                    pane_id=pane_id,
+                    text="",
+                    press_enter=True,
+                    delay_seconds=0.15,
+                )
+            else:
+                paste_pane_text(
+                    pane_id=pane_id,
+                    text=text,
+                    press_enter=True,
+                    delay_seconds=0.2,
+                )
         except subprocess.CalledProcessError:
             # Fallback for environments where buffer paste is unavailable.
             send_pane_text(
@@ -2042,6 +2249,39 @@ def _inject_prompt_to_pane(*, pane_id: str, text: str, agent: str) -> bool:
             return True
         time.sleep(0.6)
     return False
+
+
+def _extract_handoff_targets(text: str) -> list[str]:
+    """Extract handoff markers from live terminal lines."""
+    targets: list[str] = []
+    normalized = _normalize_terminal_text_for_markers(text)
+    pattern = re.compile(
+        r"(?mi)^\s*(?:HANDOFF_TO|SPAWN_AGENT)\s*:\s*([a-zA-Z0-9_-]+)\b"
+    )
+    for match in pattern.findall(normalized):
+        token = str(match).strip().lower()
+        if token and not token.startswith("<"):
+            targets.append(token)
+    return targets
+
+
+def _extract_step_done_ids(text: str) -> list[str]:
+    """Extract STEP_DONE markers from live terminal lines."""
+    step_ids: list[str] = []
+    normalized = _normalize_terminal_text_for_markers(text)
+    pattern = re.compile(r"(?mi)^\s*STEP_DONE\s*:\s*([A-Za-z0-9_.-]+)\b")
+    for match in pattern.findall(normalized):
+        token = str(match).strip()
+        if token and not token.startswith("<"):
+            step_ids.append(token)
+    return step_ids
+
+
+def _normalize_terminal_text_for_markers(text: str) -> str:
+    """Normalize terminal output so marker parsing survives ANSI/carriage updates."""
+    normalized = text.replace("\r", "\n")
+    normalized = ANSI_ESCAPE_RE.sub("", normalized)
+    return normalized
 
 
 def _build_subagent_prompt(*, task: str, steps: list[dict], lang: str, controller: str) -> str:
@@ -2064,6 +2304,8 @@ def _build_subagent_prompt(*, task: str, steps: list[dict], lang: str, controlle
             + "\n执行规则（必须遵守）:\n"
             + "- 收到任务后直接执行，不要问用户“是否继续/要不要我继续实现”。\n"
             + "- 若信息不完整，使用最小可行默认值并继续推进，同时注明假设。\n"
+            + "- 禁止先运行 `--help` / `-h` / `--version` 或健康检查脚本探活，直接执行分配步骤。\n"
+            + "- 若命令被权限/审批拦截，输出 `NEED_ELEVATION: <command> | reason=<error>` 并等待。\n"
             + "- 完成后必须输出以下四行（逐行输出）:\n"
             + "- STEP_DONE: <step_id>\n"
             + f"- HANDOFF_TO: {controller}\n"
@@ -2080,6 +2322,8 @@ def _build_subagent_prompt(*, task: str, steps: list[dict], lang: str, controlle
         + "\nExecution rules (must follow):\n"
         + "- Execute immediately after receiving task. Do not ask user \"should I continue?\".\n"
         + "- If information is missing, choose minimal viable defaults, note assumptions, and continue.\n"
+        + "- Do not run `--help` / `-h` / `--version` or health-check scripts before execution.\n"
+        + "- If command execution is blocked by permission/approval, output `NEED_ELEVATION: <command> | reason=<error>` and wait.\n"
         + "- After finishing, output these four lines:\n"
         + "- STEP_DONE: <step_id>\n"
         + f"- HANDOFF_TO: {controller}\n"
@@ -2098,8 +2342,6 @@ def _start_subagent_status_relay(
     agent: str,
 ) -> None:
     """Relay sub-agent completion markers back to controller pane."""
-    step_pattern = re.compile(r"STEP_DONE\s*:\s*([A-Za-z0-9_.-]+)", re.IGNORECASE)
-    handoff_pattern = re.compile(r"(?:HANDOFF_TO|SPAWN_AGENT)\s*:\s*([a-zA-Z0-9_-]+)", re.IGNORECASE)
     complete_pattern = re.compile(r"(?:===\s*SUBAGENT_COMPLETE\s*===|===\s*TASK_COMPLETE\s*===)", re.IGNORECASE)
 
     def _runner() -> None:
@@ -2107,6 +2349,7 @@ def _start_subagent_status_relay(
         seen_handoffs: set[str] = set()
         unchanged = 0
         last_tail = ""
+        seeded = False
         while True:
             try:
                 snapshot = capture_pane_text(pane_id=subagent_pane, start_line=-260)
@@ -2118,12 +2361,17 @@ def _start_subagent_status_relay(
                 continue
 
             tail = snapshot[-5000:]
+            if not seeded:
+                seeded = True
+                last_tail = tail
+                time.sleep(1.0)
+                continue
             if tail == last_tail:
                 unchanged += 1
             else:
                 unchanged = 0
                 last_tail = tail
-                for step_id in step_pattern.findall(tail):
+                for step_id in _extract_step_done_ids(tail):
                     sid = step_id.strip()
                     if sid and sid not in seen_steps:
                         seen_steps.add(sid)
@@ -2133,7 +2381,7 @@ def _start_subagent_status_relay(
                             controller_pane=controller_pane,
                             message=f"[ai-collab relay] {agent} step done -> {sid}",
                         )
-                for target in handoff_pattern.findall(tail):
+                for target in _extract_handoff_targets(tail):
                     next_agent = target.strip().lower()
                     if next_agent and next_agent not in seen_handoffs:
                         seen_handoffs.add(next_agent)
@@ -2191,9 +2439,15 @@ def _spawn_subagent_with_prompt(
         text=sub_prompt,
     )
     console.print(f"[dim]{_auto_msg(lang, 'brief_saved', path=str(briefing_file))}[/dim]")
+    dispatch_text = _build_prompt_dispatch_message(
+        lang=lang,
+        path=briefing_file,
+        role="subagent",
+        agent=agent,
+    )
     injected = _inject_prompt_to_pane(
         pane_id=pane_id,
-        text=sub_prompt,
+        text=dispatch_text,
         agent=agent,
     )
     if not injected:
@@ -2232,11 +2486,11 @@ def _start_handoff_watcher(
 
     canonical: dict[str, str] = {name.lower(): name for name in agent_roles.keys()}
     spawned: set[str] = set()
-    handoff_pattern = re.compile(r"(?:HANDOFF_TO|SPAWN_AGENT)\s*:\s*([a-zA-Z0-9_-]+)", re.IGNORECASE)
 
     def _runner() -> None:
         unchanged = 0
         last_tail = ""
+        seeded = False
         while True:
             try:
                 snapshot = capture_pane_text(pane_id=controller_pane, start_line=-260)
@@ -2248,12 +2502,17 @@ def _start_handoff_watcher(
                 continue
 
             tail = snapshot[-5000:]
+            if not seeded:
+                seeded = True
+                last_tail = tail
+                time.sleep(1.0)
+                continue
             if tail == last_tail:
                 unchanged += 1
             else:
                 unchanged = 0
                 last_tail = tail
-                for match in handoff_pattern.findall(tail):
+                for match in _extract_handoff_targets(tail):
                     key = match.lower()
                     agent = canonical.get(key)
                     if not agent or agent == controller or agent in spawned:
@@ -2428,6 +2687,7 @@ def _launch_tmux_orchestration(
             )
         controller_prompt = generated_prompt
 
+    controller_prompt_ready = True
     if controller_prompt:
         briefing_file = _write_briefing_file(
             cwd=cwd,
@@ -2436,15 +2696,22 @@ def _launch_tmux_orchestration(
             text=controller_prompt,
         )
         console.print(f"[dim]{_auto_msg(lang, 'brief_saved', path=str(briefing_file))}[/dim]")
+        dispatch_text = _build_prompt_dispatch_message(
+            lang=lang,
+            path=briefing_file,
+            role="controller",
+            agent=controller,
+        )
         injected = _inject_prompt_to_pane(
             pane_id=controller_pane,
-            text=controller_prompt,
+            text=dispatch_text,
             agent=controller,
         )
         if not injected:
             console.print(
                 f"[yellow]{_auto_msg(lang, 'prompt_inject_failed', agent=controller, pane=controller_pane)}[/yellow]"
             )
+            controller_prompt_ready = False
 
     agent_roles: dict[str, list[dict]] = {}
     for step in plan:
@@ -2466,15 +2733,18 @@ def _launch_tmux_orchestration(
                 controller=controller,
             )
     else:
-        _start_handoff_watcher(
-            session=resolved_session,
-            controller_pane=controller_pane,
-            controller=controller,
-            task=task,
-            agent_roles=agent_roles,
-            cwd=cwd,
-            lang=lang,
-        )
+        if controller_prompt_ready:
+            _start_handoff_watcher(
+                session=resolved_session,
+                controller_pane=controller_pane,
+                controller=controller,
+                task=task,
+                agent_roles=agent_roles,
+                cwd=cwd,
+                lang=lang,
+            )
+        else:
+            console.print(f"[yellow]{_auto_msg(lang, 'watcher_skipped')}[/yellow]")
 
     log_dir = pane_logs_dir(cwd=cwd, session=resolved_session)
     console.print(f"[green]{_auto_msg(lang, 'tmux_ready')}:[/green] {resolved_session}")
@@ -2484,17 +2754,28 @@ def _launch_tmux_orchestration(
     return True
 
 
+def _resolve_orchestrator_skill_source() -> Optional[Path]:
+    """Resolve install source directory for ai-collab-orchestrator skill."""
+    candidates = [
+        # Packaged source for GitHub/PyPI distribution.
+        Path(__file__).parent / "skills" / "ai-collab-orchestrator",
+        # Local development fallback.
+        Path(__file__).parent.parent / ".claude" / "skills" / "ai-collab-orchestrator",
+    ]
+    for candidate in candidates:
+        if (candidate / "SKILL.md").exists():
+            return candidate
+    return None
+
+
 def _install_ai_collab_skills(enabled_providers: list[str], lang: str) -> None:
     """
     Install ai-collab-orchestrator skill links for enabled agents.
     """
-    from pathlib import Path
     import shutil
 
-    # Source directory for the orchestrator skill.
-    skill_source = Path(__file__).parent.parent / ".claude" / "skills" / "ai-collab-orchestrator"
-
-    if not skill_source.exists():
+    skill_source = _resolve_orchestrator_skill_source()
+    if not skill_source:
         console.print(f"[yellow]{'警告: ai-collab-orchestrator skill 不存在' if lang == 'zh-CN' else 'Warning: ai-collab-orchestrator skill not found'}[/yellow]")
         return
 
@@ -2580,7 +2861,7 @@ def _run_init_wizard(config_obj: Config, *, ui_mode: str = "text") -> None:
         questionary = _questionary
 
     # Step 1: select UI language.
-    lang_default = config_obj.ui_language if config_obj.ui_language in I18N else "en-US"
+    lang_default = _resolve_runtime_language(cli_lang=None, config_lang=config_obj.ui_language)
     if questionary:
         lang = questionary.select(
             _msg(lang_default, "language_prompt"),
@@ -2653,8 +2934,8 @@ def _run_init_wizard(config_obj: Config, *, ui_mode: str = "text") -> None:
         enabled_providers = [fallback]
         console.print(f"[yellow]{'未选择任何 Agent，已启用' if lang == 'zh-CN' else 'No agent selected, enabled'} {_provider_display_plain(fallback)}[/yellow]")
 
-    # Step 4: run quick connectivity checks.
-    console.print(f"\n[bold]{'测试 Agent 连通性' if lang == 'zh-CN' else 'Testing agent connectivity'}[/bold]")
+    # Step 4: run quick command availability checks (no provider CLI probe).
+    console.print(f"\n[bold]{'检查 Agent 命令可用性' if lang == 'zh-CN' else 'Checking agent command availability'}[/bold]")
     failed_agents = []
     for agent_name in enabled_providers:
         console.print(f"  {_provider_display_plain(agent_name)}...", end="")
@@ -2666,7 +2947,7 @@ def _run_init_wizard(config_obj: Config, *, ui_mode: str = "text") -> None:
             failed_agents.append((agent_name, health_msg))
 
     if failed_agents:
-        console.print(f"\n[yellow]{'警告：部分 Agent 连通性测试失败' if lang == 'zh-CN' else 'Warning: Some agents failed health check'}[/yellow]")
+        console.print(f"\n[yellow]{'警告：部分 Agent 命令不可用' if lang == 'zh-CN' else 'Warning: Some agent commands are unavailable'}[/yellow]")
         for agent_name, error_msg in failed_agents:
             console.print(f"  • {_provider_display_plain(agent_name)}: {error_msg}")
 
@@ -2953,7 +3234,7 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
         return
 
     provider = provider_prefix or args.provider or config.current_controller
-    lang = args.lang or (config.ui_language if config.ui_language in I18N else "en-US")
+    lang = _resolve_runtime_language(cli_lang=args.lang, config_lang=config.ui_language)
     decision_ui = None
     if args.interactive_decisions and sys.stdin.isatty():
         decision_ui = _pick_ui_backend(
@@ -3074,6 +3355,11 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
                         f"[dim]{_auto_msg(lang, 'controller_plan_adjusted', path=str(adjust_file))}[/dim]"
                     )
                 question = str(plan.get("approval_question", "")).strip() or _auto_msg(lang, "controller_plan_confirm")
+                if lang == "zh-CN" and question.lower().strip() in {
+                    "do you approve this plan?",
+                    "approve this controller plan?",
+                }:
+                    question = _auto_msg(lang, "controller_plan_confirm")
                 approved = _ask_yes_no(
                     question,
                     lang=lang,
@@ -3171,17 +3457,19 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
                 controller_prompt_text = ensure_controller_prompt()
                 if controller_prompt_text is None:
                     return
+                launch_result = _result_for_tmux_launch(result, controller_plan)
                 if _launch_tmux_orchestration(
                     task=task,
                     controller=provider,
-                    result=result,
+                    result=launch_result,
                     lang=lang,
                     prewarm_subagents=bool(args.tmux_prewarm_subagents),
                     controller_prompt_override=controller_prompt_text,
                     tmux_target=str(args.tmux_target),
                 ):
                     return
-                console.print(f"[yellow]{_auto_msg(lang, 'tmux_fallback')}[/yellow]")
+                console.print(f"[red]{_auto_msg(lang, 'tmux_required_abort')}[/red]")
+                return
             if action == "single":
                 result = result.model_copy(update={"need_collaboration": False})
 
@@ -3190,7 +3478,9 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
             if controller_plan_rejected:
                 return
 
-        if args.execution_mode in {"auto", "tmux"} and _can_launch_tmux(result):
+        launch_result = _result_for_tmux_launch(result, controller_plan)
+        can_tmux = _can_launch_tmux(launch_result)
+        if args.execution_mode in {"auto", "tmux"} and can_tmux:
             if args.execution_mode == "tmux" or (args.execution_mode == "auto" and not decision_ui):
                 controller_prompt_text = ensure_controller_prompt()
                 if controller_prompt_text is None:
@@ -3198,14 +3488,20 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
                 if _launch_tmux_orchestration(
                     task=task,
                     controller=provider,
-                    result=result,
+                    result=launch_result,
                     lang=lang,
                     prewarm_subagents=bool(args.tmux_prewarm_subagents),
                     controller_prompt_override=controller_prompt_text,
                     tmux_target=str(args.tmux_target),
                 ):
                     return
+                if args.execution_mode == "tmux":
+                    console.print(f"[red]{_auto_msg(lang, 'tmux_required_abort')}[/red]")
+                    return
                 console.print(f"[yellow]{_auto_msg(lang, 'tmux_fallback')}[/yellow]")
+        elif args.execution_mode == "tmux":
+            console.print(f"[red]{_auto_msg(lang, 'tmux_required_unavailable')}[/red]")
+            return
 
         context = {
             "controller": provider,

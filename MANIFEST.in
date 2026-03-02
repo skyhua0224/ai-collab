@@ -4,5 +4,6 @@ include LICENSE
 include pyproject.toml
 include setup.py
 recursive-include ai_collab *.py
+recursive-include ai_collab/skills *.md
 recursive-include config *.json
 recursive-include tests *.py

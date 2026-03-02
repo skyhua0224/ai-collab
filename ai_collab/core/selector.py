@@ -104,8 +104,10 @@ class ModelSelector:
             level = thinking_levels.get(requested, thinking_levels.get("high", {}))
             thinking = requested
 
+        # Codex CLI does not support legacy "--thinking" flag in `codex exec`.
+        # Keep thinking metadata for planning, but preserve executable CLI.
         flag = level.get("flag", "")
-        cli = f"{base_cli} {flag}".strip()
+        cli = base_cli
 
         return ModelSelectionResult(
             cli=cli,

@@ -64,7 +64,7 @@ def test_select_codex_default(config):
 
     assert result.model == "gpt-5.3-codex"
     assert result.thinking == "medium"
-    assert "--thinking medium" in result.cli
+    assert result.cli == "codex exec --model gpt-5.3-codex"
 
 
 def test_select_codex_low(config):
@@ -74,7 +74,7 @@ def test_select_codex_low(config):
 
     assert result.model == "gpt-5.3-codex"
     assert result.thinking == "low"
-    assert "--thinking low" in result.cli
+    assert result.cli == "codex exec --model gpt-5.3-codex"
 
 
 def test_select_codex_respects_enabled_profiles(config):
@@ -85,7 +85,7 @@ def test_select_codex_respects_enabled_profiles(config):
     result = selector.select_model("codex", "Implement feature", "default")
 
     assert result.thinking == "low"
-    assert "--thinking low" in result.cli
+    assert result.cli == "codex exec --model gpt-5.3-codex"
 
 
 def test_select_gemini_powerful(config):

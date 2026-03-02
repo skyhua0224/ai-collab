@@ -32,6 +32,7 @@ def test_paste_pane_text_uses_tmux_buffer(monkeypatch) -> None:
 
     monkeypatch.setattr(tmux_workspace, "_run_tmux", lambda args: calls.append(args))
     monkeypatch.setattr(tmux_workspace.time, "sleep", lambda _s: None)
+    monkeypatch.delenv("AI_COLLAB_BRACKETED_PASTE", raising=False)
 
     tmux_workspace.paste_pane_text(
         pane_id="%1",
@@ -40,7 +41,46 @@ def test_paste_pane_text_uses_tmux_buffer(monkeypatch) -> None:
     )
 
     assert calls[0][0] == "load-buffer"
-    assert calls[1][:3] == ["paste-buffer", "-d", "-p"]
+    assert calls[1][:3] == ["paste-buffer", "-d", "-b"]
+    assert calls[1][-2:] == ["-t", "%1"]
+    assert calls[2] == ["send-keys", "-t", "%1", "C-m"]
+
+
+def test_type_pane_text_sends_characters_then_enter(monkeypatch) -> None:
+    """Character typing path should avoid bulk paste and finish with Enter."""
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(tmux_workspace, "_run_tmux", lambda args: calls.append(args))
+    monkeypatch.setattr(tmux_workspace.time, "sleep", lambda _s: None)
+
+    tmux_workspace.type_pane_text(
+        pane_id="%1",
+        text="ab",
+        char_delay_seconds=0.0,
+        delay_seconds=0.0,
+    )
+
+    assert calls[0] == ["send-keys", "-t", "%1", "-l", "--", "a"]
+    assert calls[1] == ["send-keys", "-t", "%1", "-l", "--", "b"]
+    assert calls[2] == ["send-keys", "-t", "%1", "C-m"]
+
+
+def test_paste_pane_text_supports_bracketed_mode_via_env(monkeypatch) -> None:
+    """Bracketed paste remains available when explicitly enabled by env var."""
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(tmux_workspace, "_run_tmux", lambda args: calls.append(args))
+    monkeypatch.setattr(tmux_workspace.time, "sleep", lambda _s: None)
+    monkeypatch.setenv("AI_COLLAB_BRACKETED_PASTE", "1")
+
+    tmux_workspace.paste_pane_text(
+        pane_id="%1",
+        text="line a\nline b\nline c",
+        delay_seconds=0.0,
+    )
+
+    assert calls[0][0] == "load-buffer"
+    assert calls[1][:4] == ["paste-buffer", "-d", "-p", "-b"]
     assert calls[1][-2:] == ["-t", "%1"]
     assert calls[2] == ["send-keys", "-t", "%1", "C-m"]
 
@@ -74,6 +114,9 @@ def test_spawn_subagent_uses_marked_subagent_panes(monkeypatch, tmp_path) -> Non
 
     monkeypatch.setattr(tmux_workspace, "_run_tmux_capture", fake_capture)
     monkeypatch.setattr(tmux_workspace, "_run_tmux", lambda args: tmux_cmds.append(args))
+    monkeypatch.setattr(tmux_workspace, "wait_for_pane_quiet", lambda **_kwargs: True)
+    monkeypatch.setattr(tmux_workspace, "send_pane_text", lambda **_kwargs: None)
+    monkeypatch.setattr(tmux_workspace, "_dispatch_delay_seconds", lambda: 0.0)
     monkeypatch.setattr(tmux_workspace, "_subagent_script", lambda **_kwargs: "echo hi; exec $SHELL")
 
     pane_id = tmux_workspace.spawn_subagent_pane(
