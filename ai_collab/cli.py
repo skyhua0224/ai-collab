@@ -998,6 +998,7 @@ def resume_list(cwd: str, limit: int, json_output: bool) -> None:
     table.add_column("run_id", style="cyan")
     table.add_column("label", style="white")
     table.add_column("status", style="green")
+    table.add_column("phase", style="blue")
     table.add_column("updated_at", style="yellow")
     table.add_column("session", style="magenta")
     table.add_column("controller", style="white")
@@ -1008,6 +1009,7 @@ def resume_list(cwd: str, limit: int, json_output: bool) -> None:
             str(item.get("run_id", "")),
             label,
             str(item.get("status", "")),
+            str(item.get("phase", "")),
             str(item.get("updated_at", "")),
             str(item.get("session", "")),
             controller or "-",
@@ -1033,10 +1035,15 @@ def resume_show(run_id: str, cwd: str, json_output: bool) -> None:
         console.print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
     controller = state.get("controller", {})
+    tmux_state = state.get("tmux", {})
+    layout_history = tmux_state.get("layout_history", []) if isinstance(tmux_state, dict) else []
     console.print(f"[bold]run_id[/bold]: {state.get('run_id', run_id)}")
     console.print(f"[bold]label[/bold]: {state.get('label', '')}")
     console.print(f"[bold]session[/bold]: {state.get('session', '')}")
     console.print(f"[bold]controller[/bold]: {controller.get('agent', '')} @ {controller.get('pane_id', '')}")
+    console.print(f"[bold]controller_runtime_session_id[/bold]: {controller.get('runtime_session_id', '')}")
+    console.print(f"[bold]phase[/bold]: {state.get('phase', '')} ({state.get('phase_detail', '')})")
+    console.print(f"[bold]layout_updates[/bold]: {len(layout_history)}")
     console.print(f"[bold]updated_at[/bold]: {state.get('updated_at', '')}")
     if pending:
         console.print("[bold yellow]pending steps:[/bold yellow]")
@@ -1146,6 +1153,16 @@ def resume_recover(run_id: str, cwd: str, session: Optional[str], attach: bool, 
 
     store.rebind_controller(session=target_session, pane_id=controller_pane)
     store.set_agent_status(agent=controller_agent, status="running", detail="resumed")
+    store.set_phase(
+        phase="resumed",
+        detail=f"{target_session}:{controller_pane}",
+        source="resume",
+    )
+    _record_tmux_layout_snapshot(
+        run_store=store,
+        session=target_session,
+        reason="resume_recover",
+    )
     store.append_event(
         event_type="run_resumed",
         source="resume",
@@ -3378,6 +3395,26 @@ def _emit_relay_event(
             agent=agent,
             payload=payload or {"message": message},
         )
+        if event_type in {"step_done", "subagent_complete", "subagent_hard_timeout", "subagent_error_detected"}:
+            run_store.set_phase(
+                phase="monitoring",
+                detail=f"{event_type}:{agent or 'controller'}",
+                source=source,
+            )
+        if event_type in {
+            "subagent_spawned",
+            "subagent_complete",
+            "subagent_complete_legacy",
+            "subagent_hard_timeout",
+            "subagent_error_detected",
+            "handoff_request",
+            "handoff_request_legacy",
+        }:
+            _record_tmux_layout_snapshot(
+                run_store=run_store,
+                session=session,
+                reason=f"event:{event_type}",
+            )
 
     if _relay_to_controller_status_enabled():
         subprocess.run(
@@ -3531,6 +3568,129 @@ def _extract_step_done_ids(text: str) -> list[str]:
         if token and not token.startswith("<"):
             step_ids.append(token)
     return step_ids
+
+
+def _extract_runtime_session_ids(text: str) -> list[str]:
+    """Best-effort extraction for agent runtime session/conversation IDs."""
+    normalized = _normalize_terminal_text_for_markers(text)
+    ids: list[str] = []
+    patterns = [
+        re.compile(
+            r"(?im)\b(?:session|conversation|chat)(?:\s*_?\s*id)?\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9._:-]{5,})"
+        ),
+        re.compile(r"(?im)\bresume\s+([A-Za-z0-9][A-Za-z0-9._:-]{5,})"),
+    ]
+    for pattern in patterns:
+        for match in pattern.findall(normalized):
+            token = str(match).strip().strip(",.;")
+            if not token:
+                continue
+            if token not in ids:
+                ids.append(token)
+    return ids
+
+
+def _capture_tmux_layout_snapshot(*, session: str, preview_lines: int = 6) -> dict[str, Any]:
+    """Capture tmux window/pane topology plus light pane content preview."""
+    if shutil.which("tmux") is None:
+        return {"session": session, "available": False, "reason": "tmux_missing"}
+    windows_cmd = subprocess.run(
+        ["tmux", "list-windows", "-t", session, "-F", "#{window_index}\t#{window_name}\t#{window_active}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if windows_cmd.returncode != 0:
+        return {
+            "session": session,
+            "available": False,
+            "reason": (windows_cmd.stderr or "").strip() or "list_windows_failed",
+        }
+    windows: list[dict[str, Any]] = []
+    for line in windows_cmd.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        index, name, active = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        pane_cmd = subprocess.run(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                f"{session}:{index}",
+                "-F",
+                "#{pane_id}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_title}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        panes: list[dict[str, Any]] = []
+        if pane_cmd.returncode == 0:
+            for row in pane_cmd.stdout.splitlines():
+                cols = row.split("\t")
+                if len(cols) < 8:
+                    continue
+                pane_id = cols[0].strip()
+                preview = ""
+                if preview_lines > 0:
+                    preview_cmd = subprocess.run(
+                        ["tmux", "capture-pane", "-p", "-J", "-t", pane_id, "-S", f"-{max(1, int(preview_lines))}"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if preview_cmd.returncode == 0:
+                        preview_rows = [row.strip() for row in preview_cmd.stdout.splitlines() if row.strip()]
+                        preview = " | ".join(preview_rows[-min(3, len(preview_rows)):])[:420]
+                panes.append(
+                    {
+                        "pane_id": pane_id,
+                        "active": cols[1].strip(),
+                        "left": cols[2].strip(),
+                        "top": cols[3].strip(),
+                        "width": cols[4].strip(),
+                        "height": cols[5].strip(),
+                        "command": cols[6].strip(),
+                        "title": cols[7].strip(),
+                        "preview": preview,
+                    }
+                )
+        windows.append(
+            {
+                "index": index,
+                "name": name,
+                "active": active,
+                "panes": panes,
+            }
+        )
+    return {"session": session, "available": True, "windows": windows}
+
+
+def _record_tmux_layout_snapshot(*, run_store: Optional[RunStateStore], session: str, reason: str) -> None:
+    """Store tmux snapshot diff into run state whenever topology/content changes."""
+    if run_store is None:
+        return
+    snapshot = _capture_tmux_layout_snapshot(session=session, preview_lines=6)
+    changed = run_store.update_tmux_layout_snapshot(
+        session=session,
+        snapshot=snapshot,
+        reason=reason,
+    )
+    if changed:
+        windows = snapshot.get("windows", []) if isinstance(snapshot, dict) else []
+        pane_count = 0
+        if isinstance(windows, list):
+            pane_count = sum(len(item.get("panes", [])) for item in windows if isinstance(item, dict))
+        run_store.append_event(
+            event_type="tmux_layout_changed",
+            source="tmux",
+            payload={
+                "reason": reason,
+                "window_count": len(windows) if isinstance(windows, list) else 0,
+                "pane_count": pane_count,
+            },
+        )
 
 
 def _extract_ai_collab_events(text: str) -> list[dict[str, Any]]:
@@ -3746,6 +3906,7 @@ def _start_subagent_status_relay(
 
         if run_store is not None:
             run_store.set_agent_status(agent=agent, status="running")
+            run_store.set_phase(phase="monitoring", detail=f"watching:{agent}", source="relay")
             run_store.append_event(
                 event_type="subagent_started",
                 source="relay",
@@ -3786,6 +3947,14 @@ def _start_subagent_status_relay(
                     evt_run = str(event.get("run_id", "")).strip()
                     evt_step = str(event.get("step_id", "")).strip()
                     evt_nonce = str(event.get("nonce", "")).strip()
+                    evt_session_id = str(
+                        event.get("session_id")
+                        or event.get("runtime_session_id")
+                        or event.get("conversation_id")
+                        or ""
+                    ).strip()
+                    if run_store is not None and evt_session_id:
+                        run_store.set_agent_runtime_session_id(agent=agent, runtime_session_id=evt_session_id)
                     evt_key = f"{evt_type}|{evt_run}|{evt_step}|{evt_nonce}"
                     if evt_key in seen_structured:
                         continue
@@ -3934,6 +4103,9 @@ def _start_subagent_status_relay(
                     return
             issue_now = time.monotonic()
             idle_now = issue_now - last_progress
+            if run_store is not None:
+                for runtime_id in _extract_runtime_session_ids(delta):
+                    run_store.set_agent_runtime_session_id(agent=agent, runtime_session_id=runtime_id)
             issue = _classify_watch_issue(delta) or _classify_watch_issue(tail)
             if issue:
                 if issue != active_issue:
@@ -4026,6 +4198,11 @@ def _spawn_subagent_with_prompt(
     )
     if run_store is not None:
         run_store.bind_agent(agent=agent, pane_id=pane_id, step_tickets=step_tickets)
+        run_store.set_phase(
+            phase="subagent_spawned",
+            detail=f"{agent}:{pane_id}",
+            source="controller",
+        )
         run_store.append_event(
             event_type="subagent_spawned",
             source="controller",
@@ -4034,6 +4211,11 @@ def _spawn_subagent_with_prompt(
                 "pane_id": pane_id,
                 "step_ids": [ticket.get("step_id", "") for ticket in step_tickets],
             },
+        )
+        _record_tmux_layout_snapshot(
+            run_store=run_store,
+            session=session,
+            reason=f"spawn:{agent}",
         )
     sub_prompt = _build_subagent_prompt(
         task=task,
@@ -4125,7 +4307,11 @@ def _start_handoff_watcher(
                 unchanged += 1
             else:
                 unchanged = 0
+                delta = tail[len(last_tail):] if tail.startswith(last_tail) else tail
                 last_tail = tail
+                if run_store is not None:
+                    for runtime_id in _extract_runtime_session_ids(delta):
+                        run_store.set_controller_runtime_session_id(runtime_session_id=runtime_id)
                 for match in _extract_handoff_targets(tail):
                     key = match.lower()
                     agent = canonical.get(key)
@@ -4334,6 +4520,11 @@ def _launch_tmux_orchestration(
         controller_agent=controller,
         controller_pane=controller_pane,
     )
+    run_store.set_phase(
+        phase="controller_started",
+        detail=f"{controller}:{controller_pane}",
+        source="controller",
+    )
     run_store.append_event(
         event_type="run_started",
         source="controller",
@@ -4344,6 +4535,11 @@ def _launch_tmux_orchestration(
             "tmux_target": tmux_target,
             "prewarm_subagents": prewarm_subagents,
         },
+    )
+    _record_tmux_layout_snapshot(
+        run_store=run_store,
+        session=resolved_session,
+        reason="run_started",
     )
     console.print(f"[dim]run_id: {run_store.run_id}[/dim]")
 

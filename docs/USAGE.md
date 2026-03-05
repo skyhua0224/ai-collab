@@ -100,6 +100,12 @@ ai-collab resume rename <run_id> "phase1-hotfix"
 ai-collab resume recover <run_id> -w . -A
 ```
 
+Resume state includes:
+
+1. Controller/sub-agent pane bindings and runtime session ids (when detectable from terminal output).
+2. Pending step checklist and phase history.
+3. tmux topology/content snapshots (captured when topology/event changes).
+
 ## 3) Runner Mode Patterns
 
 ### Interactive default

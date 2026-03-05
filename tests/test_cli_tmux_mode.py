@@ -986,6 +986,27 @@ def test_extract_step_done_ids_accepts_live_line_suffix_noise() -> None:
     assert cli._extract_step_done_ids(text) == ["S2"]
 
 
+def test_extract_runtime_session_ids_from_common_lines() -> None:
+    """Runtime session ids should be parsed from common session/conversation markers."""
+    text = """
+Session ID: abcdef123456
+conversation_id=run-8899-xy
+resume ZZZ998877
+"""
+    values = cli._extract_runtime_session_ids(text)
+    assert "abcdef123456" in values
+    assert "run-8899-xy" in values
+    assert "ZZZ998877" in values
+
+
+def test_capture_tmux_layout_snapshot_returns_unavailable_when_tmux_missing(monkeypatch) -> None:
+    """Layout snapshot helper should degrade gracefully when tmux is unavailable."""
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: None)
+    snapshot = cli._capture_tmux_layout_snapshot(session="s1", preview_lines=3)
+    assert snapshot["available"] is False
+    assert snapshot["session"] == "s1"
+
+
 def test_extract_ai_collab_events_parses_json_lines() -> None:
     """Structured AI_COLLAB_EVENT lines should parse into dict payloads."""
     text = """

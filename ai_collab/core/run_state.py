@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import threading
@@ -59,13 +60,31 @@ class RunStateStore:
             "label": "",
             "created_at": _utc_now(),
             "updated_at": _utc_now(),
+            "phase": "created",
+            "phase_detail": "run_initialized",
+            "phase_history": [
+                {
+                    "phase": "created",
+                    "detail": "run_initialized",
+                    "source": "system",
+                    "ts": _utc_now(),
+                }
+            ],
             "session": session,
             "controller": {
                 "agent": controller_agent,
                 "pane_id": controller_pane,
+                "runtime_session_id": "",
             },
             "agents": {},
             "steps": {},
+            "tmux": {
+                "session": session,
+                "layout_hash": "",
+                "layout_updated_at": "",
+                "layout_snapshot": {},
+                "layout_history": [],
+            },
         }
         self._write_binding()
         self._write_state()
@@ -141,6 +160,8 @@ class RunStateStore:
                     "label": str(state.get("label", "")).strip(),
                     "created_at": str(state.get("created_at", "")),
                     "updated_at": str(state.get("updated_at", "")),
+                    "phase": str(state.get("phase", "")).strip(),
+                    "phase_detail": str(state.get("phase_detail", "")).strip(),
                     "session": str(state.get("session", "")),
                     "controller_agent": str(controller.get("agent", "")),
                     "controller_pane": str(controller.get("pane_id", "")),
@@ -185,6 +206,8 @@ class RunStateStore:
             "created_at": self._state.get("created_at"),
             "updated_at": self._state.get("updated_at"),
             "label": self._state.get("label", ""),
+            "phase": self._state.get("phase", ""),
+            "phase_detail": self._state.get("phase_detail", ""),
         }
         self.paths.binding_file.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -218,7 +241,91 @@ class RunStateStore:
             controller = self._state.setdefault("controller", {})
             controller["pane_id"] = pane_id
             controller.setdefault("agent", "")
+            tmux_state = self._state.setdefault("tmux", {})
+            tmux_state["session"] = session
+            self._state["phase"] = "rebound"
+            self._state["phase_detail"] = f"controller={pane_id}"
+            self._state.setdefault("phase_history", []).append(
+                {
+                    "phase": "rebound",
+                    "detail": f"controller={pane_id}",
+                    "source": "resume",
+                    "ts": _utc_now(),
+                }
+            )
             self._write_state()
+
+    def set_phase(self, *, phase: str, detail: str = "", source: str = "system") -> None:
+        """Track orchestration lifecycle phases with append-only history."""
+        value = str(phase).strip().lower()
+        if not value:
+            return
+        info = str(detail).strip()
+        entry = {
+            "phase": value,
+            "detail": info,
+            "source": str(source).strip() or "system",
+            "ts": _utc_now(),
+        }
+        with self._lock:
+            history = self._state.setdefault("phase_history", [])
+            if history and history[-1].get("phase") == value and history[-1].get("detail", "") == info:
+                self._state["phase"] = value
+                self._state["phase_detail"] = info
+                return
+            history.append(entry)
+            self._state["phase"] = value
+            self._state["phase_detail"] = info
+            self._write_state()
+
+    def set_controller_runtime_session_id(self, *, runtime_session_id: str) -> None:
+        value = str(runtime_session_id).strip()
+        if not value:
+            return
+        with self._lock:
+            controller = self._state.setdefault("controller", {})
+            if str(controller.get("runtime_session_id", "")).strip() == value:
+                return
+            controller["runtime_session_id"] = value
+            self._write_state()
+
+    def set_agent_runtime_session_id(self, *, agent: str, runtime_session_id: str) -> None:
+        value = str(runtime_session_id).strip()
+        name = str(agent).strip()
+        if not value or not name:
+            return
+        with self._lock:
+            agent_state = self._state.setdefault("agents", {}).setdefault(name, {})
+            if str(agent_state.get("runtime_session_id", "")).strip() == value:
+                return
+            agent_state["runtime_session_id"] = value
+            self._write_state()
+
+    def update_tmux_layout_snapshot(self, *, session: str, snapshot: dict[str, Any], reason: str) -> bool:
+        """Persist tmux layout snapshot only when topology/content changed."""
+        canonical = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()  # noqa: S324
+        with self._lock:
+            tmux_state = self._state.setdefault("tmux", {})
+            previous = str(tmux_state.get("layout_hash", "")).strip()
+            tmux_state["session"] = str(session).strip()
+            if previous == digest:
+                return False
+            tmux_state["layout_hash"] = digest
+            tmux_state["layout_snapshot"] = snapshot
+            tmux_state["layout_updated_at"] = _utc_now()
+            history = tmux_state.setdefault("layout_history", [])
+            history.append(
+                {
+                    "hash": digest,
+                    "reason": str(reason).strip() or "unknown",
+                    "ts": tmux_state["layout_updated_at"],
+                }
+            )
+            if len(history) > 60:
+                del history[:-60]
+            self._write_state()
+        return True
 
     def bind_agent(self, *, agent: str, pane_id: str, step_tickets: list[dict[str, str]]) -> None:
         with self._lock:
@@ -229,6 +336,7 @@ class RunStateStore:
                     "status": "running",
                     "last_event_at": _utc_now(),
                     "step_tickets": step_tickets,
+                    "runtime_session_id": str(agent_state.get("runtime_session_id", "")).strip(),
                 }
             )
             for ticket in step_tickets:
@@ -239,11 +347,22 @@ class RunStateStore:
                     step_id,
                     {
                         "agent": agent,
-                        "nonce": ticket.get("nonce", ""),
-                        "status": "assigned",
-                        "updated_at": _utc_now(),
-                    },
+                            "nonce": ticket.get("nonce", ""),
+                            "status": "assigned",
+                            "updated_at": _utc_now(),
+                            "stage": "assigned",
+                        },
                 )
+            self._state["phase"] = "subagent_spawned"
+            self._state["phase_detail"] = f"{agent}:{pane_id}"
+            self._state.setdefault("phase_history", []).append(
+                {
+                    "phase": "subagent_spawned",
+                    "detail": f"{agent}:{pane_id}",
+                    "source": "controller",
+                    "ts": _utc_now(),
+                }
+            )
             self._write_state()
 
     def set_agent_status(self, *, agent: str, status: str, detail: str = "") -> None:
@@ -252,6 +371,17 @@ class RunStateStore:
             agent_state["status"] = status
             agent_state["detail"] = detail
             agent_state["last_event_at"] = _utc_now()
+            if status in {"completed", "done"}:
+                self._state["phase"] = "subagent_completed"
+                self._state["phase_detail"] = f"{agent}:{status}"
+                self._state.setdefault("phase_history", []).append(
+                    {
+                        "phase": "subagent_completed",
+                        "detail": f"{agent}:{status}",
+                        "source": "relay",
+                        "ts": _utc_now(),
+                    }
+                )
             self._write_state()
 
     def set_step_status(
@@ -266,6 +396,7 @@ class RunStateStore:
         with self._lock:
             step = self._state.setdefault("steps", {}).setdefault(step_id, {})
             step["status"] = status
+            step["stage"] = status
             if agent:
                 step["agent"] = agent
             if nonce:
@@ -273,6 +404,17 @@ class RunStateStore:
             if summary:
                 step["summary"] = summary
             step["updated_at"] = _utc_now()
+            if str(status).strip().lower() in {"done", "complete", "completed", "accepted"}:
+                self._state["phase"] = "step_completed"
+                self._state["phase_detail"] = f"{step_id}:{status}"
+                self._state.setdefault("phase_history", []).append(
+                    {
+                        "phase": "step_completed",
+                        "detail": f"{step_id}:{status}",
+                        "source": "relay",
+                        "ts": _utc_now(),
+                    }
+                )
             self._write_state()
 
     def expected_nonce_for_step(self, *, step_id: str) -> str | None:
