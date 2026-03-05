@@ -999,6 +999,7 @@ def resume_list(cwd: str, limit: int, json_output: bool) -> None:
     table.add_column("label", style="white")
     table.add_column("status", style="green")
     table.add_column("phase", style="blue")
+    table.add_column("entry_prompt", style="white", no_wrap=True, overflow="ellipsis", max_width=36)
     table.add_column("updated_at", style="yellow")
     table.add_column("session", style="magenta")
     table.add_column("controller", style="white")
@@ -1010,6 +1011,7 @@ def resume_list(cwd: str, limit: int, json_output: bool) -> None:
             label,
             str(item.get("status", "")),
             str(item.get("phase", "")),
+            str(item.get("entry_prompt_preview", "")).strip() or "-",
             str(item.get("updated_at", "")),
             str(item.get("session", "")),
             controller or "-",
@@ -1043,6 +1045,7 @@ def resume_show(run_id: str, cwd: str, json_output: bool) -> None:
     console.print(f"[bold]controller[/bold]: {controller.get('agent', '')} @ {controller.get('pane_id', '')}")
     console.print(f"[bold]controller_runtime_session_id[/bold]: {controller.get('runtime_session_id', '')}")
     console.print(f"[bold]phase[/bold]: {state.get('phase', '')} ({state.get('phase_detail', '')})")
+    console.print(f"[bold]entry_prompt[/bold]: {state.get('entry_prompt', '')}")
     console.print(f"[bold]layout_updates[/bold]: {len(layout_history)}")
     console.print(f"[bold]updated_at[/bold]: {state.get('updated_at', '')}")
     if pending:
@@ -1152,6 +1155,7 @@ def resume_recover(run_id: str, cwd: str, session: Optional[str], attach: bool, 
     )
 
     store.rebind_controller(session=target_session, pane_id=controller_pane)
+    store.set_entry_prompt(text=dispatch)
     store.set_agent_status(agent=controller_agent, status="running", detail="resumed")
     store.set_phase(
         phase="resumed",
@@ -4489,6 +4493,7 @@ def _launch_tmux_orchestration(
         controller_prompt = generated_prompt
 
     controller_prompt_ready = True
+    entry_prompt_text = ""
     if controller_prompt:
         briefing_file = _write_briefing_file(
             cwd=cwd,
@@ -4503,6 +4508,7 @@ def _launch_tmux_orchestration(
             role="controller",
             agent=controller,
         )
+        entry_prompt_text = dispatch_text
         injected = _inject_prompt_to_pane(
             pane_id=controller_pane,
             text=dispatch_text,
@@ -4520,6 +4526,7 @@ def _launch_tmux_orchestration(
         controller_agent=controller,
         controller_pane=controller_pane,
     )
+    run_store.set_entry_prompt(text=entry_prompt_text or controller_prompt or task)
     run_store.set_phase(
         phase="controller_started",
         detail=f"{controller}:{controller_pane}",
@@ -4531,6 +4538,7 @@ def _launch_tmux_orchestration(
         agent=controller,
         payload={
             "task": task,
+            "entry_prompt_preview": (entry_prompt_text or controller_prompt or task)[:240],
             "execution_mode": "tmux",
             "tmux_target": tmux_target,
             "prewarm_subagents": prewarm_subagents,

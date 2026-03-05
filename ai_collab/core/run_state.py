@@ -23,6 +23,13 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _preview_text(text: str, *, limit: int = 110) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 1)].rstrip() + "…"
+
+
 @dataclass(frozen=True)
 class RunPaths:
     run_id: str
@@ -58,6 +65,7 @@ class RunStateStore:
         self._state: dict[str, Any] = {
             "run_id": run_id,
             "label": "",
+            "entry_prompt": "",
             "created_at": _utc_now(),
             "updated_at": _utc_now(),
             "phase": "created",
@@ -158,6 +166,7 @@ class RunStateStore:
                 {
                     "run_id": run_id,
                     "label": str(state.get("label", "")).strip(),
+                    "entry_prompt_preview": _preview_text(str(state.get("entry_prompt", "")).strip()),
                     "created_at": str(state.get("created_at", "")),
                     "updated_at": str(state.get("updated_at", "")),
                     "phase": str(state.get("phase", "")).strip(),
@@ -206,6 +215,7 @@ class RunStateStore:
             "created_at": self._state.get("created_at"),
             "updated_at": self._state.get("updated_at"),
             "label": self._state.get("label", ""),
+            "entry_prompt_preview": _preview_text(str(self._state.get("entry_prompt", "")).strip()),
             "phase": self._state.get("phase", ""),
             "phase_detail": self._state.get("phase_detail", ""),
         }
@@ -233,6 +243,11 @@ class RunStateStore:
     def set_label(self, *, label: str) -> None:
         with self._lock:
             self._state["label"] = str(label).strip()
+            self._write_state()
+
+    def set_entry_prompt(self, *, text: str) -> None:
+        with self._lock:
+            self._state["entry_prompt"] = str(text).strip()
             self._write_state()
 
     def rebind_controller(self, *, session: str, pane_id: str) -> None:

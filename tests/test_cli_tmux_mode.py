@@ -468,11 +468,14 @@ def test_resume_list_show_rename_roundtrip(tmp_path) -> None:
         controller_agent="codex",
         controller_pane="%1",
     )
+    store.set_entry_prompt(text="Read and execute task file: /tmp/briefing.md")
     runner = CliRunner()
 
     listed = runner.invoke(cli.main, ["resume", "list", "-w", str(tmp_path), "-j"])
     assert listed.exit_code == 0
     assert store.run_id in listed.output
+    assert "entry_prompt_preview" in listed.output
+    assert "Read and execute task file" in listed.output
 
     renamed = runner.invoke(
         cli.main,

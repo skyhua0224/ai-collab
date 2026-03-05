@@ -51,6 +51,7 @@ def test_run_state_store_load_list_and_rebind(tmp_path) -> None:
     loaded = RunStateStore.load(cwd=tmp_path, run_id=store.run_id)
     assert loaded is not None
     loaded.set_label(label="nightly-rollback")
+    loaded.set_entry_prompt(text="Read and execute task file: /tmp/controller-brief.txt")
     loaded.rebind_controller(session="s2", pane_id="%9")
 
     state = loaded.snapshot()
@@ -63,6 +64,8 @@ def test_run_state_store_load_list_and_rebind(tmp_path) -> None:
     assert items[0]["run_id"] == store.run_id
     assert items[0]["status"] in {"running", "paused", "created", "completed", "degraded"}
     assert "phase" in items[0]
+    assert "entry_prompt_preview" in items[0]
+    assert "Read and execute task file" in items[0]["entry_prompt_preview"]
 
 
 def test_run_state_store_tracks_runtime_ids_phase_and_layout_snapshots(tmp_path) -> None:
