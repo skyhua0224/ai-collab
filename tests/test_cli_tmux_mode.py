@@ -8,6 +8,7 @@ import ai_collab.cli as cli
 from click.testing import CliRunner
 from ai_collab.core.config import Config
 from ai_collab.core.detector import CollaborationResult
+from ai_collab.core.run_state import RunStateStore
 
 
 def _sample_result() -> SimpleNamespace:
@@ -446,6 +447,89 @@ def test_help_relay_smoke_shows_short_and_long_options() -> None:
     assert "-k, --keep-pane / -K, --auto-close-pane" in result.output
 
 
+def test_help_resume_group_and_list_show_short_and_long_options() -> None:
+    """resume group/list help should expose standard short+long flags."""
+    runner = CliRunner()
+    group_help = runner.invoke(cli.main, ["resume", "--help"])
+    list_help = runner.invoke(cli.main, ["resume", "list", "--help"])
+    assert group_help.exit_code == 0
+    assert list_help.exit_code == 0
+    assert "recover" in group_help.output
+    assert "-w, --cwd" in list_help.output
+    assert "-n, --limit" in list_help.output
+    assert "-j, --json-output" in list_help.output
+
+
+def test_resume_list_show_rename_roundtrip(tmp_path) -> None:
+    """resume list/show/rename should read and update persisted run state."""
+    store = RunStateStore.create(
+        cwd=tmp_path,
+        session="s1",
+        controller_agent="codex",
+        controller_pane="%1",
+    )
+    runner = CliRunner()
+
+    listed = runner.invoke(cli.main, ["resume", "list", "-w", str(tmp_path), "-j"])
+    assert listed.exit_code == 0
+    assert store.run_id in listed.output
+
+    renamed = runner.invoke(
+        cli.main,
+        ["resume", "rename", store.run_id, "nightly-checkpoint", "-w", str(tmp_path)],
+    )
+    assert renamed.exit_code == 0
+    assert "nightly-checkpoint" in renamed.output
+
+    shown = runner.invoke(cli.main, ["resume", "show", store.run_id, "-w", str(tmp_path), "-j"])
+    assert shown.exit_code == 0
+    assert "nightly-checkpoint" in shown.output
+    assert store.run_id in shown.output
+
+
+def test_resume_recover_recreates_session_and_rebinds(monkeypatch, tmp_path) -> None:
+    """resume recover should recreate missing tmux session and update controller binding."""
+    store = RunStateStore.create(
+        cwd=tmp_path,
+        session="lost-session",
+        controller_agent="codex",
+        controller_pane="%1",
+    )
+    attach_called = {"count": 0}
+
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: "/usr/bin/tmux")
+    monkeypatch.setattr(cli, "_tmux_session_exists", lambda _session: False)
+    monkeypatch.setattr(cli, "create_controller_workspace", lambda **_kwargs: "%99")
+    monkeypatch.setattr(
+        cli,
+        "_write_briefing_file",
+        lambda **_kwargs: tmp_path / "briefing.txt",
+    )
+    monkeypatch.setattr(cli, "_build_prompt_dispatch_message", lambda **_kwargs: "resume dispatch")
+    monkeypatch.setattr(cli, "_inject_prompt_to_pane", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        cli,
+        "attach_session",
+        lambda **_kwargs: attach_called.__setitem__("count", attach_called["count"] + 1),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        ["resume", "recover", store.run_id, "-w", str(tmp_path), "-A", "-j"],
+    )
+    assert result.exit_code == 0
+    assert '"created_new_session": true' in result.output
+    assert '"controller_pane": "%99"' in result.output
+    assert attach_called["count"] == 0
+
+    loaded = RunStateStore.load(cwd=tmp_path, run_id=store.run_id)
+    assert loaded is not None
+    state = loaded.snapshot()
+    assert state["session"] == "lost-session"
+    assert state["controller"]["pane_id"] == "%99"
+
+
 def test_help_root_group_supports_short_help_and_version_flags() -> None:
     """Root click group help should expose standard short/long help and version flags."""
     runner = CliRunner()
@@ -512,6 +596,21 @@ def test_project_main_routes_tmux_open_and_close_test_to_click_main(monkeypatch)
 
     assert calls[0][0] == "tmux-open"
     assert calls[1][0] == "tmux-close-test"
+
+
+def test_project_main_routes_resume_to_click_main(monkeypatch) -> None:
+    """project_main should route resume command to click main."""
+    captured = {"args": []}
+
+    def _fake_click_main(*, args, prog_name, standalone_mode):  # noqa: ARG001
+        captured["args"] = list(args)
+
+    monkeypatch.setattr(cli.main, "main", _fake_click_main)
+    monkeypatch.setattr(cli.sys, "argv", ["ai-collab", "resume", "list"])
+
+    cli.project_main()
+
+    assert captured["args"] == ["resume", "list"]
 
 
 def test_project_main_accepts_short_version_flag(monkeypatch) -> None:

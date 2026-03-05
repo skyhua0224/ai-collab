@@ -907,6 +907,281 @@ def status(ctx: click.Context) -> None:
         console.print(f"  {configured_icon} {name}: {provider.cli}{suffix}")
 
 
+@main.group()
+def resume() -> None:
+    """Inspect and recover persisted orchestration runs."""
+
+
+def _resume_pending_steps(state: dict[str, Any]) -> list[tuple[str, str, str]]:
+    steps = state.get("steps", {})
+    rows: list[tuple[str, str, str]] = []
+    if not isinstance(steps, dict):
+        return rows
+    done_values = {"done", "complete", "completed", "accepted"}
+    for step_id, details in steps.items():
+        if not isinstance(details, dict):
+            continue
+        status = str(details.get("status", "")).strip().lower()
+        if status in done_values:
+            continue
+        agent = str(details.get("agent", "")).strip()
+        rows.append((str(step_id), agent, status or "pending"))
+    rows.sort(key=lambda item: item[0])
+    return rows
+
+
+def _tmux_pane_exists_in_session(*, session: str, pane_id: str) -> bool:
+    target = str(pane_id).strip()
+    if not target:
+        return False
+    result = subprocess.run(
+        ["tmux", "list-panes", "-t", session, "-F", "#{pane_id}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    panes = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    return target in panes
+
+
+def _spawn_resume_controller_pane(*, session: str, cwd: Path, controller_agent: str) -> str:
+    shell = os.environ.get("SHELL", "zsh")
+    pane = subprocess.run(
+        [
+            "tmux",
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            session,
+            "-n",
+            "ai-collab-resume",
+            "-c",
+            str(cwd),
+            shell,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if pane.returncode != 0 or not pane.stdout.strip():
+        raise TmuxWorkspaceError((pane.stderr or "").strip() or "failed to create resume controller pane")
+    pane_id = pane.stdout.strip()
+    send_pane_text(
+        pane_id=pane_id,
+        text=controller_agent,
+        press_enter=True,
+        delay_seconds=0.6,
+    )
+    return pane_id
+
+
+@resume.command(name="list")
+@click.option("--cwd", "-w", default=".", show_default=True, help="Workspace root containing .ai-collab/runs")
+@click.option("--limit", "-n", type=int, default=20, show_default=True, help="Max runs to show")
+@click.option("--json-output", "-j", is_flag=True, help="Print result as JSON")
+def resume_list(cwd: str, limit: int, json_output: bool) -> None:
+    """List resumable orchestration runs."""
+    root = Path(cwd).expanduser().resolve()
+    runs = RunStateStore.list_runs(cwd=root, limit=max(1, int(limit)))
+    if json_output:
+        console.print(json.dumps(runs, ensure_ascii=False, indent=2))
+        return
+    if not runs:
+        console.print("[yellow]No run state found under .ai-collab/runs[/yellow]")
+        return
+    table = Table(title=f"Resumable Runs ({len(runs)})")
+    table.add_column("run_id", style="cyan")
+    table.add_column("label", style="white")
+    table.add_column("status", style="green")
+    table.add_column("updated_at", style="yellow")
+    table.add_column("session", style="magenta")
+    table.add_column("controller", style="white")
+    for item in runs:
+        label = str(item.get("label", "")).strip() or "-"
+        controller = f"{item.get('controller_agent', '')}:{item.get('controller_pane', '')}".strip(":")
+        table.add_row(
+            str(item.get("run_id", "")),
+            label,
+            str(item.get("status", "")),
+            str(item.get("updated_at", "")),
+            str(item.get("session", "")),
+            controller or "-",
+        )
+    console.print(table)
+
+
+@resume.command(name="show")
+@click.argument("run_id", required=True)
+@click.option("--cwd", "-w", default=".", show_default=True, help="Workspace root containing .ai-collab/runs")
+@click.option("--json-output", "-j", is_flag=True, help="Print result as JSON")
+def resume_show(run_id: str, cwd: str, json_output: bool) -> None:
+    """Show one run state detail."""
+    root = Path(cwd).expanduser().resolve()
+    store = RunStateStore.load(cwd=root, run_id=run_id)
+    if store is None:
+        console.print(f"[red]Run not found:[/red] {run_id}")
+        raise SystemExit(2)
+    state = store.snapshot()
+    pending = _resume_pending_steps(state)
+    if json_output:
+        payload = {"state": state, "pending_steps": pending}
+        console.print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    controller = state.get("controller", {})
+    console.print(f"[bold]run_id[/bold]: {state.get('run_id', run_id)}")
+    console.print(f"[bold]label[/bold]: {state.get('label', '')}")
+    console.print(f"[bold]session[/bold]: {state.get('session', '')}")
+    console.print(f"[bold]controller[/bold]: {controller.get('agent', '')} @ {controller.get('pane_id', '')}")
+    console.print(f"[bold]updated_at[/bold]: {state.get('updated_at', '')}")
+    if pending:
+        console.print("[bold yellow]pending steps:[/bold yellow]")
+        for sid, agent, status in pending:
+            console.print(f"- {sid} | {agent or '-'} | {status}")
+    else:
+        console.print("[green]No pending steps in state snapshot.[/green]")
+
+
+@resume.command(name="rename")
+@click.argument("run_id", required=True)
+@click.argument("name", required=True)
+@click.option("--cwd", "-w", default=".", show_default=True, help="Workspace root containing .ai-collab/runs")
+def resume_rename(run_id: str, name: str, cwd: str) -> None:
+    """Assign a readable label for one run."""
+    root = Path(cwd).expanduser().resolve()
+    store = RunStateStore.load(cwd=root, run_id=run_id)
+    if store is None:
+        console.print(f"[red]Run not found:[/red] {run_id}")
+        raise SystemExit(2)
+    label = str(name).strip()
+    if not label:
+        console.print("[red]Name cannot be empty.[/red]")
+        raise SystemExit(2)
+    store.set_label(label=label)
+    store.append_event(
+        event_type="run_renamed",
+        source="resume",
+        payload={"label": label},
+    )
+    console.print(f"[green]renamed[/green] {run_id} -> {label}")
+
+
+@resume.command(name="recover")
+@click.argument("run_id", required=True)
+@click.option("--cwd", "-w", default=".", show_default=True, help="Workspace root containing .ai-collab/runs")
+@click.option("--session", "-s", help="Override tmux session name used for recovery")
+@click.option("-a/-A", "--attach/--no-attach", default=True, show_default=False, help="Attach tmux session after recovery")
+@click.option("--json-output", "-j", is_flag=True, help="Print recovery result as JSON")
+def resume_recover(run_id: str, cwd: str, session: Optional[str], attach: bool, json_output: bool) -> None:
+    """Recover controller session from persisted run state."""
+    if shutil.which("tmux") is None:
+        console.print("[red]tmux not found in PATH[/red]")
+        raise SystemExit(2)
+    root = Path(cwd).expanduser().resolve()
+    store = RunStateStore.load(cwd=root, run_id=run_id)
+    if store is None:
+        console.print(f"[red]Run not found:[/red] {run_id}")
+        raise SystemExit(2)
+
+    state = store.snapshot()
+    controller = state.get("controller", {})
+    controller_agent = str(controller.get("agent", "")).strip() or "codex"
+    previous_session = str(state.get("session", "")).strip()
+    target_session = str(session or previous_session or f"ai-collab-{run_id[:8]}").strip()
+    if not target_session:
+        target_session = f"ai-collab-{run_id[:8]}"
+
+    created_new_session = False
+    controller_pane = str(controller.get("pane_id", "")).strip()
+    if not _tmux_session_exists(target_session):
+        controller_pane = create_controller_workspace(
+            session=target_session,
+            cwd=root,
+            controller=controller_agent,
+            reset=False,
+            autorun=True,
+        )
+        created_new_session = True
+    elif not _tmux_pane_exists_in_session(session=target_session, pane_id=controller_pane):
+        controller_pane = _spawn_resume_controller_pane(
+            session=target_session,
+            cwd=root,
+            controller_agent=controller_agent,
+        )
+
+    pending = _resume_pending_steps(state)
+    pending_lines = "\n".join([f"- {sid} | {agent or '-'} | {status}" for sid, agent, status in pending]) or "- none"
+    prompt = (
+        f"Resume orchestration run: {run_id}\n"
+        f"Workspace: {root}\n"
+        f"Previous session: {previous_session or '-'}\n"
+        f"Recovered session: {target_session}\n"
+        f"Pending steps:\n{pending_lines}\n"
+        "Action:\n"
+        "1) Continue only pending scope and avoid redoing completed steps.\n"
+        "2) Use ai-collab tmux-watch with dynamic timeout decisions.\n"
+        "3) When sub-agent completes, ask user close/keep before next action."
+    )
+    briefing = _write_briefing_file(
+        cwd=root,
+        role="controller-resume",
+        agent=controller_agent,
+        text=prompt,
+    )
+    dispatch = _build_prompt_dispatch_message(
+        lang="en-US",
+        path=briefing,
+        role="controller-resume",
+        agent=controller_agent,
+    )
+    injected = _inject_prompt_to_pane(
+        pane_id=controller_pane,
+        text=dispatch,
+        agent=controller_agent,
+    )
+
+    store.rebind_controller(session=target_session, pane_id=controller_pane)
+    store.set_agent_status(agent=controller_agent, status="running", detail="resumed")
+    store.append_event(
+        event_type="run_resumed",
+        source="resume",
+        agent=controller_agent,
+        payload={
+            "previous_session": previous_session,
+            "session": target_session,
+            "controller_pane": controller_pane,
+            "created_new_session": created_new_session,
+            "prompt_injected": injected,
+        },
+    )
+
+    payload = {
+        "run_id": run_id,
+        "session": target_session,
+        "controller_agent": controller_agent,
+        "controller_pane": controller_pane,
+        "created_new_session": created_new_session,
+        "prompt_file": str(briefing),
+        "prompt_injected": injected,
+        "pending_steps": pending,
+    }
+    if json_output:
+        console.print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        console.print(
+            f"[green]resume recovered[/green] run={run_id} session={target_session} pane={controller_pane} "
+            f"pending={len(pending)}"
+        )
+        console.print(f"[dim]prompt file: {briefing}[/dim]")
+
+    if attach:
+        attach_session(session=target_session)
+
+
 @main.command()
 @click.option("--session", "-s", default="ai-collab", help="tmux session name")
 @click.option("--cwd", "-w", default=".", help="Workspace directory to open in panes")
@@ -5018,7 +5293,7 @@ def _print_project_help() -> None:
         "Management commands:\n"
         "  init, status, config, detect, list, monitor, tmux-status, tmux-capture,\n"
         "  tmux-watch, tmux-close-pane, relay-smoke, handoff, tmux-open,\n"
-        "  tmux-close-test, select\n\n"
+        "  tmux-close-test, resume, select\n\n"
         "Examples:\n"
         "  ai-collab \"implement JWT auth with review\"\n"
         "  ai-collab --execution-mode tmux --tmux-target inline \"deliver fullstack feature\"\n"
@@ -5037,6 +5312,7 @@ def project_main() -> None:
         "list",
         "monitor",
         "relay-smoke",
+        "resume",
         "select",
         "status",
         "tmux-capture",

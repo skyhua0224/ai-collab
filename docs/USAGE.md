@@ -41,6 +41,7 @@ Quick list (all support `--help`; optioned commands support short+long flags):
 13. `tmux-open`
 14. `tmux-close-test`
 15. `relay-smoke`
+16. `resume`
 
 ### Initialize
 
@@ -88,6 +89,15 @@ ai-collab tmux-open -a gemini -c %1 -p "Implement only API contract draft"
 
 ```bash
 ai-collab tmux-close-test -C codex -S claude -d 90 -t 60 -r 45
+```
+
+### Resume and recover orchestration runs
+
+```bash
+ai-collab resume list -w . -n 20
+ai-collab resume show <run_id> -w .
+ai-collab resume rename <run_id> "phase1-hotfix"
+ai-collab resume recover <run_id> -w . -A
 ```
 
 ## 3) Runner Mode Patterns

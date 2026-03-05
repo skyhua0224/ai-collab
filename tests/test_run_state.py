@@ -33,3 +33,32 @@ def test_run_state_store_writes_binding_state_and_events(tmp_path) -> None:
     assert state["steps"]["S2"]["status"] == "done"
     assert event["type"] == "step_done"
     assert len(lines) >= 1
+
+
+def test_run_state_store_load_list_and_rebind(tmp_path) -> None:
+    store = RunStateStore.create(
+        cwd=tmp_path,
+        session="s1",
+        controller_agent="codex",
+        controller_pane="%1",
+    )
+    store.bind_agent(
+        agent="gemini",
+        pane_id="%3",
+        step_tickets=[{"step_id": "S3", "nonce": "n3"}],
+    )
+
+    loaded = RunStateStore.load(cwd=tmp_path, run_id=store.run_id)
+    assert loaded is not None
+    loaded.set_label(label="nightly-rollback")
+    loaded.rebind_controller(session="s2", pane_id="%9")
+
+    state = loaded.snapshot()
+    assert state["label"] == "nightly-rollback"
+    assert state["session"] == "s2"
+    assert state["controller"]["pane_id"] == "%9"
+
+    items = RunStateStore.list_runs(cwd=tmp_path, limit=10)
+    assert items
+    assert items[0]["run_id"] == store.run_id
+    assert items[0]["status"] in {"running", "paused", "created", "completed", "degraded"}
