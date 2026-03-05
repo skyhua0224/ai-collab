@@ -462,7 +462,8 @@ def paste_pane_text(*, pane_id: str, text: str, press_enter: bool = True, delay_
 
 def capture_pane_text(*, pane_id: str, start_line: int = -200) -> str:
     """Capture pane text for readiness checks and debugging."""
-    return _run_tmux_capture(["capture-pane", "-p", "-S", str(start_line), "-t", pane_id])
+    # Join wrapped lines so structured relay markers (JSON/events) remain intact.
+    return _run_tmux_capture(["capture-pane", "-p", "-J", "-S", str(start_line), "-t", pane_id])
 
 
 def wait_for_pane_quiet(

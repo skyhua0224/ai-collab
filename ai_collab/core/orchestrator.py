@@ -39,67 +39,11 @@ ROLE_COMPLEXITY: Dict[str, str] = {
     "testing": "medium",
 }
 
-TASK_CAPABILITIES: Dict[str, List[str]] = {
-    "frontend": [
-        "frontend",
-        "ui",
-        "web",
-        "html",
-        "css",
-        "react",
-        "vue",
-        "页面",
-        "前端",
-        "界面",
-    ],
-    "backend": [
-        "backend",
-        "api",
-        "server",
-        "service",
-        "spring",
-        "flask",
-        "fastapi",
-        "express",
-        "后端",
-    ],
-    "persistence": [
-        "database",
-        "db",
-        "sqlite",
-        "mysql",
-        "postgres",
-        "redis",
-        "存储",
-        "持久化",
-        "保存数据",
-    ],
-    "architecture": [
-        "architecture",
-        "design",
-        "framework",
-        "tech stack",
-        "选型",
-        "技术选型",
-        "架构",
-        "方案",
-        "框架",
-    ],
-    "research": [
-        "research",
-        "benchmark",
-        "study",
-        "调研",
-        "对比",
-        "探索",
-    ],
-    "testing": [
-        "test",
-        "tdd",
-        "coverage",
-        "测试",
-        "回归",
-    ],
+PHASE_ROLE_MAP: Dict[str, str] = {
+    "discover": "ecosystem-research",
+    "define": "tech-selection",
+    "develop": "implementation",
+    "deliver": "quality-review",
 }
 
 
@@ -119,8 +63,12 @@ class OrchestrationPlanner:
         trigger_name: Optional[str] = None,
     ) -> Dict[str, object]:
         available_agents = self._available_agents(task)
-        capabilities = self._infer_capabilities(task)
-        roles = self._plan_roles(capabilities=capabilities, intent=intent, trigger_name=trigger_name)
+        roles = self._plan_roles(
+            task=task,
+            intent=intent,
+            trigger_name=trigger_name,
+            available_agents=available_agents,
+        )
 
         steps: List[Dict[str, str]] = []
         for role in roles:
@@ -142,7 +90,7 @@ class OrchestrationPlanner:
         mode = "multi-agent" if len(selected_agents) > 1 else "single-agent"
         return {
             "mode": mode,
-            "capabilities": sorted(capabilities),
+            "capabilities": [],
             "available_agents": available_agents,
             "selected_agents": selected_agents,
             "orchestration_plan": steps,
@@ -179,24 +127,22 @@ class OrchestrationPlanner:
         mode = str(provider_cfg.model_selection or "default").strip()
         return mode or "default"
 
-    def _infer_capabilities(self, task: str) -> Set[str]:
-        task_lower = task.lower()
-        capabilities: Set[str] = set()
-        for capability, keywords in TASK_CAPABILITIES.items():
-            if any(keyword.lower() in task_lower for keyword in keywords):
-                capabilities.add(capability)
-        return capabilities
-
     def _plan_roles(
         self,
         *,
-        capabilities: Set[str],
+        task: str,
         intent: Optional[str],
         trigger_name: Optional[str],
+        available_agents: List[Dict[str, str]],
     ) -> List[str]:
         roles: List[str] = []
+        enabled_agents = {item.get("agent", "") for item in available_agents if item.get("agent")}
+        configured_defaults = self._configured_default_roles(enabled_agents=enabled_agents)
 
-        if "frontend" in capabilities and ("backend" in capabilities or "persistence" in capabilities):
+        if not task.strip():
+            roles.extend(configured_defaults)
+
+        if trigger_name == "fullstack-superapp":
             roles.extend(["tech-selection", "frontend-build", "backend-build", "quality-review"])
         elif trigger_name == "architecture":
             roles.extend(["tech-selection", "implementation", "quality-review"])
@@ -215,6 +161,20 @@ class OrchestrationPlanner:
             if intent in {"implementation", "debug", "testing", "security"}:
                 roles.append("quality-review")
 
+        if not roles:
+            roles.extend(configured_defaults)
+
+        if not roles:
+            roles.append("implementation")
+            if len(enabled_agents) > 1:
+                roles.append("quality-review")
+        elif (
+            "implementation" in roles
+            and "quality-review" not in roles
+            and len(enabled_agents) > 1
+        ):
+            roles.append("quality-review")
+
         deduped: List[str] = []
         seen = set()
         for role in roles:
@@ -223,6 +183,44 @@ class OrchestrationPlanner:
             deduped.append(role)
             seen.add(role)
         return deduped
+
+    def _configured_default_roles(self, *, enabled_agents: Set[str]) -> List[str]:
+        auto_cfg = self.config.auto_collaboration or {}
+        assignment_map = self._assignment_map()
+        phase_routing = auto_cfg.get("phase_routing", {})
+
+        roles: List[str] = []
+        for phase in ("discover", "define", "develop", "deliver"):
+            routed_agent = ""
+            assignment = assignment_map.get(phase, {})
+            if isinstance(assignment, dict):
+                routed_agent = str(assignment.get("agent", "")).strip()
+            if not routed_agent and isinstance(phase_routing, dict):
+                routed_agent = str(phase_routing.get(phase, "")).strip()
+            if routed_agent and routed_agent in enabled_agents:
+                roles.append(PHASE_ROLE_MAP[phase])
+
+        if roles:
+            return roles
+
+        legacy_role_keys = {
+            "ecosystem_research": "ecosystem-research",
+            "synthesis": "quality-review",
+            "code_patterns": "implementation",
+            "discover": "ecosystem-research",
+            "define": "tech-selection",
+            "develop": "implementation",
+            "deliver": "quality-review",
+        }
+        for key, mapped in legacy_role_keys.items():
+            assignment = assignment_map.get(key, {})
+            if not isinstance(assignment, dict):
+                continue
+            routed_agent = str(assignment.get("agent", "")).strip()
+            if routed_agent and routed_agent in enabled_agents:
+                roles.append(mapped)
+
+        return roles
 
     def _assign_role(
         self,

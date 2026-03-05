@@ -19,9 +19,28 @@ Admin command reference:
 
 ```bash
 ai-collab --help
+ai-collab <subcommand> --help
 ```
 
 ## 2) Admin Subcommands
+
+Quick list (all support `--help`; optioned commands support short+long flags):
+
+1. `init`
+2. `status`
+3. `config`
+4. `detect`
+5. `select`
+6. `list`
+7. `monitor`
+8. `tmux-status`
+9. `tmux-capture`
+10. `tmux-watch`
+11. `tmux-close-pane`
+12. `handoff`
+13. `tmux-open`
+14. `tmux-close-test`
+15. `relay-smoke`
 
 ### Initialize
 
@@ -56,7 +75,19 @@ ai-collab list
 ### Launch tmux workspace manually
 
 ```bash
-ai-collab monitor --controller codex --session ai-collab-live
+ai-collab monitor -c codex -s ai-collab-live
+```
+
+### Launch one sub-agent quickly (short wrapper)
+
+```bash
+ai-collab tmux-open -a gemini -c %1 -p "Implement only API contract draft"
+```
+
+### Start one-command close-choice workflow test
+
+```bash
+ai-collab tmux-close-test -C codex -S claude -d 90 -t 60 -r 45
 ```
 
 ## 3) Runner Mode Patterns
@@ -70,38 +101,38 @@ ai-collab
 ### Direct execution
 
 ```bash
-ai-collab --provider codex --execution-mode direct "Build audit logging and retention policy checks"
+ai-collab -p codex -x direct "Build audit logging and retention policy checks"
 ```
 
 ### tmux execution (inline panes)
 
 ```bash
 ai-collab \
-  --provider codex \
-  --execution-mode tmux \
-  --tmux-target inline \
-  --tmux-prewarm-subagents \
-  --controller-first \
+  -p codex \
+  -x tmux \
+  -t inline \
+  -W \
+  -c \
   "Deliver a full-stack feature with implementation and review handoff"
 ```
 
 ### Plan-only mode
 
 ```bash
-ai-collab --dry-run --output json "your task"
+ai-collab -d -o json "your task"
 ```
 
 ## 4) High-Value Runner Flags
 
-1. `--execution-mode {auto,direct,tmux}`
-2. `--tmux-target {auto,session,inline}`
-3. `--tmux-prewarm-subagents | --no-tmux-prewarm-subagents`
-4. `--controller-first | --no-controller-first`
-5. `--interactive-decisions | --no-interactive-decisions`
-6. `--allow-nested | --no-allow-nested`
-7. `--output {text,json}`
-8. `--lang {en-US,zh-CN}`
-9. `--ui-mode {auto,tui,text}`
+1. `-x, --execution-mode {auto,direct,tmux}`
+2. `-t, --tmux-target {auto,session,inline}`
+3. `-W, --tmux-prewarm-subagents | --no-tmux-prewarm-subagents`
+4. `-c, --controller-first | --no-controller-first`
+5. `-I, --interactive-decisions | --no-interactive-decisions`
+6. `-a, --allow-nested | --no-allow-nested`
+7. `-o, --output {text,json}`
+8. `-l, --lang {en-US,zh-CN}`
+9. `-u, --ui-mode {auto,tui,text}`
 
 ## 5) Configuration Conventions
 

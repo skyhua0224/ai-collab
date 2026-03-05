@@ -70,34 +70,6 @@ DEFAULT_PROFILE_SKILLS = {
 }
 
 
-INTENT_KEYWORDS = {
-    "documentation": ["blog", "博客", "文档", "README", "文章", "总结", "复盘", "writeup", "notes"],
-    "design": ["ui", "界面", "设计", "mockup", "原型", "layout", "视觉", "交互"],
-    "architecture": ["architecture", "架构", "方案", "重构", "refactor", "design pattern"],
-    "implementation": ["implement", "实现", "开发", "build", "feature", "编码", "落地"],
-    "debug": ["debug", "调试", "修复", "fix", "bug", "crash", "错误", "问题"],
-    "security": ["security", "安全", "漏洞", "audit", "证书", "认证", "owasp"],
-    "research": ["research", "调研", "探索", "对比", "evaluate", "benchmark", "study"],
-    "testing": ["test", "测试", "tdd", "coverage", "验证", "回归"],
-    "gameplay": ["unity", "unreal", "ue", "renpy", "game", "游戏", "关卡", "战斗", "状态机"],
-}
-
-TRIGGER_PRIORITY = {
-    "fullstack-superapp": 16,
-    "mobile-native": 14,
-    "macos-native": 14,
-    "game-dev": 14,
-    "systems-tooling": 12,
-    "security-audit": 8,
-    "debugging": 8,
-    "testing": 8,
-    "visual-design": 6,
-    "implementation": 4,
-    "docs-writing": 4,
-    "research": 4,
-    "architecture": 0,
-}
-
 CATEGORY_PRIORITY = {
     "superapp-fullstack": 100,
     "mobile-native": 95,
@@ -157,15 +129,32 @@ class CollaborationDetector:
             filtered = [item for item in categories if item in enabled_categories]
             categories = filtered if filtered else list(enabled_categories)
 
-        intent = self._infer_intent(task)
-        trigger, matched_patterns = self._select_trigger(task, intent, categories)
         planner = OrchestrationPlanner(self.config)
-        plan = planner.build_plan(
+        seed_plan = planner.build_plan(
             task=task,
             current_provider=current_provider,
-            intent=intent,
-            trigger_name=trigger.get("name") if trigger else None,
+            intent=None,
+            trigger_name=None,
         )
+        intent = self._infer_intent(
+            orchestration_plan=seed_plan.get("orchestration_plan", []),
+            categories=categories,
+        )
+        trigger, matched_patterns = self._select_trigger(
+            intent=intent,
+            categories=categories,
+            orchestration_plan=seed_plan.get("orchestration_plan", []),
+        )
+        plan = seed_plan
+        if intent or trigger:
+            refined = planner.build_plan(
+                task=task,
+                current_provider=current_provider,
+                intent=intent,
+                trigger_name=trigger.get("name") if trigger else None,
+            )
+            if refined.get("orchestration_plan"):
+                plan = refined
         if trigger and self._should_promote_to_fullstack(trigger=trigger, orchestration_plan=plan.get("orchestration_plan", [])):
             promoted = self._get_trigger_by_name("fullstack-superapp")
             if promoted:
@@ -266,6 +255,20 @@ class CollaborationDetector:
                 execution_mode=str(plan.get("mode", "single-agent")),
             )
 
+        if not self._is_planner_multi_agent(plan):
+            return CollaborationResult(
+                need_collaboration=False,
+                trigger=trigger.get("name", ""),
+                description=trigger.get("description", ""),
+                intent=intent,
+                project_categories=categories,
+                suggested_skills=self._suggest_skills(trigger.get("name"), categories),
+                available_agents=plan.get("available_agents", []),
+                orchestration_plan=plan.get("orchestration_plan", []),
+                selected_agents=plan.get("selected_agents", []),
+                execution_mode=str(plan.get("mode", "single-agent")),
+            )
+
         workflow_name = trigger.get("workflow", "")
         workflow = self.config.workflows.get(workflow_name, {})
 
@@ -359,62 +362,82 @@ class CollaborationDetector:
 
     def _select_trigger(
         self,
-        task: str,
+        *,
         intent: Optional[str],
         categories: List[str],
+        orchestration_plan: List[Dict[str, str]],
     ) -> Tuple[Optional[Dict], List[str]]:
-        triggers = self.config.auto_collaboration.get("triggers", [])
-        task_lower = task.lower()
+        candidate_names: List[str] = []
+        plan_based = self._infer_trigger_from_plan(
+            intent=intent,
+            categories=categories,
+            orchestration_plan=orchestration_plan,
+        )
+        if plan_based:
+            candidate_names.append(plan_based)
 
-        candidates: List[Tuple[int, Dict, List[str]]] = []
-        for trigger in triggers:
-            patterns = trigger.get("patterns", [])
-            matched = [p for p in patterns if p.lower() in task_lower]
-            if not matched:
+        profile_based = self._trigger_name_from_profile_intent(intent, categories)
+        if profile_based:
+            candidate_names.append(profile_based)
+
+        if intent:
+            mapped = self._intent_trigger_map().get(intent)
+            if mapped:
+                candidate_names.append(mapped)
+
+        seen = set()
+        for name in candidate_names:
+            if not name or name in seen:
                 continue
-
-            score = sum(len(p) for p in matched)
-            score += len(matched) * 10
-            trigger_name = trigger.get("name", "")
-            score += TRIGGER_PRIORITY.get(trigger_name, 0)
-
-            # Keep intent guidance without overriding stronger domain triggers.
-            if intent and trigger_name == self._intent_trigger_map().get(intent):
-                score += 8
-
-            candidates.append((score, trigger, matched))
-
-        if candidates:
-            candidates.sort(key=lambda item: item[0], reverse=True)
-            _, best_trigger, best_patterns = candidates[0]
-            return best_trigger, best_patterns
-
-        # No direct keyword match. Fall back to intent + project category mapping.
-        fallback_name = self._trigger_name_from_profile_intent(intent, categories)
-        if not fallback_name and intent:
-            fallback_name = self._intent_trigger_map().get(intent)
-
-        if not fallback_name:
-            return None, []
-
-        for trigger in triggers:
-            if trigger.get("name") == fallback_name:
+            seen.add(name)
+            trigger = self._get_trigger_by_name(name)
+            if trigger:
                 return trigger, []
 
         return None, []
 
-    def _infer_intent(self, task: str) -> Optional[str]:
-        task_lower = task.lower()
-        best_intent: Optional[str] = None
-        best_score = 0
+    def _infer_intent(
+        self,
+        *,
+        orchestration_plan: List[Dict[str, str]],
+        categories: List[str],
+    ) -> Optional[str]:
+        roles = {str(item.get("role", "")).strip() for item in orchestration_plan if isinstance(item, dict)}
+        if "testing" in roles:
+            return "testing"
+        if {"frontend-build", "backend-build"}.issubset(roles):
+            return "implementation"
+        if "tech-selection" in roles and "implementation" not in roles:
+            return "architecture"
+        if "ecosystem-research" in roles and "implementation" not in roles:
+            return "research"
+        if "quality-review" in roles and "implementation" in roles:
+            return "implementation"
+        if "implementation" in roles:
+            return "implementation"
 
-        for intent, keywords in INTENT_KEYWORDS.items():
-            score = sum(1 for kw in keywords if kw.lower() in task_lower)
-            if score > best_score:
-                best_score = score
-                best_intent = intent
+        fallback_trigger = self._trigger_name_from_profile_intent(None, categories)
+        return self._intent_from_trigger_name(fallback_trigger)
 
-        return best_intent
+    def _intent_from_trigger_name(self, trigger_name: Optional[str]) -> Optional[str]:
+        reverse_map = {
+            "visual-design": "design",
+            "architecture": "architecture",
+            "implementation": "implementation",
+            "debugging": "debug",
+            "security-audit": "security",
+            "research": "research",
+            "testing": "testing",
+            "docs-writing": "documentation",
+            "game-dev": "gameplay",
+            "fullstack-superapp": "implementation",
+            "macos-native": "implementation",
+            "mobile-native": "implementation",
+            "systems-tooling": "implementation",
+        }
+        if not trigger_name:
+            return None
+        return reverse_map.get(trigger_name)
 
     def _intent_trigger_map(self) -> Dict[str, str]:
         auto_cfg = self.config.auto_collaboration or {}

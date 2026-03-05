@@ -3,7 +3,8 @@
 import pytest
 
 from ai_collab.core.config import Config
-from ai_collab.core.detector import CollaborationDetector, CollaborationResult
+from ai_collab.core.detector import CollaborationDetector
+from ai_collab.core.profiler import ProjectProfile
 
 
 @pytest.fixture
@@ -30,6 +31,14 @@ def config():
                 "reviewers": ["claude"],
                 "workflow": "code-review",
             },
+            {
+                "name": "docs-writing",
+                "description": "Documentation tasks",
+                "patterns": ["doc", "readme"],
+                "primary": "claude",
+                "reviewers": ["gemini"],
+                "workflow": "docs-review",
+            },
         ],
     }
     config.workflows = {
@@ -47,24 +56,81 @@ def config():
                 {"agent": "claude", "action": "review", "output": "feedback"},
             ],
         },
+        "docs-review": {
+            "description": "Docs workflow",
+            "phases": [
+                {"agent": "claude", "action": "draft", "output": "document"},
+                {"agent": "gemini", "action": "polish", "output": "clarity improvements"},
+            ],
+        },
     }
     return config
 
 
-def test_detect_visual_design(config):
-    """Test detecting visual design tasks."""
+def _mock_profile(monkeypatch, *, categories: list[str]) -> None:
+    monkeypatch.setattr(
+        "ai_collab.core.profiler.ProjectProfiler.detect",
+        lambda self: ProjectProfile(root="/tmp/workspace", categories=categories, signals={}),
+    )
+
+
+def test_detect_prefers_profile_mapping_over_task_keywords(config, monkeypatch):
+    """Detector should route by profile mapping instead of raw keyword pattern matches."""
+    _mock_profile(monkeypatch, categories=["docs-text"])
+    config.auto_collaboration["profile_trigger_map"] = {
+        "docs-text": {"default": "docs-writing", "implementation": "docs-writing"}
+    }
     detector = CollaborationDetector(config)
     result = detector.detect("Create an HTML mockup", "claude")
 
     assert result.need_collaboration is True
-    assert result.trigger == "visual-design"
-    assert result.primary == "gemini"
-    assert "claude" in result.reviewers
-    assert result.workflow_name == "design-review"
+    assert result.trigger == "docs-writing"
+    assert result.primary == "claude"
+    assert "gemini" in result.reviewers
+    assert result.workflow_name == "docs-review"
+    assert result.matched_patterns == []
 
 
-def test_detect_implementation(config):
-    """Test detecting implementation tasks."""
+def test_empty_task_still_builds_multi_agent_plan_from_config(config, monkeypatch):
+    """Empty task should use configured routing defaults and still produce multi-agent orchestration."""
+    _mock_profile(monkeypatch, categories=["superapp-fullstack"])
+    config.auto_collaboration["assignment_map"] = {
+        "discover": {"agent": "gemini", "profile": "powerful"},
+        "define": {"agent": "claude", "profile": "default"},
+        "develop": {"agent": "codex", "profile": "medium"},
+        "deliver": {"agent": "claude", "profile": "default"},
+    }
+    config.auto_collaboration["profile_trigger_map"] = {
+        "superapp-fullstack": {
+            "default": "fullstack-superapp",
+            "implementation": "fullstack-superapp",
+        }
+    }
+    config.auto_collaboration["triggers"].append(
+        {
+            "name": "fullstack-superapp",
+            "description": "Fullstack development",
+            "patterns": ["fullstack"],
+            "primary": "codex",
+            "reviewers": ["claude", "gemini"],
+            "workflow": "code-review",
+        }
+    )
+    detector = CollaborationDetector(config)
+    result = detector.detect("", "codex")
+
+    assert result.need_collaboration is True
+    assert result.execution_mode == "multi-agent"
+    roles = {item["role"] for item in result.orchestration_plan}
+    assert "ecosystem-research" in roles
+    assert "tech-selection" in roles
+    assert "implementation" in roles
+    assert "quality-review" in roles
+
+
+def test_detect_implementation(config, monkeypatch):
+    """Implementation intent should still map to implementation trigger via planner-derived intent."""
+    _mock_profile(monkeypatch, categories=["systems-tooling"])
     detector = CollaborationDetector(config)
     result = detector.detect("Implement user authentication feature", "claude")
 
@@ -75,13 +141,16 @@ def test_detect_implementation(config):
     assert result.workflow_name == "code-review"
 
 
-def test_no_collaboration_needed(config):
-    """Test when no collaboration is needed."""
+def test_no_collaboration_when_only_one_provider_enabled(config, monkeypatch):
+    """Collaboration should be disabled when planner can only select a single enabled provider."""
+    _mock_profile(monkeypatch, categories=["systems-tooling"])
+    config.providers["claude"].enabled = False
+    config.providers["gemini"].enabled = False
     detector = CollaborationDetector(config)
     result = detector.detect("Simple code review", "claude")
 
     assert result.need_collaboration is False
-    assert result.trigger is None
+    assert result.execution_mode == "single-agent"
 
 
 def test_collaboration_disabled(config):
@@ -105,11 +174,18 @@ def test_legacy_auto_orchestration_key_is_still_supported(config):
     result = detector.detect("Create an HTML mockup", "claude")
 
     assert result.need_collaboration is True
-    assert result.trigger == "visual-design"
+    assert result.trigger == "implementation"
 
 
-def test_detect_fullstack_from_capabilities_without_direct_keyword_match(config):
-    """Planner should infer fullstack flow from task capabilities, not only raw trigger keywords."""
+def test_detect_fullstack_from_profile_mapping_without_keyword_match(config, monkeypatch):
+    """Planner should infer fullstack flow from project profile mapping without relying on task keywords."""
+    _mock_profile(monkeypatch, categories=["superapp-fullstack"])
+    config.auto_collaboration["profile_trigger_map"] = {
+        "superapp-fullstack": {
+            "default": "fullstack-superapp",
+            "implementation": "fullstack-superapp",
+        }
+    }
     config.auto_collaboration["triggers"].append(
         {
             "name": "fullstack-superapp",
@@ -131,7 +207,7 @@ def test_detect_fullstack_from_capabilities_without_direct_keyword_match(config)
     }
     detector = CollaborationDetector(config)
 
-    task = "实现一个极小的待办功能，有前端和后端，后端要保存数据"
+    task = "实现一个极小的待办功能"
     result = detector.detect(task, "codex")
 
     assert result.need_collaboration is True
@@ -144,14 +220,15 @@ def test_detect_fullstack_from_capabilities_without_direct_keyword_match(config)
     assert "quality-review" in roles
 
 
-def test_generate_prompt(config):
+def test_generate_prompt(config, monkeypatch):
     """Test generating collaboration prompt."""
+    _mock_profile(monkeypatch, categories=["systems-tooling"])
     detector = CollaborationDetector(config)
-    result = detector.detect("Create HTML mockup", "claude")
+    result = detector.detect("Implement backend endpoint", "claude")
 
-    prompt = detector.generate_prompt("Create HTML mockup", result, "claude")
+    prompt = detector.generate_prompt("Implement backend endpoint", result, "claude")
 
     assert "Multi-AI Collaboration" in prompt
-    assert "visual-design" in prompt
-    assert "gemini" in prompt
+    assert "implementation" in prompt
+    assert "codex" in prompt
     assert "claude" in prompt

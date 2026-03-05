@@ -120,13 +120,130 @@ Default orchestration behavior:
 4. Only run provider diagnostics when the user explicitly asks for troubleshooting, or after repeated execution failures that block progress.
 5. Treat Gemini `429 MODEL_CAPACITY_EXHAUSTED` as capacity limitation, not as "provider not called".
 
-## tmux dispatch pattern (required)
+Controller strict-mode additions:
+
+1. In execution phase, do not run `--help` loops to "discover" commands. Build command from known run context and execute directly.
+2. If tmux access is blocked (permission/sandbox/approval), immediately output:
+   - `NEED_ELEVATION: <command> | reason=<error>`
+   - then stop and wait for user decision.
+3. If required runtime context is missing (session/pane id), ask once for the missing value; do not probe by repeated help commands.
+
+## One-click launcher (required default)
+
+Use `ai-collab handoff` first instead of manual `tmux send-keys` sequences.
+
+CLI entry:
+
+```bash
+ai-collab handoff --agent <codex|claude|gemini> ...
+```
+
+Short wrappers (preferred for daily use):
+
+```bash
+# Open pane/window with short parameters (defaults: split + controller-bottom + input notify)
+ai-collab tmux-open -a <codex|claude|gemini> -c <controller_pane> -p '<task>'
+
+# One-command controller close-choice workflow test (monitor + accept + ask close/keep)
+ai-collab tmux-close-test -C codex -S codex -d 90 -t 60 -r 45
+```
+
+Behavior (must preserve):
+
+1. Reuse current tmux session (or explicit `--session`).
+2. Create a new tmux window (`--tmux-layout window`) or split pane (`--tmux-layout split`).
+3. Wait until shell is ready.
+4. `cd` into main repository root.
+5. Start selected agent (`claude` / `gemini` / `codex`).
+6. Wait for agent startup prompt.
+7. Paste prompt text, then send `Enter` in a separate action.
+8. Optional: wait for execution signal via `--exec-pattern`.
+
+Standard examples:
+
+```bash
+# macOS / Linux: new tmux window
+ai-collab handoff \
+  --agent gemini \
+  --model gemini-3.1-pro-preview \
+  --tmux-layout window \
+  --repo-root "$PWD" \
+  --prompt '请读取并执行任务文件：/abs/path/to/task.txt'
+```
+
+```bash
+# Split mode: top pane controller, bottom pane sub-agent
+ai-collab handoff \
+  --agent claude \
+  --tmux-layout split \
+  --split-policy controller-bottom \
+  --controller-height-percent 50 \
+  --repo-root "$PWD" \
+  --prompt '请只做前端可用性复核并给出修正建议'
+```
+
+```powershell
+# Windows PowerShell (requires tmux available in PATH)
+ai-collab handoff `
+  --agent codex `
+  --tmux-layout split `
+  --split-policy controller-bottom `
+  --controller-height-percent 50 `
+  --repo-root <repo-root> `
+  --prompt "请读取并执行任务文件：<task-file-path>"
+```
+
+Rules:
+
+1. Default working target is the main repo root, not a random subfolder.
+2. For Gemini, prefer explicit model (`gemini-3.1-pro-preview`) instead of implicit auto selection.
+3. When user requests visible collaboration, default to `--tmux-layout split --split-policy controller-bottom`.
+4. `controller-bottom` policy:
+   - first sub-agent: create lower half pane
+   - second and later sub-agents: split the lower region horizontally (left/right, then left/middle/right, etc.)
+   - keep controller in top pane with `--controller-height-percent 50`
+5. For parallel sub-agents, run `ai-collab handoff --tmux-layout split --split-policy controller-bottom` multiple times. Close done panes with `tmux kill-pane -t <pane_id>`.
+
+Completion-policy contract (required):
+
+1. Before spawning a sub-agent, ask user once for completion behavior:
+   - `ask`: completion后先询问用户是否关闭 pane（默认）
+   - `keep`: 完成后保留 pane
+   - `close`: 完成后自动关闭 pane
+   - `ask` mode should notify controller first so controller asks user in-chat before closing pane.
+2. Encode that choice explicitly in command:
+
+```bash
+ai-collab handoff ... --completion-action ask
+```
+
+3. If user wants zero-interrupt launch, add:
+
+```bash
+ai-collab handoff ... --no-ask-launch-options --completion-action <ask|keep|close|none>
+```
+
+Script fallback:
+
+```bash
+python3 "$PWD/ai_collab/skills/ai-collab-orchestrator/scripts/tmux_agent_handoff.py" ...
+```
+
+> Note: run this command from repository root. On macOS absolute path example:
+> `/Users/<you>/ai-collab/ai_collab/skills/ai-collab-orchestrator/scripts/tmux_agent_handoff.py`
+
+## tmux dispatch pattern (manual fallback)
 
 Use the same dispatch pattern for `codex`, `claude`, and `gemini`:
 
 1. Create pane first.
 2. Wait for shell to be ready.
 3. Send provider command by `tmux send-keys ... C-m`.
+4. Wait for provider startup banner and interactive input prompt before sending task content.
+5. In interactive mode, send task content in 2 steps:
+   - send text
+   - send `Enter` as a separate `tmux send-keys` call
+6. Treat task as started only after visible execution signal appears (for example step marker, file-read/tool call, or running spinner).
 
 Do NOT rely on `split-window ... "zsh -lc '<long command>'"` as the default orchestration path.
 
@@ -142,6 +259,17 @@ Example:
 ```bash
 pane_id=$(tmux split-window -v -p 35 -P -F '#{pane_id}')
 tmux send-keys -t "$pane_id" 'gemini -o text --approval-mode yolo --model gemini-3.1-pro-preview "仅回复 OK" || gemini -o text --approval-mode yolo --model gemini-3-flash-preview "仅回复 OK"' C-m
+```
+
+Interactive handoff example (required when provider stays in REPL):
+
+```bash
+pane_id=$(tmux split-window -v -p 35 -P -F '#{pane_id}')
+tmux send-keys -t "$pane_id" 'gemini' C-m
+# wait until banner + "Type your message" prompt is visible
+tmux send-keys -t "$pane_id" '请读取并执行任务文件：/abs/path/to/task.txt'
+tmux send-keys -t "$pane_id" Enter
+# verify pane shows execution signal before proceeding
 ```
 
 ## Permission and visibility policy (must follow)

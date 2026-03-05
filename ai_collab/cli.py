@@ -18,6 +18,7 @@ import time
 import threading
 from pathlib import Path
 from typing import Any, Optional, Tuple
+from uuid import uuid4
 
 import click
 from rich.console import Console
@@ -28,6 +29,7 @@ from ai_collab.core.config import Config
 from ai_collab.core.detector import CollaborationDetector
 from ai_collab.core.environment import detect_os_name, detect_provider_status, resolve_executable
 from ai_collab.core.selector import ModelSelector
+from ai_collab.core.run_state import RunStateStore
 from ai_collab.core.tmux_workspace import (
     TmuxWorkspaceError,
     attach_session,
@@ -46,6 +48,7 @@ from ai_collab.core.workflow import WorkflowManager
 
 console = Console(force_terminal=True, legacy_windows=False)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\].*?\x1b\\")
+COMPLETION_MARKER_LINE_RE = re.compile(r"(?mi)^\s*===\s*(?:SUBAGENT_COMPLETE|TASK_COMPLETE)\s*===\s*$")
 
 
 I18N = {
@@ -641,8 +644,8 @@ def _ask_yes_no(
     return selected == yes_value
 
 
-@click.group()
-@click.version_option(version="0.1.0")
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.version_option("0.1.0", "-V", "--version")
 @click.pass_context
 def main(ctx: click.Context) -> None:
     """AI Collaboration System - Multi-AI orchestration and workflow management."""
@@ -801,22 +804,25 @@ def config(ctx: click.Context, action: str, key: Optional[str], value: Optional[
 @main.command()
 @click.option("--force", "-f", is_flag=True, help="Force reinitialize")
 @click.option(
+    "-i/-I",
     "--interactive/--non-interactive",
     default=True,
-    show_default=True,
+    show_default=False,
     help="Run provider/model setup wizard during init",
 )
 @click.option(
     "--ui-mode",
+    "-u",
     type=click.Choice(["auto", "tui", "text"]),
     default="tui",
     show_default=True,
     help="Wizard interaction mode",
 )
 @click.option(
+    "-a/-A",
     "--auto-install-deps/--no-auto-install-deps",
     default=True,
-    show_default=True,
+    show_default=False,
     help="Automatically install missing wizard dependencies (for TUI)",
 )
 @click.pass_context
@@ -903,14 +909,16 @@ def status(ctx: click.Context) -> None:
 
 @main.command()
 @click.option("--session", "-s", default="ai-collab", help="tmux session name")
-@click.option("--cwd", default=".", help="Workspace directory to open in panes")
+@click.option("--cwd", "-w", default=".", help="Workspace directory to open in panes")
 @click.option(
     "--controller",
+    "-c",
     type=click.Choice(["codex", "claude", "gemini"]),
     help="Controller agent for top pane (default: current_controller)",
 )
 @click.option(
     "--layout",
+    "-l",
     type=click.Choice(["stacked", "tabbed"]),
     default="stacked",
     show_default=True,
@@ -918,12 +926,13 @@ def status(ctx: click.Context) -> None:
 )
 @click.option(
     "--task-hint",
+    "-t",
     default="Describe your task once and split into design/implement/review subtasks.",
     help="A hint shown in each pane",
 )
-@click.option("--autorun-agents", is_flag=True, help="Auto-launch codex/claude/gemini REPL in panes")
-@click.option("--reset", is_flag=True, help="Kill existing session with same name and recreate")
-@click.option("--detached", is_flag=True, help="Create session without attaching")
+@click.option("--autorun-agents", "-a", is_flag=True, help="Auto-launch codex/claude/gemini REPL in panes")
+@click.option("--reset", "-r", is_flag=True, help="Kill existing session with same name and recreate")
+@click.option("--detached", "-d", is_flag=True, help="Create session without attaching")
 @click.pass_context
 def monitor(
     ctx: click.Context,
@@ -965,6 +974,846 @@ def monitor(
 
     if not detached:
         subprocess.run(["tmux", "attach-session", "-t", session], check=False)
+
+
+@main.command(name="tmux-status")
+@click.option("--json-output", "-j", is_flag=True, help="Print tmux status as JSON")
+def tmux_status(json_output: bool) -> None:
+    """Show current tmux session/window/pane binding info."""
+    if shutil.which("tmux") is None:
+        console.print("[red]tmux not found in PATH[/red]")
+        raise SystemExit(2)
+
+    session = ""
+    window_index = ""
+    pane_id = ""
+    pane_cmd = ""
+    current = subprocess.run(
+        ["tmux", "display-message", "-p", "#S\t#{window_index}\t#{pane_id}\t#{pane_current_command}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if current.returncode == 0 and current.stdout.strip():
+        session, window_index, pane_id, pane_cmd = current.stdout.strip().split("\t", 3)
+    else:
+        # Fallback for shells without active tmux client binding.
+        sessions = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}\t#{session_attached}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if sessions.returncode != 0:
+            console.print("[yellow]Not in an active tmux client context[/yellow]")
+            raise SystemExit(1)
+        attached: list[str] = []
+        all_sessions: list[str] = []
+        for line in sessions.stdout.splitlines():
+            parts = line.split("\t")
+            if not parts or not parts[0].strip():
+                continue
+            name = parts[0].strip()
+            all_sessions.append(name)
+            if len(parts) > 1 and parts[1].strip() == "1":
+                attached.append(name)
+        session = attached[0] if attached else (all_sessions[0] if all_sessions else "")
+        if not session:
+            console.print("[yellow]Not in an active tmux client context[/yellow]")
+            raise SystemExit(1)
+        fallback_panes = subprocess.run(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                session,
+                "-F",
+                "#{window_index}\t#{pane_id}\t#{pane_active}\t#{pane_current_command}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if fallback_panes.returncode != 0 or not fallback_panes.stdout.strip():
+            console.print("[yellow]Not in an active tmux client context[/yellow]")
+            raise SystemExit(1)
+        first_row = None
+        active_row = None
+        for line in fallback_panes.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 4:
+                continue
+            row = (parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip())
+            if not first_row:
+                first_row = row
+            if row[2] == "1":
+                active_row = row
+                break
+        chosen = active_row or first_row
+        if not chosen:
+            console.print("[yellow]Not in an active tmux client context[/yellow]")
+            raise SystemExit(1)
+        window_index, pane_id, _active, pane_cmd = chosen
+
+    panes = subprocess.run(
+        [
+            "tmux",
+            "list-panes",
+            "-t",
+            f"{session}:{window_index}",
+            "-F",
+            "#{pane_id}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_title}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    pane_rows: list[dict[str, str]] = []
+    if panes.returncode == 0:
+        for line in panes.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 8:
+                continue
+            pane_rows.append(
+                {
+                    "pane_id": parts[0],
+                    "active": parts[1],
+                    "left": parts[2],
+                    "top": parts[3],
+                    "width": parts[4],
+                    "height": parts[5],
+                    "command": parts[6],
+                    "title": parts[7],
+                }
+            )
+
+    payload = {
+        "session": session,
+        "window_index": window_index,
+        "current_pane": pane_id,
+        "current_command": pane_cmd,
+        "panes": pane_rows,
+    }
+    if json_output:
+        console.print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    console.print(f"[bold]tmux[/bold] session={session} window={window_index} pane={pane_id} cmd={pane_cmd}")
+    for row in pane_rows:
+        marker = "*" if row["active"] == "1" else " "
+        console.print(
+            f" {marker} {row['pane_id']} left={row['left']} top={row['top']} w={row['width']} h={row['height']} cmd={row['command']} title={row['title']}"
+        )
+
+
+@main.command(name="tmux-close-pane")
+@click.option("--pane-id", "-p", required=True, help="Pane id to close, e.g. %11")
+def tmux_close_pane(pane_id: str) -> None:
+    """Close a specific tmux pane safely."""
+    if shutil.which("tmux") is None:
+        console.print("[red]tmux not found in PATH[/red]")
+        raise SystemExit(2)
+    result = subprocess.run(
+        ["tmux", "kill-pane", "-t", pane_id],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        err = (result.stderr or "").strip() or "unknown tmux error"
+        console.print(f"[red]tmux-close-pane failed:[/red] {err}")
+        raise SystemExit(result.returncode)
+    console.print(f"[green]closed pane[/green] {pane_id}")
+
+
+@main.command(name="tmux-capture")
+@click.option("--pane-id", "-p", help="Target pane id (default: current pane)")
+@click.option("--lines", "-n", type=int, default=180, show_default=True, help="Tail lines to capture")
+def tmux_capture(pane_id: Optional[str], lines: int) -> None:
+    """Capture pane output tail for debugging via ai-collab wrapper."""
+    if shutil.which("tmux") is None:
+        console.print("[red]tmux not found in PATH[/red]")
+        raise SystemExit(2)
+    target = pane_id
+    if not target:
+        cur = subprocess.run(
+            ["tmux", "display-message", "-p", "#{pane_id}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if cur.returncode != 0 or not cur.stdout.strip():
+            console.print("[red]No active tmux pane context[/red]")
+            raise SystemExit(2)
+        target = cur.stdout.strip()
+    count = max(20, min(int(lines), 2000))
+    out = subprocess.run(
+        ["tmux", "capture-pane", "-p", "-t", target, "-S", f"-{count}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if out.returncode != 0:
+        err = (out.stderr or "").strip() or "unknown tmux error"
+        console.print(f"[red]tmux-capture failed:[/red] {err}")
+        raise SystemExit(out.returncode)
+    print(out.stdout, end="")
+
+
+def _classify_watch_issue(text: str) -> str:
+    """Best-effort classification for stuck/error states from pane output."""
+    lower = text.lower()
+    if not lower.strip():
+        return ""
+    if "model_capacity_exhausted" in lower or ("429" in lower and "model" in lower):
+        return "model_capacity_exhausted"
+    if "currently experiencing high demand" in lower or (
+        "keep trying" in lower and "switch to gemini-3-flash-preview" in lower
+    ):
+        return "model_capacity_exhausted"
+    if "model not found" in lower or "invalid model" in lower:
+        return "model_unavailable"
+    if "permission denied" in lower or "approval required" in lower or "requires elevated permissions" in lower:
+        return "permission_blocked"
+    if "connection error" in lower or "failed to connect" in lower or "network" in lower:
+        return "network_error"
+    if "timed out" in lower or "timeout" in lower:
+        return "upstream_timeout"
+    return ""
+
+
+def _contains_completion_marker(text: str) -> bool:
+    """Return True only when completion marker appears as a standalone output line."""
+    normalized = _normalize_terminal_text_for_markers(text)
+    return bool(COMPLETION_MARKER_LINE_RE.search(normalized))
+
+
+def _completion_marker_count(text: str) -> int:
+    """Count standalone completion markers in terminal text."""
+    normalized = _normalize_terminal_text_for_markers(text)
+    return len(COMPLETION_MARKER_LINE_RE.findall(normalized))
+
+
+def _completion_event_signature(event: dict[str, Any]) -> str:
+    """Stable signature for deduplicating parsed completion events."""
+    try:
+        return json.dumps(event, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        return repr(event)
+
+
+def _watch_status_suggestion(status: str, reason: str) -> str:
+    if status == "completed":
+        return "Sub-agent finished. Ask user whether to close pane and continue."
+    if status == "pane_unavailable":
+        return "Pane is unavailable; restart sub-agent or rebind pane id."
+    if status == "error":
+        if reason in {"model_capacity_exhausted", "model_unavailable"}:
+            return "Fallback to backup model/agent, then retry."
+        if reason == "permission_blocked":
+            return "Request elevation or adjust permission mode, then retry."
+        if reason == "network_error":
+            return "Retry with backoff; if repeated, switch provider/agent."
+        return "Check pane logs and retry monitoring."
+    if status == "timeout":
+        if reason == "still_running":
+            return "Increase timeout and monitor again."
+        if reason == "idle_no_progress":
+            return "Sub-agent may be stuck; nudge with a scoped follow-up prompt or restart."
+        return "Monitor again or switch fallback agent if repeated."
+    return "Continue monitoring."
+
+
+@main.command(name="tmux-watch")
+@click.option("--pane-id", "-p", help="Target pane id (default: current pane)")
+@click.option("--timeout-seconds", "-t", type=float, default=30.0, show_default=True, help="Watch timeout in seconds")
+@click.option("--poll-seconds", "-i", type=float, default=1.0, show_default=True, help="Polling interval in seconds")
+@click.option("--capture-lines", "-n", type=int, default=220, show_default=True, help="Tail lines captured each poll")
+@click.option("--json-output", "-j", is_flag=True, help="Print watch result as JSON")
+def tmux_watch(
+    pane_id: Optional[str],
+    timeout_seconds: float,
+    poll_seconds: float,
+    capture_lines: int,
+    json_output: bool,
+) -> None:
+    """Watch one pane until completion/timeout and return structured execution status."""
+    if shutil.which("tmux") is None:
+        console.print("[red]tmux not found in PATH[/red]")
+        raise SystemExit(2)
+    target = pane_id
+    if not target:
+        cur = subprocess.run(
+            ["tmux", "display-message", "-p", "#{pane_id}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if cur.returncode != 0 or not cur.stdout.strip():
+            console.print("[red]No active tmux pane context[/red]")
+            raise SystemExit(2)
+        target = cur.stdout.strip()
+
+    timeout = max(float(timeout_seconds), 1.0)
+    interval = max(float(poll_seconds), 0.2)
+    count = max(120, min(int(capture_lines), 4000))
+
+    start = time.monotonic()
+    last_change = start
+    last_tail = ""
+    seeded = False
+    status = "running"
+    reason = ""
+    completion_source = ""
+    completion_event: dict[str, Any] = {}
+    seen_event_signatures: set[str] = set()
+    seen_marker_count = 0
+    active_issue = ""
+    active_issue_since = 0.0
+    issue_grace_seconds = max(4.0, min(12.0, timeout * 0.35))
+
+    while time.monotonic() - start < timeout:
+        shot = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-J", "-t", target, "-S", f"-{count}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if shot.returncode != 0:
+            status = "pane_unavailable"
+            reason = (shot.stderr or "").strip() or "pane_unavailable"
+            break
+
+        tail = shot.stdout[-12000:]
+        prev_tail = last_tail
+        seeded_this_round = False
+        if not seeded:
+            seeded = True
+            seeded_this_round = True
+            delta = tail
+            seen_marker_count = _completion_marker_count(tail)
+            for evt in _extract_ai_collab_events(tail):
+                seen_event_signatures.add(_completion_event_signature(evt))
+        elif tail.startswith(prev_tail):
+            delta = tail[len(prev_tail):]
+        else:
+            delta = tail
+
+        if tail != prev_tail:
+            last_change = time.monotonic()
+        last_tail = tail
+
+        if not seeded_this_round:
+            parsed_events = _extract_ai_collab_events(delta)
+            for evt in parsed_events:
+                signature = _completion_event_signature(evt)
+                if signature in seen_event_signatures:
+                    continue
+                seen_event_signatures.add(signature)
+                evt_type = str(evt.get("type", "")).strip().lower()
+                if evt_type in {"subagent_complete", "task_complete"}:
+                    status = "completed"
+                    reason = "structured_event"
+                    completion_source = "ai_collab_event"
+                    completion_event = evt
+                    break
+            if status == "completed":
+                break
+
+            marker_count = _completion_marker_count(tail)
+            if marker_count > seen_marker_count:
+                status = "completed"
+                reason = "completion_marker"
+                completion_source = "legacy_marker"
+                break
+            seen_marker_count = max(seen_marker_count, marker_count)
+
+        now_tick = time.monotonic()
+        idle_now = now_tick - last_change
+        issue = _classify_watch_issue(delta) or _classify_watch_issue(tail)
+        if issue:
+            if issue != active_issue:
+                active_issue = issue
+                active_issue_since = now_tick
+            elif (
+                active_issue_since > 0
+                and now_tick - active_issue_since >= issue_grace_seconds
+                and idle_now >= min(issue_grace_seconds, 6.0)
+            ):
+                status = "error"
+                reason = issue
+                break
+        else:
+            active_issue = ""
+            active_issue_since = 0.0
+
+        time.sleep(interval)
+
+    elapsed = time.monotonic() - start
+    idle = time.monotonic() - last_change
+
+    if status == "running":
+        if active_issue and idle >= min(issue_grace_seconds, 6.0):
+            status = "error"
+            reason = active_issue
+        else:
+            status = "timeout"
+            reason = "idle_no_progress" if idle >= max(timeout * 0.6, 8.0) else "still_running"
+
+    payload: dict[str, Any] = {
+        "pane_id": target,
+        "status": status,
+        "reason": reason,
+        "completion_source": completion_source,
+        "elapsed_seconds": round(elapsed, 2),
+        "idle_seconds": round(idle, 2),
+        "suggestion": _watch_status_suggestion(status, reason),
+    }
+    if completion_event:
+        payload["completion_event"] = completion_event
+
+    if json_output:
+        console.print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        console.print(
+            f"[bold]watch[/bold] pane={payload['pane_id']} status={payload['status']} "
+            f"reason={payload['reason']} elapsed={payload['elapsed_seconds']}s idle={payload['idle_seconds']}s"
+        )
+        console.print(f"suggestion: {payload['suggestion']}")
+
+    if status in {"pane_unavailable", "error"}:
+        raise SystemExit(1)
+
+
+@main.command()
+@click.option("--agent", "-a", type=click.Choice(["codex", "claude", "gemini"]), required=True, help="Agent CLI to launch")
+@click.option("--agent-cmd", "-x", help="Override launch command, e.g. 'gemini --model gemini-3.1-pro-preview'")
+@click.option("--model", "-m", help="Model option for gemini when --agent-cmd is not provided")
+@click.option("--session", "-s", help="tmux session name; default auto-detect current/attached session")
+@click.option("--window-name", "-n", help="tmux window name")
+@click.option("--tmux-layout", "-l", type=click.Choice(["window", "split"]), default="window", show_default=True, help="window: new tmux window; split: split current/target pane")
+@click.option("--split-policy", "-P", type=click.Choice(["manual", "controller-bottom"]), default="manual", show_default=True, help="split placement policy")
+@click.option("--split-direction", "-D", type=click.Choice(["vertical", "horizontal"]), default="vertical", show_default=True, help="split direction when --tmux-layout split")
+@click.option("--split-percent", "-z", type=int, default=35, show_default=True, help="size percent for new split pane")
+@click.option("--split-target-pane", "-T", help="target pane id to split from (default current/active pane)")
+@click.option("--controller-pane", "-c", help="controller pane id for controller-bottom policy")
+@click.option("--controller-height-percent", "-H", type=int, default=50, show_default=True, help="controller top-pane height in percent for controller-bottom policy")
+@click.option("--shell", "-S", help="shell command for new pane/window")
+@click.option("--repo-root", "-r", default=".", show_default=True, help="repository root to cd into")
+@click.option("--prompt-file", "-f", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="prompt file content sent to agent")
+@click.option("--prompt", "-p", help="inline prompt text sent to agent")
+@click.option("--no-prompt", "-N", is_flag=True, help="Launch agent only without sending prompt text")
+@click.option("--prompt-mode", "-M", type=click.Choice(["auto", "paste", "type"]), default="auto", show_default=True, help="prompt injection mode")
+@click.option(
+    "--completion-action",
+    "-k",
+    type=click.Choice(["ask", "keep", "close", "none"]),
+    help="Sub-agent completion policy: ask user / keep pane / auto close / disable watcher",
+)
+@click.option("--completion-timeout", "-K", type=float, default=21600.0, show_default=True, help="Completion watcher timeout in seconds (0 means no timeout)")
+@click.option(
+    "--completion-notify-mode",
+    "-y",
+    type=click.Choice(["status", "input", "both", "none"]),
+    default="input",
+    show_default=True,
+    help="How completion watcher notifies controller pane",
+)
+@click.option(
+    "-J/-j",
+    "--ask-launch-options/--no-ask-launch-options",
+    default=True,
+    show_default=False,
+    help="Prompt for completion policy before spawning a sub-agent when running interactively",
+)
+@click.option("--wait-shell-timeout", "-W", type=float, default=20.0, show_default=True)
+@click.option("--wait-agent-timeout", "-A", type=float, default=120.0, show_default=True)
+@click.option("--capture-lines", "-L", type=int, default=120, show_default=True)
+@click.option("--shell-settle-delay", "-e", type=float, default=2.0, show_default=True)
+@click.option("--shell-idle-quiet-for", "-q", type=float, default=1.5, show_default=True)
+@click.option("--shell-probe-timeout", "-b", type=float, default=12.0, show_default=True, help="Max wait for shell echo probe before first command")
+@click.option("--agent-idle-quiet-for", "-g", type=float, default=1.5, show_default=True)
+@click.option("--agent-min-runtime", "-R", type=float, default=2.0, show_default=True)
+@click.option("--startup-pattern", "-u", help="Override agent-ready regex (forwarded to handoff script)")
+@click.option("--enter-delay", "-E", type=float, default=0.6, show_default=True)
+@click.option("--verbose", "-v", is_flag=True, help="print step-by-step progress logs")
+def handoff(
+    agent: str,
+    agent_cmd: Optional[str],
+    model: Optional[str],
+    session: Optional[str],
+    window_name: Optional[str],
+    tmux_layout: str,
+    split_policy: str,
+    split_direction: str,
+    split_percent: int,
+    split_target_pane: Optional[str],
+    controller_pane: Optional[str],
+    controller_height_percent: int,
+    shell: Optional[str],
+    repo_root: str,
+    prompt_file: Optional[Path],
+    prompt: Optional[str],
+    no_prompt: bool,
+    prompt_mode: str,
+    completion_action: Optional[str],
+    completion_timeout: float,
+    completion_notify_mode: str,
+    ask_launch_options: bool,
+    wait_shell_timeout: float,
+    wait_agent_timeout: float,
+    capture_lines: int,
+    shell_settle_delay: float,
+    shell_idle_quiet_for: float,
+    shell_probe_timeout: float,
+    agent_idle_quiet_for: float,
+    agent_min_runtime: float,
+    startup_pattern: Optional[str],
+    enter_delay: float,
+    verbose: bool,
+) -> None:
+    """Run one-click tmux handoff for codex/claude/gemini with window/split layout."""
+    source = _resolve_orchestrator_skill_source()
+    script = source / "scripts" / "tmux_agent_handoff.py" if source else None
+    if not script or not script.exists():
+        console.print("[red]handoff script not found. Reinstall ai-collab-orchestrator skill first.[/red]")
+        raise SystemExit(2)
+
+    selected_completion_action = completion_action
+    if selected_completion_action is None:
+        if ask_launch_options and sys.stdin.isatty():
+            selected_completion_action = Prompt.ask(
+                "Sub-agent completion policy",
+                choices=["ask", "keep", "close", "none"],
+                default="ask",
+            )
+        else:
+            selected_completion_action = "ask"
+
+    cmd: list[str] = [
+        sys.executable,
+        str(script),
+        "--agent",
+        agent,
+        "--repo-root",
+        str(Path(repo_root).expanduser().resolve()),
+        "--tmux-layout",
+        tmux_layout,
+        "--split-policy",
+        split_policy,
+        "--split-direction",
+        split_direction,
+        "--split-percent",
+        str(split_percent),
+        "--prompt-mode",
+        prompt_mode,
+        "--wait-shell-timeout",
+        str(wait_shell_timeout),
+        "--wait-agent-timeout",
+        str(wait_agent_timeout),
+        "--capture-lines",
+        str(capture_lines),
+        "--completion-action",
+        str(selected_completion_action),
+        "--completion-timeout",
+        str(max(0.0, completion_timeout)),
+        "--completion-notify-mode",
+        completion_notify_mode,
+        "--shell-settle-delay",
+        str(shell_settle_delay),
+        "--shell-idle-quiet-for",
+        str(shell_idle_quiet_for),
+        "--shell-probe-timeout",
+        str(max(1.0, shell_probe_timeout)),
+        "--agent-idle-quiet-for",
+        str(agent_idle_quiet_for),
+        "--agent-min-runtime",
+        str(agent_min_runtime),
+        "--enter-delay",
+        str(enter_delay),
+    ]
+    if startup_pattern:
+        cmd.extend(["--startup-pattern", startup_pattern])
+    if agent_cmd:
+        cmd.extend(["--agent-cmd", agent_cmd])
+    elif model:
+        cmd.extend(["--model", model])
+    if session:
+        cmd.extend(["--session", session])
+    if window_name:
+        cmd.extend(["--window-name", window_name])
+    if split_target_pane:
+        cmd.extend(["--split-target-pane", split_target_pane])
+    if controller_pane:
+        cmd.extend(["--controller-pane", controller_pane])
+    if controller_height_percent:
+        cmd.extend(["--controller-height-percent", str(controller_height_percent)])
+    if shell:
+        cmd.extend(["--shell", shell])
+    if no_prompt:
+        cmd.append("--no-prompt")
+    elif prompt_file:
+        cmd.extend(["--prompt-file", str(prompt_file.expanduser().resolve())])
+    elif prompt:
+        cmd.extend(["--prompt", prompt])
+    else:
+        cmd.append("--no-prompt")
+    if verbose:
+        cmd.append("--verbose")
+
+    result = subprocess.run(cmd, check=False)
+    raise SystemExit(result.returncode)
+
+
+@main.command(name="tmux-open")
+@click.option("-a", "--agent", type=click.Choice(["codex", "claude", "gemini"]), required=True, help="Agent to launch")
+@click.option("-x", "--agent-cmd", help="Override launch command")
+@click.option("-m", "--model", help="Model for gemini when --agent-cmd is not set")
+@click.option("-s", "--session", help="tmux session (default auto-detect current)")
+@click.option("-l", "--layout", type=click.Choice(["split", "window"]), default="split", show_default=True, help="tmux layout")
+@click.option("-c", "--controller-pane", help="Controller pane id for split controller-bottom policy")
+@click.option("-n", "--window-name", help="Window name")
+@click.option("-r", "--repo-root", default=".", show_default=True, help="Repository root")
+@click.option("-p", "--prompt", help="Inline prompt")
+@click.option("-f", "--prompt-file", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Prompt file")
+@click.option("-k", "--completion", type=click.Choice(["ask", "keep", "close", "none"]), default="ask", show_default=True, help="Completion policy")
+@click.option(
+    "-N",
+    "--notify",
+    type=click.Choice(["input", "status", "both", "none"]),
+    default="input",
+    show_default=True,
+    help="Completion notify mode",
+)
+def tmux_open(
+    agent: str,
+    agent_cmd: Optional[str],
+    model: Optional[str],
+    session: Optional[str],
+    layout: str,
+    controller_pane: Optional[str],
+    window_name: Optional[str],
+    repo_root: str,
+    prompt: Optional[str],
+    prompt_file: Optional[Path],
+    completion: str,
+    notify: str,
+) -> None:
+    """Short wrapper for `ai-collab handoff` with sane tmux defaults."""
+    if prompt and prompt_file:
+        console.print("[red]Use either --prompt or --prompt-file, not both.[/red]")
+        raise SystemExit(2)
+
+    cmd: list[str] = [
+        sys.executable,
+        "-m",
+        "ai_collab.cli",
+        "handoff",
+        "--agent",
+        agent,
+        "--tmux-layout",
+        layout,
+        "--repo-root",
+        str(Path(repo_root).expanduser().resolve()),
+        "--completion-action",
+        completion,
+        "--completion-notify-mode",
+        notify,
+        "--no-ask-launch-options",
+    ]
+    if layout == "split":
+        cmd.extend(["--split-policy", "controller-bottom"])
+    if session:
+        cmd.extend(["--session", session])
+    if controller_pane:
+        cmd.extend(["--controller-pane", controller_pane])
+    if window_name:
+        cmd.extend(["--window-name", window_name])
+    if agent_cmd:
+        cmd.extend(["--agent-cmd", agent_cmd])
+    elif model:
+        cmd.extend(["--model", model])
+    if prompt_file:
+        cmd.extend(["--prompt-file", str(prompt_file.expanduser().resolve())])
+    elif prompt:
+        cmd.extend(["--prompt", prompt])
+    else:
+        cmd.append("--no-prompt")
+
+    result = subprocess.run(cmd, check=False)
+    raise SystemExit(result.returncode)
+
+
+@main.command(name="tmux-close-test")
+@click.option("-C", "--controller", type=click.Choice(["codex", "claude", "gemini"]), default="codex", show_default=True, help="Controller agent")
+@click.option("-S", "--subagent", type=click.Choice(["codex", "claude", "gemini"]), default="codex", show_default=True, help="Sub-agent")
+@click.option("-d", "--duration", type=int, default=90, show_default=True, help="Sub-agent target duration seconds")
+@click.option("-t", "--watch1", type=int, default=60, show_default=True, help="First watch timeout seconds")
+@click.option("-r", "--watch2", type=int, default=45, show_default=True, help="Second watch timeout seconds")
+@click.option("-s", "--session", help="tmux session (default auto-detect current)")
+@click.option("-w", "--window-name", default="controller-close-test", show_default=True, help="Controller window name")
+@click.option("--repo-root", "-R", default=".", show_default=True, help="Repository root")
+def tmux_close_test(
+    controller: str,
+    subagent: str,
+    duration: int,
+    watch1: int,
+    watch2: int,
+    session: Optional[str],
+    window_name: str,
+    repo_root: str,
+) -> None:
+    """One-command setup for controller close-choice workflow test."""
+    root = Path(repo_root).expanduser().resolve()
+    seconds = max(5, int(duration))
+    t1 = max(5, int(watch1))
+    t2 = max(5, int(watch2))
+
+    sub_cmd = (
+        "codex --dangerously-bypass-approvals-and-sandbox"
+        if subagent == "codex"
+        else subagent
+    )
+    prompt = (
+        f"你是主控Agent（{controller}）。直接执行，不要--help，不要读源码。\\n"
+        "只使用 ai-collab tmux-status/handoff/tmux-watch/tmux-capture/tmux-close-pane。\\n"
+        "步骤：\\n"
+        "1) 用 ai-collab tmux-status --json-output 取 CTRL_PANE。\\n"
+        f"2) 启动子控：ai-collab handoff --agent {subagent} --agent-cmd '{sub_cmd}' "
+        "--tmux-layout split --split-policy controller-bottom --controller-pane <CTRL_PANE> "
+        f"--repo-root {root} --prompt '子控只做一件事：先执行 sleep {seconds}，"
+        "然后输出 SUBTASK_RESULT: done-after-sleep 和 === TASK_COMPLETE ===。禁止额外任务。' "
+        "--completion-action ask --completion-timeout 900 --completion-notify-mode input --no-ask-launch-options。\\n"
+        "3) 解析 SUB_PANE。\\n"
+        f"4) 先监控 {t1}s：ai-collab tmux-watch --pane-id <SUB_PANE> --timeout-seconds {t1} --json-output。\\n"
+        f"5) 若 timeout/still_running，再监控 {t2}s：ai-collab tmux-watch --pane-id <SUB_PANE> --timeout-seconds {t2} --json-output。\\n"
+        "6) 用 ai-collab tmux-capture --pane-id <SUB_PANE> --lines 260 验收：必须同时包含 SUBTASK_RESULT: done-after-sleep 和 === TASK_COMPLETE ===。\\n"
+        "7) 询问用户：\\n是否关闭已完成子控窗口？\\n1. 关闭窗口\\n2. 保留窗口\\n"
+        "8) 若用户输入1：执行 ai-collab tmux-close-pane --pane-id <SUB_PANE> 并输出 [CTRL] close-done <SUB_PANE>。\\n"
+        "9) 若用户输入2：输出 [CTRL] keep-done <SUB_PANE>。\\n"
+        "10) 最后一行输出 CONTROLLER_CLOSE_CHOICE_TEST_DONE。"
+    )
+    prompt_file = _write_briefing_file(
+        cwd=root,
+        role="controller-close-test",
+        agent=controller,
+        text=prompt,
+    )
+
+    cmd: list[str] = [
+        sys.executable,
+        "-m",
+        "ai_collab.cli",
+        "tmux-open",
+        "--agent",
+        controller,
+        "--layout",
+        "window",
+        "--window-name",
+        window_name,
+        "--repo-root",
+        str(root),
+        "--prompt-file",
+        str(prompt_file),
+        "--completion",
+        "none",
+    ]
+    if controller == "codex":
+        cmd.extend(["--agent-cmd", "codex --dangerously-bypass-approvals-and-sandbox"])
+    if session:
+        cmd.extend(["--session", session])
+
+    console.print(f"[dim]controller test prompt: {prompt_file}[/dim]")
+    result = subprocess.run(cmd, check=False)
+    raise SystemExit(result.returncode)
+
+
+@main.command(name="relay-smoke")
+@click.option("--agent", "-a", type=click.Choice(["codex", "claude", "gemini"]), default="claude", show_default=True, help="Sub-agent to validate")
+@click.option("--controller-agent", "-c", type=click.Choice(["codex", "claude", "gemini"]), default="codex", show_default=True, help="Controller agent label for run binding")
+@click.option("--timeout-seconds", "-t", type=int, default=180, show_default=True, help="Max wait for completion")
+@click.option("--cwd", "-w", default=".", show_default=True, help="Workspace root for .ai-collab run files")
+@click.option("-k/-K", "--keep-pane/--auto-close-pane", default=True, show_default=False, help="Keep spawned sub-agent pane after test")
+@click.option("-u/-U", "--require-step-done/--allow-missing-step-done", default=True, show_default=False, help="Require step_done event to pass")
+def relay_smoke(
+    agent: str,
+    controller_agent: str,
+    timeout_seconds: int,
+    cwd: str,
+    keep_pane: bool,
+    require_step_done: bool,
+) -> None:
+    """Run structured relay smoke test in current tmux controller pane."""
+    if shutil.which("tmux") is None:
+        console.print("[red]tmux not found in PATH[/red]")
+        raise SystemExit(2)
+    current = subprocess.run(
+        ["tmux", "display-message", "-p", "#S\t#{pane_id}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if current.returncode != 0 or not current.stdout.strip():
+        console.print("[red]No active tmux client context for relay-smoke[/red]")
+        raise SystemExit(2)
+    session, controller_pane = current.stdout.strip().split("\t", 1)
+    root = Path(cwd).expanduser().resolve()
+
+    run_store = RunStateStore.create(
+        cwd=root,
+        session=session,
+        controller_agent=controller_agent,
+        controller_pane=controller_pane,
+    )
+    steps = [
+        {
+            "id": "S1",
+            "role": "event-smoke",
+            "selected_model": "default",
+            "reason": "validate structured completion relay",
+        }
+    ]
+    pane_id = _spawn_subagent_with_prompt(
+        session=session,
+        controller_pane=controller_pane,
+        controller=controller_agent,
+        agent=agent,
+        task="这是一条系统回执测试任务：不要实现代码。请按要求输出 AI_COLLAB_EVENT step_done + subagent_complete。",
+        steps=steps,
+        cwd=root,
+        lang="zh-CN",
+        run_store=run_store,
+    )
+    console.print(f"[dim]run_id: {run_store.run_id}[/dim]")
+    console.print(f"[dim]subagent_pane: {pane_id}[/dim]")
+
+    deadline = time.time() + max(timeout_seconds, 10)
+    final_status = "running"
+    while time.time() < deadline:
+        try:
+            state = json.loads(run_store.paths.state_file.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            time.sleep(1.0)
+            continue
+        final_status = str(state.get("agents", {}).get(agent, {}).get("status", "running"))
+        if final_status in {"completed", "timeout_hard"}:
+            break
+        time.sleep(2.0)
+
+    state = json.loads(run_store.paths.state_file.read_text(encoding="utf-8"))
+    step_status = str(state.get("steps", {}).get("S1", {}).get("status", "unknown"))
+    console.print(f"[bold]final_agent_status[/bold]: {final_status}")
+    console.print(f"[bold]final_step_status[/bold]: {step_status}")
+    console.print(f"[dim]run_dir: {run_store.paths.run_dir}[/dim]")
+
+    if not keep_pane:
+        subprocess.run(["tmux", "kill-pane", "-t", pane_id], check=False)
+
+    if final_status != "completed":
+        raise SystemExit(1)
+    if require_step_done and step_status != "done":
+        console.print("[red]relay-smoke failed:[/red] sub-agent completed without step_done event.")
+        raise SystemExit(1)
 
 
 def _safe_execute(cli: str, task: str, timeout: Optional[int] = None) -> int:
@@ -1716,7 +2565,21 @@ persona_skill_map:
 - 子 Agent 必须在 tmux 可视窗格执行，禁止后台 shell 调用 claude/gemini。
 - 交接时必须输出 `HANDOFF_TO: <agent>` 或 `SPAWN_AGENT: <agent>`。
 - 禁止先运行 `--help` / `-h` / `--version` 或任何探活脚本；必须直接执行分配步骤。
+- 禁止读取 `cli.py` / `SKILL.md` / 搜索源码来确认参数；直接使用命令合同。
+- 若要求真实子 Agent 测试，禁止使用 `--agent-cmd` shell 模拟（例如 sleep/echo）。
 - 若命令被权限/审批拦截，先输出 `NEED_ELEVATION: <command> | reason=<error>` 并等待，不得静默降级。
+
+ai-collab 命令合同（直接使用）:
+- `ai-collab tmux-status --json-output`
+- `ai-collab handoff --agent <gemini|claude|codex> --tmux-layout split --split-policy controller-bottom --controller-pane <pane_id> --repo-root <repo> --prompt '<任务>' --completion-action keep --no-ask-launch-options`
+- `ai-collab tmux-watch --pane-id <pane_id> --timeout-seconds <n> --json-output`
+- `ai-collab tmux-close-pane --pane-id <pane_id>`
+
+监控与故障处理策略（必须执行）:
+- 先短超时监控；若 `timeout/still_running`，按回退序列重试（例如 30s -> 60s -> 90s）。
+- 若 `tmux-watch` 返回 `error/model_capacity_exhausted`：优先切换该 Agent 的备选模型并重试；仍失败再切换备选 Agent。
+- 若 `error/network_error`：先退避重试（例如 10s/20s/40s）；连续失败再切模型或切 Agent。
+- 若子 Agent 已完成部分步骤，重派时只继续未完成步骤，不得整任务重做。
 """
 
     return f"""You are the controller agent: {controller}.
@@ -1759,7 +2622,21 @@ Mandatory constraints:
 - Sub-agents must run in visible tmux panes. Do not call claude/gemini via hidden background shell commands.
 - On handoff, output `HANDOFF_TO: <agent>` or `SPAWN_AGENT: <agent>`.
 - Do not run probe commands such as `--help` / `-h` / `--version` or ad-hoc health scripts before execution.
+- Do not read `cli.py` / `SKILL.md` / source search results to discover parameters; use the command contract directly.
+- If real sub-agent validation is required, do not use `--agent-cmd` shell simulation (`sleep/echo`).
 - If any command is blocked by permission/approval, output `NEED_ELEVATION: <command> | reason=<error>` and wait (no silent downgrade).
+
+ai-collab command contract (use directly):
+- `ai-collab tmux-status --json-output`
+- `ai-collab handoff --agent <gemini|claude|codex> --tmux-layout split --split-policy controller-bottom --controller-pane <pane_id> --repo-root <repo> --prompt '<task>' --completion-action keep --no-ask-launch-options`
+- `ai-collab tmux-watch --pane-id <pane_id> --timeout-seconds <n> --json-output`
+- `ai-collab tmux-close-pane --pane-id <pane_id>`
+
+Monitoring and failure policy (mandatory):
+- Start with short watch timeout; if `timeout/still_running`, retry with backoff sequence (for example 30s -> 60s -> 90s).
+- If `tmux-watch` returns `error/model_capacity_exhausted`: switch to the same agent's backup model first; if still failing, switch to backup agent.
+- If `error/network_error`: retry with backoff first (for example 10s/20s/40s); only then switch model/agent.
+- If sub-agent already completed some steps, re-dispatch only unfinished steps (no full-task redo).
 """
 
 
@@ -1835,6 +2712,18 @@ def _build_controller_execution_prompt(
     """Build execution prompt for approved controller plan."""
     serialized = json.dumps(plan, indent=2, ensure_ascii=False)
     notes_block = adjustment_notes.strip()
+    command_contract_zh = """固定命令合同（直接使用，不要再读代码/文档猜参数）:
+- 查看 tmux 绑定: `ai-collab tmux-status --json-output`
+- 拉起真实子 Agent（下半屏）: `ai-collab handoff --agent <gemini|claude|codex> --tmux-layout split --split-policy controller-bottom --controller-pane <pane_id> --repo-root <repo> --prompt '<任务>' --completion-action keep --no-ask-launch-options`
+- 监控子 Agent: `ai-collab tmux-watch --pane-id <pane_id> --timeout-seconds <n> --json-output`
+- 关闭子 pane: `ai-collab tmux-close-pane --pane-id <pane_id>`
+"""
+    command_contract_en = """Command contract (use directly; do not read code/docs to guess params):
+- tmux binding: `ai-collab tmux-status --json-output`
+- spawn real sub-agent (bottom split): `ai-collab handoff --agent <gemini|claude|codex> --tmux-layout split --split-policy controller-bottom --controller-pane <pane_id> --repo-root <repo> --prompt '<task>' --completion-action keep --no-ask-launch-options`
+- monitor sub-agent: `ai-collab tmux-watch --pane-id <pane_id> --timeout-seconds <n> --json-output`
+- close sub pane: `ai-collab tmux-close-pane --pane-id <pane_id>`
+"""
     if lang == "zh-CN":
         extra = ""
         if notes_block:
@@ -1849,9 +2738,13 @@ def _build_controller_execution_prompt(
 2. 子 Agent 必须在 tmux 可视窗格执行，禁止后台 shell 调用 claude/gemini。
 3. 每步结束输出 `STEP_DONE: <id>` 与简短结果。
 4. 交接下一位时输出 `HANDOFF_TO: <agent>` 或 `SPAWN_AGENT: <agent>`。
-5. 禁止运行 `--help` / `-h` / `--version` 或探活脚本；直接执行步骤。
-6. 若命令被权限/审批拦截，立即输出 `NEED_ELEVATION: <command> | reason=<error>`，等待用户处理。
-7. 全部完成输出 `=== TASK_COMPLETE ===`。
+5. 禁止运行 `--help` / `-h` / `--version`、禁止读取 `cli.py` / `SKILL.md` / 搜索源码来确认参数。
+6. 若用户要求“真实子 Agent”，禁止使用 `--agent-cmd` shell 模拟（如 `sleep/echo`）。
+7. 监控超时参数必须动态调整，不得固定为同一个值。
+8. 若命令被权限/审批拦截，立即输出 `NEED_ELEVATION: <command> | reason=<error>`，等待用户处理。
+9. 全部完成输出 `=== TASK_COMPLETE ===`。
+
+{command_contract_zh}
 """
     extra = ""
     if notes_block:
@@ -1866,9 +2759,13 @@ Execution rules:
 2. Run sub-agents in visible tmux panes only. Do not call claude/gemini via hidden background shell commands.
 3. After each step output `STEP_DONE: <id>` with short summary.
 4. When handing off, output `HANDOFF_TO: <agent>` or `SPAWN_AGENT: <agent>`.
-5. Do not run probe commands (`--help` / `-h` / `--version`) or ad-hoc health scripts before execution.
-6. If blocked by permission/approval, output `NEED_ELEVATION: <command> | reason=<error>` and wait.
-7. Finish with `=== TASK_COMPLETE ===`.
+5. Do not run probe commands (`--help` / `-h` / `--version`) and do not read `cli.py`/`SKILL.md` to discover params.
+6. If user asked for real sub-agent validation, do not use `--agent-cmd` shell simulation (`sleep/echo`).
+7. Adjust monitor timeout dynamically from runtime status; do not keep one fixed timeout value.
+8. If blocked by permission/approval, output `NEED_ELEVATION: <command> | reason=<error>` and wait.
+9. Finish with `=== TASK_COMPLETE ===`.
+
+{command_contract_en}
 """
 
 
@@ -2021,7 +2918,13 @@ def _wait_for_agent_ready(*, pane_id: str, agent: str, timeout_seconds: float = 
             "do you trust the contents of this directory",
             "press enter to continue",
         ],
-        "claude": ["claude", "sonnet", "opus"],
+        "claude": [
+            "claude code",
+            'try "create a util',
+            "ctrl+t to hide tasks",
+            "/ide for",
+            "enter to confirm",
+        ],
         "gemini": ["gemini"],
     }
     deadline = time.monotonic() + max(timeout_seconds, 0.1)
@@ -2054,7 +2957,8 @@ def _wait_for_agent_ready(*, pane_id: str, agent: str, timeout_seconds: float = 
             )
             if has_trust_gate and not claude_trust_confirmed:
                 claude_trust_confirmed = True
-                send_pane_text(pane_id=pane_id, text="", press_enter=True, delay_seconds=0.0)
+                # Claude trust gate may default cursor on "No, exit"; explicitly choose option 1.
+                send_pane_text(pane_id=pane_id, text="1", press_enter=True, delay_seconds=0.0)
                 time.sleep(0.8)
                 continue
         if any(token in lower for token in expected):
@@ -2095,8 +2999,62 @@ def _pane_contains_probe(*, pane_id: str, probe: str) -> bool:
 
 def _relay_to_controller_input_enabled() -> bool:
     """Whether relay watcher should inject status text into controller input."""
-    value = os.environ.get("AI_COLLAB_RELAY_TO_CONTROLLER_INPUT", "1").strip().lower()
+    value = os.environ.get("AI_COLLAB_RELAY_TO_CONTROLLER_INPUT", "0").strip().lower()
     return value in {"1", "true", "yes", "on"}
+
+
+def _relay_to_controller_status_enabled() -> bool:
+    """Whether relay watcher should show status via tmux status line message."""
+    value = os.environ.get("AI_COLLAB_RELAY_STATUS_MESSAGE", "1").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _controller_ask_close_on_complete_enabled() -> bool:
+    """Whether relay should force controller to ask user about closing completed panes."""
+    value = os.environ.get("AI_COLLAB_CONTROLLER_ASK_CLOSE_ON_COMPLETE", "1").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _controller_close_prompt_to_input_enabled() -> bool:
+    """Whether close-confirmation prompt should be injected into controller input box."""
+    value = os.environ.get("AI_COLLAB_CONTROLLER_CLOSE_PROMPT_TO_INPUT", "1").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _notify_controller_to_confirm_subagent_close(
+    *,
+    controller_pane: str,
+    agent: str,
+    pane_id: str,
+) -> None:
+    """Tell controller to ask user whether to close a completed sub-agent pane first."""
+    if not _controller_ask_close_on_complete_enabled():
+        return
+    msg = (
+        "[ai-collab control] Sub-agent "
+        f"{agent} (pane {pane_id}) completed. "
+        "First ask user whether to close this completed agent pane, wait for user answer, then continue."
+    )
+    subprocess.run(
+        ["tmux", "display-message", "-t", controller_pane, msg],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if _controller_close_prompt_to_input_enabled():
+        send_pane_text(
+            pane_id=controller_pane,
+            text=msg,
+            press_enter=True,
+            delay_seconds=0.0,
+        )
+        # Some chat UIs treat first Enter as input commit but not submit.
+        send_pane_text(
+            pane_id=controller_pane,
+            text="",
+            press_enter=True,
+            delay_seconds=0.12,
+        )
 
 
 def _resolve_dispatch_typing_char_delay() -> float:
@@ -2125,6 +3083,11 @@ def _emit_relay_event(
     session: str,
     controller_pane: str,
     message: str,
+    run_store: Optional[RunStateStore] = None,
+    event_type: str = "relay_message",
+    source: str = "relay",
+    agent: str = "",
+    payload: Optional[dict[str, Any]] = None,
 ) -> None:
     """Persist relay events and optionally inject them to controller input."""
     event_log = _tmux_events_log_path(cwd=cwd, session=session)
@@ -2132,6 +3095,22 @@ def _emit_relay_event(
     event_log.parent.mkdir(parents=True, exist_ok=True)
     with event_log.open("a", encoding="utf-8") as handle:
         handle.write(f"[{timestamp}] {message}\n")
+
+    if run_store is not None:
+        run_store.append_event(
+            event_type=event_type,
+            source=source,
+            agent=agent,
+            payload=payload or {"message": message},
+        )
+
+    if _relay_to_controller_status_enabled():
+        subprocess.run(
+            ["tmux", "display-message", "-t", controller_pane, message],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
     if _relay_to_controller_input_enabled():
         send_pane_text(
@@ -2189,7 +3168,9 @@ def _inject_prompt_to_pane(*, pane_id: str, text: str, agent: str) -> bool:
     """
     probe = _prompt_probe(text)
     ready_timeout = _resolve_agent_ready_timeout(agent)
-    max_attempts = 2
+    # Gemini occasionally drops first injected block during startup transitions.
+    # Keep retry only for Gemini to avoid duplicate dispatch in codex/claude.
+    max_attempts = 2 if agent == "gemini" else 1
     for attempt in range(max_attempts):
         ready = _wait_for_agent_ready(
             pane_id=pane_id,
@@ -2277,6 +3258,92 @@ def _extract_step_done_ids(text: str) -> list[str]:
     return step_ids
 
 
+def _extract_ai_collab_events(text: str) -> list[dict[str, Any]]:
+    """Extract structured AI_COLLAB_EVENT JSON payloads from terminal output."""
+    events: list[dict[str, Any]] = []
+    normalized = _normalize_terminal_text_for_markers(text)
+    lines = normalized.splitlines()
+    prefix = re.compile(r"(?i)^\s*AI_COLLAB_EVENT\s*:?\s*(.*)$")
+    marker_prefix = re.compile(r"(?i)^\s*(?:AI_COLLAB_EVENT|STEP_DONE|HANDOFF_TO|SPAWN_AGENT|RESULT)\s*:")
+
+    idx = 0
+    while idx < len(lines):
+        raw = lines[idx]
+        match = prefix.match(raw)
+        if not match:
+            idx += 1
+            continue
+
+        suffix = match.group(1).strip()
+        brace_pos = suffix.find("{")
+        if brace_pos < 0:
+            idx += 1
+            continue
+
+        payload = suffix[brace_pos:].strip()
+        parsed: Optional[dict[str, Any]] = None
+        consumed = 0
+
+        for look_ahead in range(0, 8):
+            try:
+                candidate = json.loads(payload)
+            except json.JSONDecodeError:
+                candidate = None
+            if isinstance(candidate, dict):
+                parsed = candidate
+                consumed = look_ahead
+                break
+            next_idx = idx + look_ahead + 1
+            if next_idx >= len(lines):
+                break
+            next_line = lines[next_idx]
+            if marker_prefix.match(next_line):
+                break
+            payload += next_line.strip()
+
+        if parsed is not None:
+            events.append(parsed)
+            idx += consumed + 1
+            continue
+        idx += 1
+    return events
+
+
+def _build_step_tickets(steps: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Assign deterministic step ids plus run-scoped nonces for completion validation."""
+    tickets: list[dict[str, str]] = []
+    for idx, step in enumerate(steps, 1):
+        step_id = str(step.get("id", "")).strip() or f"S{idx}"
+        step["id"] = step_id
+        tickets.append(
+            {
+                "step_id": step_id,
+                "nonce": uuid4().hex[:12],
+            }
+        )
+    return tickets
+
+
+def _resolve_subagent_timeout_seconds(kind: str) -> float:
+    """Resolve soft/hard timeout for sub-agent status waiting."""
+    defaults = {
+        "soft": 180.0,
+        "hard": 480.0,
+    }
+    key = "AI_COLLAB_SUBAGENT_SOFT_TIMEOUT_SECONDS" if kind == "soft" else "AI_COLLAB_SUBAGENT_HARD_TIMEOUT_SECONDS"
+    base = defaults[kind]
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return base
+    try:
+        value = float(raw)
+    except ValueError:
+        return base
+    if value <= 0:
+        return base
+    return value
+
+
 def _normalize_terminal_text_for_markers(text: str) -> str:
     """Normalize terminal output so marker parsing survives ANSI/carriage updates."""
     normalized = text.replace("\r", "\n")
@@ -2284,7 +3351,15 @@ def _normalize_terminal_text_for_markers(text: str) -> str:
     return normalized
 
 
-def _build_subagent_prompt(*, task: str, steps: list[dict], lang: str, controller: str) -> str:
+def _build_subagent_prompt(
+    *,
+    task: str,
+    steps: list[dict],
+    lang: str,
+    controller: str,
+    run_id: str,
+    step_tickets: list[dict[str, str]],
+) -> str:
     assigned_lines = [
         "- {step_id} {role}: model={model}, reason={reason}".format(
             step_id=f"[{step.get('id', f'S{idx}')}]",
@@ -2293,6 +3368,13 @@ def _build_subagent_prompt(*, task: str, steps: list[dict], lang: str, controlle
             reason=step.get("reason", ""),
         )
         for idx, step in enumerate(steps, 1)
+    ]
+    ticket_lines = [
+        "- {step_id}: nonce={nonce}".format(
+            step_id=ticket.get("step_id", ""),
+            nonce=ticket.get("nonce", ""),
+        )
+        for ticket in step_tickets
     ]
     if lang == "zh-CN":
         return (
@@ -2306,7 +3388,20 @@ def _build_subagent_prompt(*, task: str, steps: list[dict], lang: str, controlle
             + "- 若信息不完整，使用最小可行默认值并继续推进，同时注明假设。\n"
             + "- 禁止先运行 `--help` / `-h` / `--version` 或健康检查脚本探活，直接执行分配步骤。\n"
             + "- 若命令被权限/审批拦截，输出 `NEED_ELEVATION: <command> | reason=<error>` 并等待。\n"
-            + "- 完成后必须输出以下四行（逐行输出）:\n"
+            + "- 本次运行 run_id: "
+            + run_id
+            + "\n"
+            + "- 本次 step nonce 对照:\n"
+            + ("\n".join(ticket_lines) if ticket_lines else "- (none)")
+            + "\n"
+            + "- 完成后必须输出结构化事件（每行一条，严格 JSON）:\n"
+            + '- AI_COLLAB_EVENT: {"type":"step_done","run_id":"'
+            + run_id
+            + '","step_id":"<step_id>","nonce":"<nonce>","status":"ok","summary":"<三行内摘要>"}\n'
+            + '- AI_COLLAB_EVENT: {"type":"subagent_complete","run_id":"'
+            + run_id
+            + '","agent":"<agent>","status":"ok"}\n'
+            + "- 同时保留以下兼容标记（逐行输出）:\n"
             + "- STEP_DONE: <step_id>\n"
             + f"- HANDOFF_TO: {controller}\n"
             + "- RESULT: <三行内结果摘要>\n"
@@ -2324,7 +3419,20 @@ def _build_subagent_prompt(*, task: str, steps: list[dict], lang: str, controlle
         + "- If information is missing, choose minimal viable defaults, note assumptions, and continue.\n"
         + "- Do not run `--help` / `-h` / `--version` or health-check scripts before execution.\n"
         + "- If command execution is blocked by permission/approval, output `NEED_ELEVATION: <command> | reason=<error>` and wait.\n"
-        + "- After finishing, output these four lines:\n"
+        + "- Current run_id: "
+        + run_id
+        + "\n"
+        + "- Step nonce map:\n"
+        + ("\n".join(ticket_lines) if ticket_lines else "- (none)")
+        + "\n"
+        + "- After finishing, emit structured events (one JSON line per event):\n"
+        + '- AI_COLLAB_EVENT: {"type":"step_done","run_id":"'
+        + run_id
+        + '","step_id":"<step_id>","nonce":"<nonce>","status":"ok","summary":"<3-line summary>"}\n'
+        + '- AI_COLLAB_EVENT: {"type":"subagent_complete","run_id":"'
+        + run_id
+        + '","agent":"<agent>","status":"ok"}\n'
+        + "- Keep compatibility markers as well:\n"
         + "- STEP_DONE: <step_id>\n"
         + f"- HANDOFF_TO: {controller}\n"
         + "- RESULT: <summary within 3 lines>\n"
@@ -2340,22 +3448,43 @@ def _start_subagent_status_relay(
     subagent_pane: str,
     controller_pane: str,
     agent: str,
+    run_store: Optional[RunStateStore] = None,
+    expected_step_nonces: Optional[dict[str, str]] = None,
 ) -> None:
     """Relay sub-agent completion markers back to controller pane."""
-    complete_pattern = re.compile(r"(?:===\s*SUBAGENT_COMPLETE\s*===|===\s*TASK_COMPLETE\s*===)", re.IGNORECASE)
+    expected_nonces = expected_step_nonces or {}
+    soft_timeout = _resolve_subagent_timeout_seconds("soft")
+    hard_timeout = max(_resolve_subagent_timeout_seconds("hard"), soft_timeout + 30.0)
 
     def _runner() -> None:
         seen_steps: set[str] = set()
         seen_handoffs: set[str] = set()
+        seen_structured: set[str] = set()
         unchanged = 0
         last_tail = ""
         seeded = False
+        last_progress = time.monotonic()
+        soft_timeout_emitted = False
+        active_issue = ""
+        active_issue_since = 0.0
+        issue_grace_seconds = max(8.0, min(20.0, soft_timeout * 0.35))
+
+        if run_store is not None:
+            run_store.set_agent_status(agent=agent, status="running")
+            run_store.append_event(
+                event_type="subagent_started",
+                source="relay",
+                agent=agent,
+                payload={"pane_id": subagent_pane},
+            )
         while True:
             try:
                 snapshot = capture_pane_text(pane_id=subagent_pane, start_line=-260)
             except subprocess.CalledProcessError:
                 unchanged += 1
                 if unchanged >= 8:
+                    if run_store is not None:
+                        run_store.set_agent_status(agent=agent, status="pane_unavailable")
                     return
                 time.sleep(1.0)
                 continue
@@ -2366,22 +3495,135 @@ def _start_subagent_status_relay(
                 last_tail = tail
                 time.sleep(1.0)
                 continue
+            delta = tail
+            if tail.startswith(last_tail):
+                delta = tail[len(last_tail):]
             if tail == last_tail:
                 unchanged += 1
             else:
                 unchanged = 0
                 last_tail = tail
-                for step_id in _extract_step_done_ids(tail):
+                last_progress = time.monotonic()
+
+                parsed_structured = _extract_ai_collab_events(delta)
+                for event in parsed_structured:
+                    evt_type = str(event.get("type", "")).strip().lower()
+                    evt_run = str(event.get("run_id", "")).strip()
+                    evt_step = str(event.get("step_id", "")).strip()
+                    evt_nonce = str(event.get("nonce", "")).strip()
+                    evt_key = f"{evt_type}|{evt_run}|{evt_step}|{evt_nonce}"
+                    if evt_key in seen_structured:
+                        continue
+                    seen_structured.add(evt_key)
+
+                    if run_store is not None and evt_run and evt_run != run_store.run_id:
+                        _emit_relay_event(
+                            cwd=cwd,
+                            session=session,
+                            controller_pane=controller_pane,
+                            message=f"[ai-collab relay] {agent} ignored mismatched run_id event: {evt_run}",
+                            run_store=run_store,
+                            event_type="subagent_event_rejected",
+                            source="relay",
+                            agent=agent,
+                            payload={"reason": "run_id_mismatch", "event": event},
+                        )
+                        continue
+
+                    if evt_type == "step_done":
+                        expected_nonce = expected_nonces.get(evt_step, "")
+                        if expected_nonce and evt_nonce != expected_nonce:
+                            _emit_relay_event(
+                                cwd=cwd,
+                                session=session,
+                                controller_pane=controller_pane,
+                                message=f"[ai-collab relay] {agent} rejected step_done nonce mismatch for {evt_step}",
+                                run_store=run_store,
+                                event_type="subagent_event_rejected",
+                                source="relay",
+                                agent=agent,
+                                payload={"reason": "nonce_mismatch", "event": event},
+                            )
+                            continue
+                        if evt_step:
+                            seen_steps.add(evt_step)
+                            if run_store is not None:
+                                run_store.set_step_status(
+                                    step_id=evt_step,
+                                    status="done",
+                                    agent=agent,
+                                    nonce=evt_nonce or expected_nonce,
+                                    summary=str(event.get("summary", "")).strip(),
+                                )
+                        _emit_relay_event(
+                            cwd=cwd,
+                            session=session,
+                            controller_pane=controller_pane,
+                            message=f"[ai-collab relay] {agent} step done -> {evt_step}",
+                            run_store=run_store,
+                            event_type="step_done",
+                            source="subagent_event",
+                            agent=agent,
+                            payload=event,
+                        )
+                        continue
+
+                    if evt_type in {"subagent_complete", "task_complete"}:
+                        if run_store is not None:
+                            run_store.set_agent_status(agent=agent, status="completed")
+                        _emit_relay_event(
+                            cwd=cwd,
+                            session=session,
+                            controller_pane=controller_pane,
+                            message=f"[ai-collab relay] {agent} reported completion.",
+                            run_store=run_store,
+                            event_type="subagent_complete",
+                            source="subagent_event",
+                            agent=agent,
+                            payload=event,
+                        )
+                        _notify_controller_to_confirm_subagent_close(
+                            controller_pane=controller_pane,
+                            agent=agent,
+                            pane_id=subagent_pane,
+                        )
+                        return
+
+                    if evt_type in {"handoff_to", "spawn_agent"}:
+                        target = str(event.get("target", "")).strip().lower()
+                        if target and target not in seen_handoffs:
+                            seen_handoffs.add(target)
+                            _emit_relay_event(
+                                cwd=cwd,
+                                session=session,
+                                controller_pane=controller_pane,
+                                message=f"[ai-collab relay] {agent} requested handoff -> {target}",
+                                run_store=run_store,
+                                event_type="handoff_request",
+                                source="subagent_event",
+                                agent=agent,
+                                payload=event,
+                            )
+
+                # Legacy marker compatibility (only parse new delta to reduce false positives).
+                for step_id in _extract_step_done_ids(delta):
                     sid = step_id.strip()
                     if sid and sid not in seen_steps:
                         seen_steps.add(sid)
+                        if run_store is not None:
+                            run_store.set_step_status(step_id=sid, status="done", agent=agent)
                         _emit_relay_event(
                             cwd=cwd,
                             session=session,
                             controller_pane=controller_pane,
                             message=f"[ai-collab relay] {agent} step done -> {sid}",
+                            run_store=run_store,
+                            event_type="step_done_legacy",
+                            source="legacy_marker",
+                            agent=agent,
+                            payload={"step_id": sid},
                         )
-                for target in _extract_handoff_targets(tail):
+                for target in _extract_handoff_targets(delta):
                     next_agent = target.strip().lower()
                     if next_agent and next_agent not in seen_handoffs:
                         seen_handoffs.add(next_agent)
@@ -2390,16 +3632,95 @@ def _start_subagent_status_relay(
                             session=session,
                             controller_pane=controller_pane,
                             message=f"[ai-collab relay] {agent} requested handoff -> {next_agent}",
+                            run_store=run_store,
+                            event_type="handoff_request_legacy",
+                            source="legacy_marker",
+                            agent=agent,
+                            payload={"target": next_agent},
                         )
-                if complete_pattern.search(tail):
+                if _contains_completion_marker(delta):
+                    if run_store is not None:
+                        run_store.set_agent_status(agent=agent, status="completed")
                     _emit_relay_event(
                         cwd=cwd,
                         session=session,
                         controller_pane=controller_pane,
                         message=f"[ai-collab relay] {agent} reported completion.",
+                        run_store=run_store,
+                        event_type="subagent_complete_legacy",
+                        source="legacy_marker",
+                        agent=agent,
+                    )
+                    _notify_controller_to_confirm_subagent_close(
+                        controller_pane=controller_pane,
+                        agent=agent,
+                        pane_id=subagent_pane,
                     )
                     return
-            if unchanged >= 120:
+            issue_now = time.monotonic()
+            idle_now = issue_now - last_progress
+            issue = _classify_watch_issue(delta) or _classify_watch_issue(tail)
+            if issue:
+                if issue != active_issue:
+                    active_issue = issue
+                    active_issue_since = issue_now
+                elif (
+                    active_issue_since > 0
+                    and issue_now - active_issue_since >= issue_grace_seconds
+                    and idle_now >= min(issue_grace_seconds, 10.0)
+                ):
+                    if run_store is not None:
+                        run_store.set_agent_status(agent=agent, status=f"error_{issue}", detail=issue)
+                    _emit_relay_event(
+                        cwd=cwd,
+                        session=session,
+                        controller_pane=controller_pane,
+                        message=f"[ai-collab relay] {agent} error detected: {issue}.",
+                        run_store=run_store,
+                        event_type="subagent_error_detected",
+                        source="relay_issue",
+                        agent=agent,
+                        payload={
+                            "reason": issue,
+                            "idle_seconds": int(idle_now),
+                            "issue_persisted_seconds": int(issue_now - active_issue_since),
+                        },
+                    )
+                    return
+            else:
+                active_issue = ""
+                active_issue_since = 0.0
+            now = time.monotonic()
+            idle_for = now - last_progress
+            if not soft_timeout_emitted and idle_for >= soft_timeout:
+                soft_timeout_emitted = True
+                if run_store is not None:
+                    run_store.set_agent_status(agent=agent, status="waiting_timeout_soft")
+                _emit_relay_event(
+                    cwd=cwd,
+                    session=session,
+                    controller_pane=controller_pane,
+                    message=f"[ai-collab relay] {agent} still running (soft-timeout={int(soft_timeout)}s).",
+                    run_store=run_store,
+                    event_type="subagent_soft_timeout",
+                    source="relay_timeout",
+                    agent=agent,
+                    payload={"idle_seconds": int(idle_for), "soft_timeout_seconds": int(soft_timeout)},
+                )
+            if idle_for >= hard_timeout:
+                if run_store is not None:
+                    run_store.set_agent_status(agent=agent, status="timeout_hard")
+                _emit_relay_event(
+                    cwd=cwd,
+                    session=session,
+                    controller_pane=controller_pane,
+                    message=f"[ai-collab relay] {agent} timed out (hard-timeout={int(hard_timeout)}s).",
+                    run_store=run_store,
+                    event_type="subagent_hard_timeout",
+                    source="relay_timeout",
+                    agent=agent,
+                    payload={"idle_seconds": int(idle_for), "hard_timeout_seconds": int(hard_timeout)},
+                )
                 return
             time.sleep(1.0)
 
@@ -2416,9 +3737,11 @@ def _spawn_subagent_with_prompt(
     steps: list[dict],
     cwd: Path,
     lang: str,
+    run_store: Optional[RunStateStore] = None,
 ) -> str:
     roles = ", ".join(step.get("role", "") for step in steps if step.get("role"))
     task_desc = f"roles: {roles}" if roles else "collaboration role"
+    step_tickets = _build_step_tickets(steps)
     pane_id = spawn_subagent_pane(
         session=session,
         controller_pane=controller_pane,
@@ -2426,11 +3749,24 @@ def _spawn_subagent_with_prompt(
         cwd=cwd,
         task_description=task_desc,
     )
+    if run_store is not None:
+        run_store.bind_agent(agent=agent, pane_id=pane_id, step_tickets=step_tickets)
+        run_store.append_event(
+            event_type="subagent_spawned",
+            source="controller",
+            agent=agent,
+            payload={
+                "pane_id": pane_id,
+                "step_ids": [ticket.get("step_id", "") for ticket in step_tickets],
+            },
+        )
     sub_prompt = _build_subagent_prompt(
         task=task,
         steps=steps,
         lang=lang,
         controller=controller,
+        run_id=run_store.run_id if run_store is not None else "unknown",
+        step_tickets=step_tickets,
     )
     briefing_file = _write_briefing_file(
         cwd=cwd,
@@ -2460,6 +3796,8 @@ def _spawn_subagent_with_prompt(
         subagent_pane=pane_id,
         controller_pane=controller_pane,
         agent=agent,
+        run_store=run_store,
+        expected_step_nonces={ticket.get("step_id", ""): ticket.get("nonce", "") for ticket in step_tickets},
     )
     return pane_id
 
@@ -2473,6 +3811,7 @@ def _start_handoff_watcher(
     agent_roles: dict[str, list[dict]],
     cwd: Path,
     lang: str,
+    run_store: Optional[RunStateStore] = None,
 ) -> None:
     """
     Watch controller output and auto-spawn sub-agent panes on handoff markers.
@@ -2527,6 +3866,7 @@ def _start_handoff_watcher(
                             steps=agent_roles.get(agent, []),
                             cwd=cwd,
                             lang=lang,
+                            run_store=run_store,
                         )
                         spawned.add(agent)
                     except Exception as exc:  # noqa: BLE001
@@ -2713,6 +4053,25 @@ def _launch_tmux_orchestration(
             )
             controller_prompt_ready = False
 
+    run_store = RunStateStore.create(
+        cwd=cwd,
+        session=resolved_session,
+        controller_agent=controller,
+        controller_pane=controller_pane,
+    )
+    run_store.append_event(
+        event_type="run_started",
+        source="controller",
+        agent=controller,
+        payload={
+            "task": task,
+            "execution_mode": "tmux",
+            "tmux_target": tmux_target,
+            "prewarm_subagents": prewarm_subagents,
+        },
+    )
+    console.print(f"[dim]run_id: {run_store.run_id}[/dim]")
+
     agent_roles: dict[str, list[dict]] = {}
     for step in plan:
         agent = str(step.get("agent", "")).strip()
@@ -2731,6 +4090,7 @@ def _launch_tmux_orchestration(
                 cwd=cwd,
                 lang=lang,
                 controller=controller,
+                run_store=run_store,
             )
     else:
         if controller_prompt_ready:
@@ -2742,6 +4102,7 @@ def _launch_tmux_orchestration(
                 agent_roles=agent_roles,
                 cwd=cwd,
                 lang=lang,
+                run_store=run_store,
             )
         else:
             console.print(f"[yellow]{_auto_msg(lang, 'watcher_skipped')}[/yellow]")
@@ -3169,54 +4530,62 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
 
     parser = argparse.ArgumentParser(prog=prog_name, description="Auto-detect and run collaboration workflow")
     parser.add_argument("task", nargs="*", help="Task description")
-    parser.add_argument("--provider", "-p", choices=sorted(providers), help="Current controller/provider")
-    parser.add_argument("--dry-run", action="store_true", help="Only print the plan, do not execute")
-    parser.add_argument("--output", "-o", choices=["text", "json"], default="text", help="Output format")
-    parser.add_argument("--lang", choices=sorted(I18N.keys()), help="Force UI language for this run")
-    parser.add_argument("--ui-mode", choices=["auto", "tui", "text"], default="auto", help="Decision UI mode")
+    parser.add_argument("-p", "--provider", choices=sorted(providers), help="Current controller/provider")
+    parser.add_argument("-d", "--dry-run", action="store_true", help="Only print the plan, do not execute")
+    parser.add_argument("-o", "--output", choices=["text", "json"], default="text", help="Output format")
+    parser.add_argument("-l", "--lang", choices=sorted(I18N.keys()), help="Force UI language for this run")
+    parser.add_argument("-u", "--ui-mode", choices=["auto", "tui", "text"], default="auto", help="Decision UI mode")
     parser.add_argument(
+        "-x",
         "--execution-mode",
         choices=["auto", "direct", "tmux"],
         default="auto",
         help="Execution mode for collaboration workflow",
     )
     parser.add_argument(
+        "-W",
         "--tmux-prewarm-subagents",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Pre-create sub-agent panes when entering tmux mode",
     )
     parser.add_argument(
+        "-t",
         "--tmux-target",
         choices=["auto", "session", "inline"],
         default="auto",
         help="tmux launch target: new session or inline panes in current tmux window",
     )
     parser.add_argument(
+        "-i",
         "--auto-install-deps",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Auto install missing TUI dependencies",
     )
     parser.add_argument(
+        "-I",
         "--interactive-decisions",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Ask for decisions before execution",
     )
     parser.add_argument(
+        "-a",
         "--allow-nested",
         action=argparse.BooleanOptionalAction,
         default=False,
         help=f"Allow running {prog_name} inside an existing ai-collab tmux session",
     )
     parser.add_argument(
+        "-e",
         "--edit-controller-prompt",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Open editable controller prompt doc before tmux launch",
     )
     parser.add_argument(
+        "-c",
         "--controller-first",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -3556,17 +4925,19 @@ def model_select_main() -> None:
     )
     parser.add_argument("provider", choices=sorted(config.providers.keys()))
     parser.add_argument("task", nargs="+")
-    parser.add_argument("--complexity", "-c", choices=["default", "low", "medium", "high"], default="default")
-    parser.add_argument("--output", "-o", choices=["text", "json"], default="text")
-    parser.add_argument("--execute", action="store_true", help="Execute provider command with selected model")
-    parser.add_argument("--ui-mode", choices=["auto", "tui", "text"], default="auto", help="Decision UI mode")
+    parser.add_argument("-c", "--complexity", choices=["default", "low", "medium", "high"], default="default")
+    parser.add_argument("-o", "--output", choices=["text", "json"], default="text")
+    parser.add_argument("-x", "--execute", action="store_true", help="Execute provider command with selected model")
+    parser.add_argument("-u", "--ui-mode", choices=["auto", "tui", "text"], default="auto", help="Decision UI mode")
     parser.add_argument(
+        "-i",
         "--auto-install-deps",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Auto install missing TUI dependencies",
     )
     parser.add_argument(
+        "-d",
         "--interactive-decisions",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -3636,13 +5007,18 @@ def _print_project_help() -> None:
     """Print unified help for the single ai-collab command."""
     console.print(
         "Usage:\n"
-        "  ai-collab [runner-options] [task...]\n"
+        "  ai-collab [OPTIONS] [task...]\n"
         "  ai-collab run [runner-options] [task...]\n"
         "  ai-collab <command> [args...]\n\n"
-        "Runner options:\n"
+        "Options:\n"
+        "  -h, --help     Show this message and exit.\n"
+        "  -V, --version  Show version and exit.\n\n"
+        "Runner options (see full list with `ai-collab run --help`):\n"
         "  ai-collab run --help\n\n"
         "Management commands:\n"
-        "  init, status, config, detect, list, monitor, select\n\n"
+        "  init, status, config, detect, list, monitor, tmux-status, tmux-capture,\n"
+        "  tmux-watch, tmux-close-pane, relay-smoke, handoff, tmux-open,\n"
+        "  tmux-close-test, select\n\n"
         "Examples:\n"
         "  ai-collab \"implement JWT auth with review\"\n"
         "  ai-collab --execution-mode tmux --tmux-target inline \"deliver fullstack feature\"\n"
@@ -3653,13 +5029,29 @@ def _print_project_help() -> None:
 def project_main() -> None:
     """Unified project entrypoint for ai-collab."""
     args = sys.argv[1:]
-    admin_commands = {"config", "detect", "init", "list", "monitor", "select", "status"}
+    admin_commands = {
+        "config",
+        "detect",
+        "handoff",
+        "init",
+        "list",
+        "monitor",
+        "relay-smoke",
+        "select",
+        "status",
+        "tmux-capture",
+        "tmux-close-pane",
+        "tmux-close-test",
+        "tmux-open",
+        "tmux-status",
+        "tmux-watch",
+    }
 
     if args and args[0] in {"-h", "--help", "help"}:
         _print_project_help()
         return
 
-    if args and args[0] == "--version":
+    if args and args[0] in {"--version", "-V"}:
         main.main(args=["--version"], prog_name="ai-collab", standalone_mode=True)
         return
 

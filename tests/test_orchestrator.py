@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ai_collab.core.config import Config
 from ai_collab.core.detector import CollaborationDetector
+from ai_collab.core.profiler import ProjectProfile
 
 
 def test_orchestration_plan_exposes_available_agents_and_model_info() -> None:
@@ -11,6 +12,12 @@ def test_orchestration_plan_exposes_available_agents_and_model_info() -> None:
     config = Config.create_default()
     config.auto_collaboration = {
         "enabled": True,
+        "profile_trigger_map": {
+            "superapp-fullstack": {
+                "default": "fullstack-superapp",
+                "implementation": "fullstack-superapp",
+            }
+        },
         "assignment_map": {
             "discover": {"agent": "gemini", "profile": "powerful"},
             "define": {"agent": "claude", "profile": "default"},
@@ -40,9 +47,18 @@ def test_orchestration_plan_exposes_available_agents_and_model_info() -> None:
         }
     }
 
+    from ai_collab.core import profiler as profiler_module
+
+    original_detect = profiler_module.ProjectProfiler.detect
+    profiler_module.ProjectProfiler.detect = (
+        lambda self: ProjectProfile(root="/tmp/workspace", categories=["superapp-fullstack"], signals={})
+    )
     detector = CollaborationDetector(config)
-    task = "Build a tiny todo app with frontend + backend and persistent storage"
-    result = detector.detect(task, "codex")
+    try:
+        task = "Build a tiny todo app"
+        result = detector.detect(task, "codex")
+    finally:
+        profiler_module.ProjectProfiler.detect = original_detect
 
     assert result.need_collaboration is True
     assert result.available_agents
@@ -54,4 +70,3 @@ def test_orchestration_plan_exposes_available_agents_and_model_info() -> None:
     assert backend_steps
     assert backend_steps[0]["agent"] == "codex"
     assert backend_steps[0]["selected_model"]
-
