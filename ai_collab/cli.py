@@ -8427,6 +8427,13 @@ def project_main() -> None:
         return
 
     if not args:
+        if not sys.stdin.isatty():
+            _print_project_help()
+            console.print(
+                "\n[dim]Non-interactive shell detected. Use `ai-collab run <task>` "
+                "or start `ai-collab` from an interactive terminal.[/dim]"
+            )
+            return
         config_obj = Config.load()
         if str(getattr(config_obj, "entry_surface", "guided") or "guided") == "guided":
             run_entry_prompt(config_obj)

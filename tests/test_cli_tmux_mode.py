@@ -3080,6 +3080,7 @@ def test_project_main_uses_guided_entry_surface_when_no_args(monkeypatch) -> Non
     config.entry_surface = "guided"
     calls = {"guided": False, "runner": False}
 
+    monkeypatch.setattr(cli.sys, "stdin", type("_TTY", (), {"isatty": lambda self: True})())
     monkeypatch.setattr(cli.Config, "load", classmethod(lambda cls: config))
     monkeypatch.setattr(cli, "run_entry_prompt", lambda cfg: calls.__setitem__("guided", cfg is config), raising=False)
     monkeypatch.setattr(cli, "runner_main", lambda *args, **kwargs: calls.__setitem__("runner", True))
@@ -3096,6 +3097,7 @@ def test_project_main_uses_command_entry_surface_when_no_args(monkeypatch) -> No
     config.entry_surface = "command"
     calls = {"guided": False, "runner_args": None}
 
+    monkeypatch.setattr(cli.sys, "stdin", type("_TTY", (), {"isatty": lambda self: True})())
     monkeypatch.setattr(cli.Config, "load", classmethod(lambda cls: config))
     monkeypatch.setattr(cli, "run_entry_prompt", lambda cfg: calls.__setitem__("guided", True), raising=False)
     monkeypatch.setattr(cli, "runner_main", lambda *args, **kwargs: calls.__setitem__("runner_args", kwargs.get("argv")))
@@ -3105,6 +3107,30 @@ def test_project_main_uses_command_entry_surface_when_no_args(monkeypatch) -> No
 
     assert calls["guided"] is False
     assert calls["runner_args"] == []
+
+
+def test_project_main_no_args_non_interactive_prints_help(monkeypatch, capsys) -> None:
+    """Naked ai-collab should not crash when stdin cannot provide menu input."""
+    calls = {"load": False, "guided": False, "runner": False}
+
+    monkeypatch.setattr(cli.sys, "stdin", type("_NoTTY", (), {"isatty": lambda self: False})())
+    monkeypatch.setattr(
+        cli.Config,
+        "load",
+        classmethod(lambda cls: calls.__setitem__("load", True) or cli.Config.create_default()),
+    )
+    monkeypatch.setattr(cli, "run_entry_prompt", lambda cfg: calls.__setitem__("guided", True), raising=False)
+    monkeypatch.setattr(cli, "runner_main", lambda *args, **kwargs: calls.__setitem__("runner", True))
+    monkeypatch.setattr(cli.sys, "argv", ["ai-collab"])
+
+    cli.project_main()
+
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert "Usage:" in text
+    assert "ai-collab run <task>" in text
+    assert calls["guided"] is False
+    assert calls["runner"] is False
 
 
 def test_entry_prompt_fragments_keep_init_config_style_language() -> None:
@@ -3140,6 +3166,8 @@ def test_entry_prompt_prompt_toolkit_style_converts_rich_background_syntax() -> 
 
     assert _prompt_toolkit_style("bold #0F172A on #7DD3FC") == "bold #0F172A bg:#7DD3FC"
     assert _prompt_toolkit_style("fg:#64748B italic") == "fg:#64748B italic"
+    assert _prompt_toolkit_style("dim") == ""
+    assert _prompt_toolkit_style("fg:#64748B dim italic") == "fg:#64748B italic"
 
 
 def test_entry_prompt_selector_clears_before_prompt_toolkit(monkeypatch) -> None:

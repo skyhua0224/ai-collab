@@ -413,13 +413,16 @@ def _print_fragments(console_obj: Console, fragments: list[tuple[str, str]], *, 
 
 def _prompt_toolkit_style(style: str) -> str:
     normalized = str(style or "").strip()
-    if not normalized or " on " not in normalized:
+    if not normalized:
         return normalized
     parts = normalized.split()
     converted: list[str] = []
     index = 0
     while index < len(parts):
         part = parts[index]
+        if part in {"dim", "faint"}:
+            index += 1
+            continue
         if part == "on" and index + 1 < len(parts):
             converted.append(f"bg:{parts[index + 1]}")
             index += 2
