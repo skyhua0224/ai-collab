@@ -66,6 +66,8 @@ class RunStateStore:
             "run_id": run_id,
             "label": "",
             "entry_prompt": "",
+            "workspace": str(cwd.resolve()),
+            "mode": "tmux",
             "created_at": _utc_now(),
             "updated_at": _utc_now(),
             "phase": "created",
@@ -162,19 +164,33 @@ class RunStateStore:
             controller = state.get("controller", {})
             agent_states = state.get("agents", {})
             step_states = state.get("steps", {})
+            tmux_state = state.get("tmux", {})
             summaries.append(
                 {
                     "run_id": run_id,
+                    "short_id": cls.short_id(run_id),
                     "label": str(state.get("label", "")).strip(),
+                    "name": str(state.get("label", "")).strip() or cls.short_id(run_id),
+                    "workspace": str(state.get("workspace", "")).strip(),
+                    "mode": str(state.get("mode", "")).strip() or "tmux",
                     "entry_prompt_preview": _preview_text(str(state.get("entry_prompt", "")).strip()),
                     "created_at": str(state.get("created_at", "")),
                     "updated_at": str(state.get("updated_at", "")),
                     "phase": str(state.get("phase", "")).strip(),
                     "phase_detail": str(state.get("phase_detail", "")).strip(),
+                    "sx": cls.step_phase(step_states),
+                    "steps_progress": cls.step_phase(step_states),
                     "session": str(state.get("session", "")),
                     "controller_agent": str(controller.get("agent", "")),
                     "controller_pane": str(controller.get("pane_id", "")),
                     "status": cls._derive_status(agent_states=agent_states, step_states=step_states),
+                    "pending_count": cls.pending_count(step_states),
+                    "last_active_at": cls.last_active_at(
+                        updated_at=str(state.get("updated_at", "")),
+                        step_states=step_states,
+                        agent_states=agent_states,
+                        tmux_state=tmux_state,
+                    ),
                     "agents": agent_states,
                     "steps": step_states,
                 }
@@ -207,6 +223,65 @@ class RunStateStore:
             return "paused"
         return "created"
 
+    @staticmethod
+    def short_id(run_id: str) -> str:
+        value = str(run_id).strip()
+        if "-" in value:
+            suffix = value.rsplit("-", 1)[-1].strip()
+            if suffix:
+                return suffix
+        return value[-8:] if len(value) > 8 else value
+
+    @staticmethod
+    def pending_count(step_states: Any) -> int:
+        steps = step_states if isinstance(step_states, dict) else {}
+        done_values = {"done", "complete", "completed", "accepted"}
+        pending = 0
+        for details in steps.values():
+            if not isinstance(details, dict):
+                continue
+            status = str(details.get("status", "")).strip().lower()
+            if status not in done_values:
+                pending += 1
+        return pending
+
+    @staticmethod
+    def step_phase(step_states: Any) -> str:
+        """Return human-readable step progress, e.g. 0/3 done."""
+        steps = step_states if isinstance(step_states, dict) else {}
+        total = len(steps)
+        if total == 0:
+            return "No steps"
+        done_values = {"done", "complete", "completed", "accepted"}
+        done_count = 0
+        for sid in sorted([str(sid) for sid in steps.keys()]):
+            details = steps.get(sid, {})
+            if not isinstance(details, dict):
+                continue
+            status = str(details.get("status", "")).strip().lower() or "pending"
+            if status in done_values:
+                done_count += 1
+        return f"{done_count}/{total} done"
+
+    @staticmethod
+    def last_active_at(*, updated_at: str, step_states: Any, agent_states: Any, tmux_state: Any) -> str:
+        """Best-effort latest activity timestamp across state sources."""
+        candidates: list[str] = [str(updated_at or "").strip()]
+        steps = step_states if isinstance(step_states, dict) else {}
+        for details in steps.values():
+            if isinstance(details, dict):
+                candidates.append(str(details.get("updated_at", "")).strip())
+        agents = agent_states if isinstance(agent_states, dict) else {}
+        for details in agents.values():
+            if isinstance(details, dict):
+                candidates.append(str(details.get("last_event_at", "")).strip())
+        tmux_data = tmux_state if isinstance(tmux_state, dict) else {}
+        candidates.append(str(tmux_data.get("layout_updated_at", "")).strip())
+        candidates = [item for item in candidates if item]
+        if not candidates:
+            return ""
+        return sorted(candidates)[-1]
+
     def _write_binding(self) -> None:
         payload = {
             "run_id": self.paths.run_id,
@@ -215,6 +290,8 @@ class RunStateStore:
             "created_at": self._state.get("created_at"),
             "updated_at": self._state.get("updated_at"),
             "label": self._state.get("label", ""),
+            "mode": self._state.get("mode", ""),
+            "workspace": self._state.get("workspace", ""),
             "entry_prompt_preview": _preview_text(str(self._state.get("entry_prompt", "")).strip()),
             "phase": self._state.get("phase", ""),
             "phase_detail": self._state.get("phase_detail", ""),
@@ -248,6 +325,22 @@ class RunStateStore:
     def set_entry_prompt(self, *, text: str) -> None:
         with self._lock:
             self._state["entry_prompt"] = str(text).strip()
+            self._write_state()
+
+    def set_mode(self, *, mode: str) -> None:
+        value = str(mode).strip().lower()
+        if not value:
+            return
+        with self._lock:
+            self._state["mode"] = value
+            self._write_state()
+
+    def set_workspace(self, *, workspace: str) -> None:
+        value = str(workspace).strip()
+        if not value:
+            return
+        with self._lock:
+            self._state["workspace"] = value
             self._write_state()
 
     def rebind_controller(self, *, session: str, pane_id: str) -> None:

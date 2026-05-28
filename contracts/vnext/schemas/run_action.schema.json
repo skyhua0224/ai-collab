@@ -1,0 +1,245 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AgentKind": {
+      "enum": [
+        "codex",
+        "claude_code",
+        "gemini_cli",
+        "mock"
+      ],
+      "type": "string"
+    },
+    "ApprovalDecision": {
+      "enum": [
+        "approve",
+        "deny"
+      ],
+      "type": "string"
+    },
+    "ArtifactKind": {
+      "enum": [
+        "plan_bundle",
+        "run_summary",
+        "report",
+        "contract",
+        "mockup",
+        "skeleton",
+        "code_change",
+        "log_excerpt"
+      ],
+      "type": "string"
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "controller": {
+          "$ref": "#/definitions/AgentKind"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "create_run"
+          ],
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "controller",
+        "run_id",
+        "task",
+        "type",
+        "workspace"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "generate_plan"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "agent": {
+          "$ref": "#/definitions/AgentKind"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "step_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "start_step"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent",
+        "run_id",
+        "step_id",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "step_id": {
+          "type": "string"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "enum": [
+            "complete_step"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "step_id",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "step_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "request_approval"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "run_id",
+        "scope",
+        "title",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "approval_id": {
+          "type": "string"
+        },
+        "decision": {
+          "$ref": "#/definitions/ApprovalDecision"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "respond_approval"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "approval_id",
+        "decision",
+        "run_id",
+        "type"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/ArtifactKind"
+        },
+        "label": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "register_artifact"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "label",
+        "run_id",
+        "type"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "RunAction"
+}

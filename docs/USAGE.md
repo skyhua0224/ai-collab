@@ -169,7 +169,6 @@ Key fields:
 Template files:
 
 1. `config/config.template.json`
-2. `config/workflows.template.json`
 
 ## 6) Logs and Diagnostics
 

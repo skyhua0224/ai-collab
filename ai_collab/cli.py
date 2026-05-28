@@ -5,31 +5,39 @@ Main CLI entry point for ai-collab.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+import contextlib
+from datetime import datetime, timezone
 import importlib
 import json
 import os
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import threading
+import tomllib
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 from uuid import uuid4
 
 import click
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
+from rich.text import Text
 
-from ai_collab.core.config import Config
+from ai_collab import __version__ as AI_COLLAB_VERSION
+
+from ai_collab.core.config import Config, resolve_collaboration_role_leads
 from ai_collab.core.detector import CollaborationDetector
 from ai_collab.core.environment import detect_os_name, detect_provider_status, resolve_executable
 from ai_collab.core.selector import ModelSelector
 from ai_collab.core.run_state import RunStateStore
+from ai_collab.core.updates import check_pypi_update, run_self_update
 from ai_collab.core.tmux_workspace import (
     TmuxWorkspaceError,
     attach_session,
@@ -45,6 +53,7 @@ from ai_collab.core.tmux_workspace import (
     wait_for_pane_quiet,
 )
 from ai_collab.core.workflow import WorkflowManager
+from ai_collab.core.workflow_v2 import builtin_session_presets, resolve_session_preset
 
 console = Console(force_terminal=True, legacy_windows=False)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\].*?\x1b\\")
@@ -584,6 +593,27 @@ def _pick_ui_backend(ui_mode: str, *, auto_install_deps: bool, lang: str = "en-U
     return None
 
 
+def _run_init_setup_tui(config_obj: Config) -> None:
+    """Launch the formal setup TUI used by the real init flow."""
+    from ai_collab.tui.setup import run_setup_tui
+
+    run_setup_tui(config_obj)
+
+
+def _run_init_setup_raw(config_obj: Config) -> None:
+    """Launch the non-framework raw terminal setup flow."""
+    from ai_collab.tui.setup_raw import run_setup_raw
+
+    run_setup_raw(config_obj)
+
+
+def _run_init_setup_prompt(config_obj: Config) -> None:
+    """Launch the thin prompt-style bootstrap flow."""
+    from ai_collab.init_prompt import run_init_prompt
+
+    run_init_prompt(config_obj)
+
+
 def _select_decision(
     prompt: str,
     options: list[tuple[str, str]],
@@ -645,7 +675,7 @@ def _ask_yes_no(
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
-@click.version_option("0.1.0", "-V", "--version")
+@click.version_option(AI_COLLAB_VERSION, "-V", "--version")
 @click.pass_context
 def main(ctx: click.Context) -> None:
     """AI Collaboration System - Multi-AI orchestration and workflow management."""
@@ -675,7 +705,7 @@ def detect(ctx: click.Context, task: str, provider: Optional[str], output: str) 
         console.print(f"Description: {result.description}")
         console.print(f"Primary: {result.primary}")
         console.print(f"Reviewers: {', '.join(result.reviewers)}")
-        console.print(f"Workflow: {result.workflow_name}")
+        console.print(f"Workflow: {_result_workflow_label(result)}")
         if result.intent:
             console.print(f"Intent: {result.intent}")
         if result.project_categories:
@@ -720,6 +750,218 @@ def select(ctx: click.Context, provider: str, task: str, complexity: Optional[st
         console.print(f"Model: {result.model}")
         console.print(f"CLI: {result.cli}")
         console.print(f"Description: {result.description}")
+
+
+@main.command()
+@click.option("--workspace", type=click.Path(path_type=Path, file_okay=False, dir_okay=True))
+@click.option("--controller", type=click.Choice(["codex", "claude", "gemini"]))
+@click.option("--task", help="Prefill the task input box")
+@click.option("--task-file", type=click.Path(path_type=Path, exists=True, dir_okay=False))
+@click.option("--skip-review", is_flag=True, help="Trust the generated plan and export immediately")
+@click.option("--planner-mode", type=click.Choice(["mock"]), default="mock", show_default=True)
+@click.option("--output-bundle", type=click.Path(path_type=Path, dir_okay=False))
+@click.option("--non-interactive", is_flag=True, help="Run the same flow without launching fullscreen TUI")
+@click.pass_context
+def ux_lab(
+    ctx: click.Context,
+    workspace: Optional[Path],
+    controller: Optional[str],
+    task: Optional[str],
+    task_file: Optional[Path],
+    skip_review: bool,
+    planner_mode: str,
+    output_bundle: Optional[Path],
+    non_interactive: bool,
+) -> None:
+    """Launch the experimental fullscreen UX lab."""
+    if non_interactive and not ((task and task.strip()) or task_file):
+        raise click.UsageError("--non-interactive requires --task or --task-file")
+
+    from ai_collab.ux_lab import launch_ux_lab
+
+    config_obj = ctx.obj["config"]
+    result = launch_ux_lab(
+        config=config_obj,
+        cwd=Path.cwd(),
+        workspace=workspace,
+        controller=controller,
+        task=task,
+        task_file=task_file,
+        skip_review=skip_review,
+        planner_mode=planner_mode,
+        output_bundle=output_bundle,
+        non_interactive=non_interactive,
+    )
+
+    if result.status == "planned":
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("SX")
+        table.add_column("Agent")
+        table.add_column("ETA")
+        table.add_column("Title")
+        for item in result.plan:
+            table.add_row(item.sx, item.agent, f"{item.eta_minutes}m", item.title)
+        console.print(table)
+        console.print(
+            "Use `--skip-review` to export the bundle directly, or run `ai-collab ux-lab` for the fullscreen editor."
+        )
+        return
+
+    if result.status == "sent" and result.bundle_path is not None:
+        console.print(str(result.bundle_path))
+
+
+@main.command()
+@click.option("--workspace", type=click.Path(path_type=Path, file_okay=False, dir_okay=True))
+@click.option("--controller", type=click.Choice(["codex", "claude", "gemini"]))
+@click.option("--task", help="Prefill the task input box")
+@click.option("--task-file", type=click.Path(path_type=Path, exists=True, dir_okay=False))
+@click.option("--skip-review", is_flag=True, help="Trust the generated plan and export immediately")
+@click.option("--planner-mode", type=click.Choice(["live", "mock"]), default="live", show_default=True)
+@click.option("--output-bundle", type=click.Path(path_type=Path, dir_okay=False))
+@click.option("--non-interactive", is_flag=True, help="Run the same flow without launching fullscreen TUI")
+@click.pass_context
+def ux_lab_v3(
+    ctx: click.Context,
+    workspace: Optional[Path],
+    controller: Optional[str],
+    task: Optional[str],
+    task_file: Optional[Path],
+    skip_review: bool,
+    planner_mode: str,
+    output_bundle: Optional[Path],
+    non_interactive: bool,
+) -> None:
+    """Launch the experimental fullscreen UX lab V3."""
+    if non_interactive and not ((task and task.strip()) or task_file):
+        raise click.UsageError("--non-interactive requires --task or --task-file")
+
+    from ai_collab.ux_lab_v3 import launch_ux_lab_v3
+
+    config_obj = ctx.obj["config"]
+    result = launch_ux_lab_v3(
+        config=config_obj,
+        cwd=Path.cwd(),
+        workspace=workspace,
+        controller=controller,
+        task=task,
+        task_file=task_file,
+        skip_review=skip_review,
+        planner_mode=planner_mode,
+        output_bundle=output_bundle,
+        non_interactive=non_interactive,
+    )
+
+    if result.status == "error":
+        raise click.ClickException(result.error_message or "ux-lab-v3 planning failed")
+
+    if result.status == "planned":
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("SX")
+        table.add_column("Agent")
+        table.add_column("ETA")
+        table.add_column("Title")
+        for item in result.plan:
+            table.add_row(item.sx, item.agent, f"{item.eta_minutes}m", item.title)
+        console.print(table)
+        console.print(
+            "Use `--skip-review` to export the bundle directly, or run `ai-collab ux-lab-v3` for the fullscreen editor."
+        )
+        return
+
+    if result.status == "sent" and result.bundle_path is not None:
+        console.print(str(result.bundle_path))
+
+
+@main.command()
+@click.option("--workspace", type=click.Path(path_type=Path, file_okay=False, dir_okay=True))
+@click.option("--controller", type=click.Choice(["codex", "claude", "gemini"]))
+@click.option("--task", help="Prefill the task input box")
+@click.option("--task-file", type=click.Path(path_type=Path, exists=True, dir_okay=False))
+@click.option("--skip-review", is_flag=True, help="Trust the generated plan and export immediately")
+@click.option("--planner-mode", type=click.Choice(["live", "mock"]), default="live", show_default=True)
+@click.option("--output-bundle", type=click.Path(path_type=Path, dir_okay=False))
+@click.option("--non-interactive", is_flag=True, help="Run the same flow without launching fullscreen TUI")
+@click.pass_context
+def launch(
+    ctx: click.Context,
+    workspace: Optional[Path],
+    controller: Optional[str],
+    task: Optional[str],
+    task_file: Optional[Path],
+    skip_review: bool,
+    planner_mode: str,
+    output_bundle: Optional[Path],
+    non_interactive: bool,
+) -> None:
+    """Launch the thin terminal task-start flow."""
+    config_obj = ctx.obj["config"]
+
+    if non_interactive:
+        if not ((task and task.strip()) or task_file):
+            raise click.UsageError("--non-interactive requires --task or --task-file")
+
+        from ai_collab.tui.launcher import run_launcher_tui
+
+        result = run_launcher_tui(
+            config=config_obj,
+            cwd=Path.cwd(),
+            workspace=workspace,
+            controller=controller,
+            task=task,
+            task_file=task_file,
+            skip_review=skip_review,
+            planner_mode=planner_mode,
+            output_bundle=output_bundle,
+            non_interactive=True,
+        )
+
+        if result.status == "error":
+            raise click.ClickException(result.error_message or "launcher planning failed")
+
+        if result.status == "planned":
+            table = Table(show_header=True, header_style="bold cyan")
+            table.add_column("SX")
+            table.add_column("Agent")
+            table.add_column("ETA")
+            table.add_column("Title")
+            for item in result.plan:
+                table.add_row(item.sx, item.agent, f"{item.eta_minutes}m", item.title)
+            console.print(table)
+            console.print(
+                "Use `--skip-review` to export the bundle directly, or run `ai-collab launch` for the thin terminal flow."
+            )
+            return
+
+        if result.status == "sent" and result.bundle_path is not None:
+            console.print(str(result.bundle_path))
+        return
+
+    from ai_collab.launch_prompt import run_launch_prompt
+
+    result = run_launch_prompt(
+        config=config_obj,
+        cwd=Path.cwd(),
+        workspace=workspace,
+        controller=controller,
+        task=task,
+        task_file=task_file,
+        planner_mode=planner_mode,
+        output_bundle=output_bundle,
+    )
+    if result is not None and result.status == "error":
+        raise click.ClickException(result.error_message or "launcher planning failed")
+
+
+@main.command()
+@click.pass_context
+def settings(ctx: click.Context) -> None:
+    """Open the thin settings/config experience."""
+    from ai_collab.config_prompt import run_config_menu_prompt
+
+    config_obj = ctx.obj["config"]
+    if run_config_menu_prompt(config_obj):
+        console.print("[green]✅ Settings saved[/green]")
 
 
 @main.command()
@@ -776,9 +1018,30 @@ def config(ctx: click.Context, action: str, key: Optional[str], value: Optional[
             config_obj.ui_language = value
             config_obj.save()
             console.print(f"[green]✓ ui_language set to {value}[/green]")
+        elif key == "current_controller":
+            if value not in {"codex", "claude", "gemini"}:
+                console.print(f"[yellow]Unsupported controller: {value}[/yellow]")
+                return
+            config_obj.current_controller = value
+            config_obj.save()
+            console.print(f"[green]✓ current_controller set to {value}[/green]")
+        elif key == "entry_surface":
+            if value not in {"guided", "command"}:
+                console.print(f"[yellow]Unsupported entry_surface: {value}[/yellow]")
+                return
+            config_obj.entry_surface = value
+            config_obj.save()
+            console.print(f"[green]✓ entry_surface set to {value}[/green]")
+        elif key == "runtime_mode":
+            if value not in {"tmux", "direct"}:
+                console.print(f"[yellow]Unsupported runtime_mode: {value}[/yellow]")
+                return
+            config_obj.runtime_mode = value
+            config_obj.save()
+            console.print(f"[green]✓ runtime_mode set to {value}[/green]")
         else:
             console.print(f"[yellow]Unknown config key: {key}[/yellow]")
-            console.print("Available keys: auto_orchestration, ui_language")
+            console.print("Available keys: auto_orchestration, ui_language, current_controller, entry_surface, runtime_mode")
 
     elif action == "get":
         if not key:
@@ -792,13 +1055,21 @@ def config(ctx: click.Context, action: str, key: Optional[str], value: Optional[
             console.print(f"auto_orchestration: {enabled}")
         elif key == "ui_language":
             console.print(f"ui_language: {config_obj.ui_language}")
+        elif key == "current_controller":
+            console.print(f"current_controller: {config_obj.current_controller}")
+        elif key == "entry_surface":
+            console.print(f"entry_surface: {getattr(config_obj, 'entry_surface', 'guided')}")
+        elif key == "runtime_mode":
+            console.print(f"runtime_mode: {getattr(config_obj, 'runtime_mode', 'tmux')}")
         else:
             console.print(f"[yellow]Unknown config key: {key}[/yellow]")
-            console.print("Available keys: auto_orchestration, ui_language")
+            console.print("Available keys: auto_orchestration, ui_language, current_controller, entry_surface, runtime_mode")
 
     else:  # interactive
-        config_obj.interactive_config()
-        console.print("\n[green]✅ Configuration saved![/green]")
+        from ai_collab.config_prompt import run_config_menu_prompt
+
+        if run_config_menu_prompt(config_obj):
+            console.print("\n[green]✅ Configuration saved![/green]")
 
 
 @main.command()
@@ -813,10 +1084,10 @@ def config(ctx: click.Context, action: str, key: Optional[str], value: Optional[
 @click.option(
     "--ui-mode",
     "-u",
-    type=click.Choice(["auto", "tui", "text"]),
-    default="tui",
+    type=click.Choice(["auto", "tui", "text", "raw"]),
+    default="auto",
     show_default=True,
-    help="Wizard interaction mode",
+    help="Init interaction mode (auto/text use thin CLI bootstrap)",
 )
 @click.option(
     "-a/-A",
@@ -847,12 +1118,12 @@ def init(
         if not sys.stdin.isatty():
             console.print("[yellow]Non-interactive terminal detected, skipping init wizard.[/yellow]")
         else:
-            resolved_ui_mode = _resolve_ui_mode(
-                ui_mode,
-                auto_install_deps=auto_install_deps,
-                lang=config_obj.ui_language,
-            )
-            _run_init_wizard(config_obj, ui_mode=resolved_ui_mode)
+            if ui_mode in {"auto", "text"}:
+                _run_init_setup_prompt(config_obj)
+            elif ui_mode == "raw":
+                _run_init_setup_raw(config_obj)
+            else:
+                _run_init_setup_tui(config_obj)
             config_obj.save()
 
     console.print(f"[green]✅ Configuration initialized at {config_dir}[/green]")
@@ -861,19 +1132,17 @@ def init(
 @main.command(name="list")
 @click.pass_context
 def list_workflows(ctx: click.Context) -> None:
-    """List all available workflows."""
-    config_obj = ctx.obj["config"]
+    """List V2 session presets."""
 
-    table = Table(title="Available Workflows")
-    table.add_column("Name", style="cyan")
-    table.add_column("Description", style="white")
-    table.add_column("Phases", style="yellow")
+    preset_table = Table(title="Session Presets")
+    preset_table.add_column("Preset", style="cyan")
+    preset_table.add_column("Blueprint", style="magenta")
+    preset_table.add_column("Description", style="white")
 
-    for name, workflow in config_obj.workflows.items():
-        phases = len(workflow.get("phases", []))
-        table.add_row(name, workflow.get("description", ""), str(phases))
+    for key, preset in builtin_session_presets().items():
+        preset_table.add_row(key, preset.workflow_key, preset.description)
 
-    console.print(table)
+    console.print(preset_table)
 
 
 @main.command()
@@ -930,6 +1199,223 @@ def _resume_pending_steps(state: dict[str, Any]) -> list[tuple[str, str, str]]:
     return rows
 
 
+def _step_sort_key(step_id: str) -> tuple[int, int, str]:
+    raw = str(step_id).strip()
+    match = re.match(r"(?i)^s(\d+)$", raw)
+    if match:
+        return (0, int(match.group(1)), raw.upper())
+    return (1, 0, raw.lower())
+
+
+def _normalize_step_status_for_display(status: str) -> str:
+    value = str(status or "").strip().lower()
+    if value in {"done", "complete", "completed", "accepted"}:
+        return "done"
+    if value in {"running", "in_progress"}:
+        return "running"
+    if value in {"assigned"}:
+        return "queued"
+    if value in {"pending"}:
+        return "pending"
+    return value or "pending"
+
+
+def _extract_step_phase_marker(item: dict[str, Any]) -> tuple[str, str]:
+    phase = str(item.get("phase", "")).strip().lower()
+    detail = str(item.get("phase_detail", "")).strip()
+    if phase not in {"step_started", "step_completed"}:
+        return ("", "")
+    match = re.match(r"^\s*(S\d+)\s*:\s*([A-Za-z0-9_\-]+)\s*$", detail, flags=re.IGNORECASE)
+    if not match:
+        return ("", "")
+    return (match.group(1).upper(), _normalize_step_status_for_display(match.group(2)))
+
+
+def _summarize_run_reason(item: dict[str, Any]) -> str:
+    agents = item.get("agents", {})
+    agent_statuses: list[str] = []
+    if isinstance(agents, dict):
+        for details in agents.values():
+            if not isinstance(details, dict):
+                continue
+            value = str(details.get("status", "")).strip().lower()
+            if value:
+                agent_statuses.append(value)
+    priority = [
+        ("timeout_hard", "hard-timeout"),
+        ("waiting_timeout_soft", "soft-timeout"),
+        ("pane_unavailable", "pane-missing"),
+    ]
+    for status in agent_statuses:
+        if status.startswith("error"):
+            return "agent-error"
+    for key, label in priority:
+        if key in agent_statuses:
+            return label
+    phase = str(item.get("phase", "")).strip().lower()
+    return ""
+
+
+def _format_steps_triad(item: dict[str, Any]) -> str:
+    steps = item.get("steps", {})
+    if not isinstance(steps, dict) or not steps:
+        return "No steps"
+
+    done_values = {"done", "complete", "completed", "accepted"}
+    done_count = 0
+    pending_ids: list[str] = []
+    done_ids: list[str] = []
+    status_by_step: dict[str, str] = {}
+    for sid, details in steps.items():
+        sid_text = str(sid).strip()
+        if not sid_text:
+            continue
+        status = "pending"
+        if isinstance(details, dict):
+            status = str(details.get("status", "")).strip().lower() or "pending"
+        status_by_step[sid_text] = status
+        if status in done_values:
+            done_count += 1
+            done_ids.append(sid_text)
+        else:
+            pending_ids.append(sid_text)
+
+    total = len(status_by_step)
+    if total <= 0:
+        return "No steps"
+
+    marker_step, marker_status = _extract_step_phase_marker(item)
+    current_step = marker_step
+    current_status = marker_status
+
+    if not current_step:
+        if pending_ids:
+            pending_ids.sort(key=_step_sort_key)
+            current_step = pending_ids[0]
+            current_status = _normalize_step_status_for_display(status_by_step.get(current_step, "pending"))
+        else:
+            done_ids.sort(key=_step_sort_key)
+            current_step = done_ids[-1] if done_ids else ""
+            current_status = "done" if current_step else ""
+
+    if not current_status:
+        current_status = _normalize_step_status_for_display(status_by_step.get(current_step, "pending"))
+
+    progress = f"{done_count}/{total}"
+    if current_step:
+        summary = f"{current_step} {current_status} ({progress})"
+    else:
+        summary = f"{progress} done"
+
+    reason = _summarize_run_reason(item)
+    if reason and current_status != "done":
+        summary = f"{summary} · {reason}"
+    return summary
+
+
+def _truncate_prompt_preview_for_table(text: str, *, max_chars: int = 20) -> str:
+    compact = " ".join(str(text or "").split())
+    if not compact:
+        return "-"
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max(0, max_chars - 1)].rstrip() + "…"
+
+
+def _resolve_run_query(*, cwd: Path, query: str) -> str:
+    """Resolve run query by full id, short id, or label (exact/prefix)."""
+    needle = str(query).strip()
+    if not needle:
+        raise click.ClickException("run query cannot be empty")
+    runs = RunStateStore.list_runs(cwd=cwd, limit=500)
+    if not runs:
+        raise click.ClickException("no run state found under .ai-collab/runs")
+
+    def _pick(matches: list[str]) -> Optional[str]:
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    full_exact = [str(item.get("run_id", "")) for item in runs if str(item.get("run_id", "")) == needle]
+    found = _pick(full_exact)
+    if found:
+        return found
+
+    short_exact = [str(item.get("run_id", "")) for item in runs if str(item.get("short_id", "")) == needle]
+    found = _pick(short_exact)
+    if found:
+        return found
+
+    label_exact = [str(item.get("run_id", "")) for item in runs if str(item.get("label", "")).strip() == needle]
+    found = _pick(label_exact)
+    if found:
+        return found
+
+    full_prefix = [str(item.get("run_id", "")) for item in runs if str(item.get("run_id", "")).startswith(needle)]
+    found = _pick(full_prefix)
+    if found:
+        return found
+
+    short_prefix = [str(item.get("run_id", "")) for item in runs if str(item.get("short_id", "")).startswith(needle)]
+    found = _pick(short_prefix)
+    if found:
+        return found
+
+    label_prefix = [
+        str(item.get("run_id", ""))
+        for item in runs
+        if str(item.get("label", "")).strip() and str(item.get("label", "")).startswith(needle)
+    ]
+    found = _pick(label_prefix)
+    if found:
+        return found
+
+    merged = list(dict.fromkeys(full_exact + short_exact + label_exact + full_prefix + short_prefix + label_prefix))
+    if not merged:
+        raise click.ClickException(f"run not found for query: {needle}")
+    sample = ", ".join(merged[:5])
+    raise click.ClickException(f"run query is ambiguous: {needle}. matches: {sample}")
+
+
+def _humanize_age(iso_text: str) -> str:
+    value = str(iso_text).strip()
+    if not value:
+        return "-"
+    try:
+        if value.endswith("Z"):
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        else:
+            parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    delta = now - parsed.astimezone(timezone.utc)
+    seconds = max(0, int(delta.total_seconds()))
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        unit = "minute" if minutes == 1 else "minutes"
+        return f"{minutes} {unit} ago"
+    hours = minutes // 60
+    if hours < 24:
+        unit = "hour" if hours == 1 else "hours"
+        return f"{hours} {unit} ago"
+    days = hours // 24
+    if days < 30:
+        unit = "day" if days == 1 else "days"
+        return f"{days} {unit} ago"
+    months = days // 30
+    if months < 12:
+        unit = "month" if months == 1 else "months"
+        return f"{months} {unit} ago"
+    years = months // 12
+    unit = "year" if years == 1 else "years"
+    return f"{years} {unit} ago"
+
+
 def _tmux_pane_exists_in_session(*, session: str, pane_id: str) -> bool:
     target = str(pane_id).strip()
     if not target:
@@ -946,7 +1432,410 @@ def _tmux_pane_exists_in_session(*, session: str, pane_id: str) -> bool:
     return target in panes
 
 
-def _spawn_resume_controller_pane(*, session: str, cwd: Path, controller_agent: str) -> str:
+def _detect_tmux_session_name(*, preferred: Optional[str] = None) -> str:
+    """Best-effort resolve current/attached tmux session name."""
+    name = str(preferred or "").strip()
+    if name:
+        return name
+
+    current = subprocess.run(
+        ["tmux", "display-message", "-p", "#S"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if current.returncode == 0 and current.stdout.strip():
+        return current.stdout.strip()
+
+    sessions = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}\t#{session_attached}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if sessions.returncode != 0:
+        return ""
+    attached: list[str] = []
+    all_sessions: list[str] = []
+    for line in sessions.stdout.splitlines():
+        parts = line.split("\t")
+        if not parts:
+            continue
+        candidate = parts[0].strip()
+        if not candidate:
+            continue
+        all_sessions.append(candidate)
+        if len(parts) > 1 and parts[1].strip() == "1":
+            attached.append(candidate)
+    return attached[0] if attached else (all_sessions[0] if all_sessions else "")
+
+
+def _tmux_resolve_session_for_pane(*, pane_id: str) -> str:
+    """Resolve session name for a pane id, if it still exists."""
+    target = str(pane_id).strip()
+    if not target:
+        return ""
+    result = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", target, "#{session_name}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _tmux_current_command_for_pane(*, pane_id: str) -> str:
+    """Return current command for a pane, empty when unavailable."""
+    target = str(pane_id).strip()
+    if not target:
+        return ""
+    result = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", target, "#{pane_current_command}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip().lower()
+
+
+def _resume_launch_command_for_agent(*, agent: str, runtime_session_id: str) -> tuple[str, bool]:
+    """Build launch command and whether it restores previous runtime session."""
+    name = str(agent).strip().lower() or "codex"
+    runtime_id = str(runtime_session_id).strip()
+    if not runtime_id:
+        return name, False
+    escaped = shlex.quote(runtime_id)
+    if name == "codex":
+        return f"codex resume {escaped}", True
+    if name == "claude":
+        return f"claude --resume {escaped}", True
+    if name == "gemini":
+        return f"gemini --resume {escaped}", True
+    return name, False
+
+
+def _launch_agent_in_pane_with_wait(
+    *,
+    pane_id: str,
+    agent: str,
+    runtime_session_id: str,
+) -> tuple[str, bool, bool]:
+    """
+    Launch agent in pane with shell/agent readiness waits.
+
+    Returns: (launch_command, runtime_session_restored, launch_ready)
+    """
+    normalized_agent = str(agent).strip().lower() or "codex"
+    primary_cmd, primary_is_resume = _resume_launch_command_for_agent(
+        agent=normalized_agent,
+        runtime_session_id=runtime_session_id,
+    )
+    candidates: list[tuple[str, bool]] = [(primary_cmd, primary_is_resume)]
+    if primary_is_resume:
+        candidates.append((normalized_agent, False))
+
+    for command, restored in candidates:
+        shell_ready = _wait_for_shell_input_ready_in_pane(
+            pane_id=pane_id,
+            timeout_seconds=16.0,
+        )
+        if not shell_ready:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", pane_id, "C-c"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            shell_ready = _wait_for_shell_input_ready_in_pane(
+                pane_id=pane_id,
+                timeout_seconds=8.0,
+            )
+        if not shell_ready:
+            continue
+        wait_for_pane_quiet(
+            pane_id=pane_id,
+            timeout_seconds=8.0,
+            stable_checks=2,
+            poll_interval=0.35,
+        )
+        send_pane_text(
+            pane_id=pane_id,
+            text=command,
+            press_enter=True,
+            delay_seconds=0.6,
+        )
+        ready = _wait_for_agent_ready(
+            pane_id=pane_id,
+            agent=normalized_agent,
+            timeout_seconds=_resolve_agent_ready_timeout(normalized_agent),
+        )
+        if ready:
+            return command, restored, True
+    fallback_cmd = candidates[-1][0] if candidates else normalized_agent
+    return fallback_cmd, False, False
+
+
+def _agent_from_subagent_title(title: str) -> str:
+    prefix = "ai-collab:subagent:"
+    value = str(title).strip()
+    if not value.startswith(prefix):
+        return ""
+    return value[len(prefix):].strip().lower()
+
+
+def _safe_int(text: Any, default: int = 0) -> int:
+    try:
+        return int(str(text).strip())
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _pane_looks_like_shell(*, pane_id: str) -> bool:
+    cmd = _tmux_current_command_for_pane(pane_id=pane_id)
+    return cmd in {"", "zsh", "bash", "sh", "fish", "pwsh", "powershell"}
+
+
+def _wait_for_shell_input_ready_in_pane(*, pane_id: str, timeout_seconds: float = 20.0) -> bool:
+    """Wait until shell process and shell input loop are both ready in pane."""
+    shell_cmds = {"zsh", "bash", "sh", "fish", "pwsh", "powershell", "nu"}
+    deadline = time.monotonic() + max(timeout_seconds, 1.0)
+
+    # 1) Wait until pane current command is a known shell.
+    while time.monotonic() < deadline:
+        current = _tmux_current_command_for_pane(pane_id=pane_id)
+        if current in shell_cmds:
+            break
+        time.sleep(0.25)
+    else:
+        return False
+
+    try:
+        wait_for_pane_quiet(
+            pane_id=pane_id,
+            timeout_seconds=4.0,
+            stable_checks=2,
+            poll_interval=0.3,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 2) Probe input loop: Enter should produce pane output change while still in shell.
+    attempts = 0
+    while attempts < 4 and time.monotonic() < deadline:
+        attempts += 1
+        try:
+            before = capture_pane_text(pane_id=pane_id, start_line=-180)
+        except subprocess.CalledProcessError:
+            time.sleep(0.25)
+            continue
+        send_pane_text(pane_id=pane_id, text="", press_enter=True, delay_seconds=0.0)
+        probe_deadline = min(deadline, time.monotonic() + 2.2)
+        while time.monotonic() < probe_deadline:
+            try:
+                after = capture_pane_text(pane_id=pane_id, start_line=-180)
+            except subprocess.CalledProcessError:
+                time.sleep(0.2)
+                continue
+            current = _tmux_current_command_for_pane(pane_id=pane_id)
+            if current in shell_cmds and after != before:
+                try:
+                    wait_for_pane_quiet(
+                        pane_id=pane_id,
+                        timeout_seconds=2.5,
+                        stable_checks=2,
+                        poll_interval=0.3,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                return True
+            time.sleep(0.2)
+    return False
+
+
+def _pane_agent_appears_ready(*, pane_id: str, agent: str) -> bool:
+    """Fast readiness probe used before deciding whether a relaunch is required."""
+    normalized_agent = str(agent).strip().lower()
+    if not normalized_agent:
+        return False
+    current = _tmux_current_command_for_pane(pane_id=pane_id)
+    if current == normalized_agent:
+        return True
+    return _wait_for_agent_ready(
+        pane_id=pane_id,
+        agent=normalized_agent,
+        timeout_seconds=1.6,
+    )
+
+
+def _extract_resume_ids_for_agent(*, text: str, agent: str) -> list[str]:
+    """Extract runtime session ids from explicit agent resume commands."""
+    normalized = _normalize_terminal_text_for_markers(text)
+    name = str(agent).strip().lower()
+    if not name:
+        return []
+    if name == "codex":
+        pattern = re.compile(r"(?im)\bcodex\s+resume\s+([A-Za-z0-9][A-Za-z0-9._:-]{5,})")
+    elif name == "claude":
+        pattern = re.compile(r"(?im)\bclaude\s+--resume\s+([A-Za-z0-9][A-Za-z0-9._:-]{5,})")
+    elif name == "gemini":
+        pattern = re.compile(r"(?im)\bgemini\s+(?:--resume|resume)\s+([A-Za-z0-9][A-Za-z0-9._:-]{5,})")
+    else:
+        pattern = re.compile(
+            rf"(?im)\b{re.escape(name)}\s+(?:--resume|resume)\s+([A-Za-z0-9][A-Za-z0-9._:-]{{5,}})"
+        )
+    tokens = [str(match).strip().strip(",.;") for match in pattern.findall(normalized)]
+    return [token for token in tokens if _looks_like_runtime_session_id(token=token, agent=name)]
+
+
+def _looks_like_runtime_session_id(*, token: str, agent: str) -> bool:
+    """Validate extracted runtime id tokens to avoid placeholder/guide text false positives."""
+    value = str(token).strip().strip(",.;")
+    if not value:
+        return False
+    lowered = value.lower()
+    blocked = {"id", "session", "runtime", "resume", "command", "conversation", "chat"}
+    if lowered in blocked:
+        return False
+    name = str(agent).strip().lower()
+    if name == "codex":
+        # Codex resume id is UUID in current CLI behavior.
+        return bool(
+            re.fullmatch(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                value,
+            )
+        )
+    if len(value) < 8:
+        return False
+    return True
+
+
+def _read_log_tail_text(*, path: Path, max_bytes: int = 600_000) -> str:
+    """Read tail of a log file as utf-8 (best effort)."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size <= 0:
+                return ""
+            read_from = max(0, size - max(1, int(max_bytes)))
+            handle.seek(read_from, os.SEEK_SET)
+            return handle.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def _resolve_runtime_session_id_for_agent(
+    *,
+    state: dict[str, Any],
+    agent: str,
+    pane_id: str,
+    sessions: list[str],
+    cwd: Path,
+) -> str:
+    """Best-effort runtime session id recovery from state/snapshot/live pane/logs."""
+    name = str(agent).strip().lower()
+    if not name:
+        return ""
+
+    # 1) state.json direct fields.
+    if name == str((state.get("controller", {}) or {}).get("agent", "")).strip().lower():
+        direct = str((state.get("controller", {}) or {}).get("runtime_session_id", "")).strip()
+        if direct:
+            return direct
+    else:
+        direct = str(((state.get("agents", {}) or {}).get(name, {}) or {}).get("runtime_session_id", "")).strip()
+        if direct:
+            return direct
+
+    # 2) snapshot runtime_sessions cache.
+    tmux_state = state.get("tmux", {}) if isinstance(state.get("tmux", {}), dict) else {}
+    snapshot = tmux_state.get("layout_snapshot", {}) if isinstance(tmux_state, dict) else {}
+    runtime_sessions = snapshot.get("runtime_sessions", {}) if isinstance(snapshot, dict) else {}
+    if isinstance(runtime_sessions, dict):
+        controller = runtime_sessions.get("controller", {}) if isinstance(runtime_sessions.get("controller"), dict) else {}
+        if name == str(controller.get("agent", "")).strip().lower():
+            cached = str(controller.get("runtime_session_id", "")).strip()
+            if cached:
+                return cached
+        agents_raw = runtime_sessions.get("agents", [])
+        if isinstance(agents_raw, list):
+            for item in reversed(agents_raw):
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("agent", "")).strip().lower() != name:
+                    continue
+                cached = str(item.get("runtime_session_id", "")).strip()
+                if cached:
+                    return cached
+
+    # 3) current pane content.
+    target_pane = str(pane_id).strip()
+    if target_pane:
+        try:
+            shot = capture_pane_text(pane_id=target_pane, start_line=-320)
+        except subprocess.CalledProcessError:
+            shot = ""
+        if shot:
+            ids = _extract_resume_ids_for_agent(text=shot, agent=name)
+            if ids:
+                return ids[-1]
+            generic = [
+                token
+                for token in _extract_runtime_session_ids(shot)
+                if _looks_like_runtime_session_id(token=token, agent=name)
+            ]
+            if generic:
+                return generic[-1]
+
+    # 4) pane logs by session/pane and recent session logs.
+    seen_logs: set[Path] = set()
+    unique_sessions: list[str] = []
+    for raw in sessions:
+        sid = str(raw).strip()
+        if sid and sid not in unique_sessions:
+            unique_sessions.append(sid)
+    safe_pane = target_pane.replace("%", "pane-")
+    for sid in unique_sessions:
+        log_dir = cwd / ".ai-collab" / "logs" / sid
+        if not log_dir.exists():
+            continue
+        preferred = log_dir / f"{safe_pane}.log" if safe_pane else None
+        candidates: list[Path] = []
+        if preferred is not None and preferred.exists():
+            candidates.append(preferred)
+        candidates.extend(
+            sorted(
+                [p for p in log_dir.glob("pane-*.log") if p.is_file()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )[:12]
+        )
+        for log_file in candidates:
+            if log_file in seen_logs:
+                continue
+            seen_logs.add(log_file)
+            text = _read_log_tail_text(path=log_file)
+            if not text:
+                continue
+            ids = _extract_resume_ids_for_agent(text=text, agent=name)
+            if ids:
+                return ids[-1]
+            generic = [
+                token
+                for token in _extract_runtime_session_ids(text)
+                if _looks_like_runtime_session_id(token=token, agent=name)
+            ]
+            if generic:
+                return generic[-1]
+    return ""
+
+
+def _spawn_resume_controller_pane(*, session: str, cwd: Path) -> str:
     shell = os.environ.get("SHELL", "zsh")
     pane = subprocess.run(
         [
@@ -970,53 +1859,606 @@ def _spawn_resume_controller_pane(*, session: str, cwd: Path, controller_agent: 
     )
     if pane.returncode != 0 or not pane.stdout.strip():
         raise TmuxWorkspaceError((pane.stderr or "").strip() or "failed to create resume controller pane")
-    pane_id = pane.stdout.strip()
-    send_pane_text(
-        pane_id=pane_id,
-        text=controller_agent,
-        press_enter=True,
-        delay_seconds=0.6,
+    return pane.stdout.strip()
+
+
+def _enable_resume_pane_logging(*, session: str, cwd: Path, pane_id: str) -> None:
+    """Enable tmux pipe-pane logging for resumed pane."""
+    log_dir = pane_logs_dir(cwd=cwd, session=session)
+    log_path = log_dir / f"{pane_id.replace('%', 'pane-')}.log"
+    command = f"cat >> {shlex.quote(str(log_path))}"
+    subprocess.run(
+        ["tmux", "pipe-pane", "-o", "-t", pane_id, command],
+        capture_output=True,
+        text=True,
+        check=False,
     )
+
+
+def _restore_window_from_snapshot(
+    *,
+    window_target: str,
+    cwd: Path,
+    seed_pane_id: str,
+    pane_specs: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Best-effort restore one window's pane count/titles and return sub-agent pane map."""
+    preferred: dict[str, str] = {}
+    specs = [item for item in pane_specs if isinstance(item, dict)]
+    if not specs:
+        return preferred
+    ordered_specs = sorted(specs, key=lambda item: (_safe_int(item.get("top")), _safe_int(item.get("left"))))
+
+    seed_idx = 0
+    for idx, item in enumerate(ordered_specs):
+        if str(item.get("title", "")).strip() == "ai-collab:controller":
+            seed_idx = idx
+            break
+    seed_spec = ordered_specs[seed_idx]
+
+    subprocess.run(
+        ["tmux", "select-pane", "-t", seed_pane_id, "-T", str(seed_spec.get("title", "")).strip() or ""],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    maybe_agent = _agent_from_subagent_title(str(seed_spec.get("title", "")))
+    if maybe_agent:
+        preferred.setdefault(maybe_agent, seed_pane_id)
+
+    remaining = [item for i, item in enumerate(ordered_specs) if i != seed_idx]
+    anchor_pane = seed_pane_id
+    prev_spec = seed_spec
+    for spec in remaining:
+        split_dir = "-h"
+        if _safe_int(spec.get("top")) > _safe_int(prev_spec.get("top")):
+            split_dir = "-v"
+        pane = subprocess.run(
+            [
+                "tmux",
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                anchor_pane,
+                split_dir,
+                "-p",
+                "50",
+                "-c",
+                str(cwd),
+                os.environ.get("SHELL", "zsh"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if pane.returncode != 0 or not pane.stdout.strip():
+            continue
+        pane_id = pane.stdout.strip()
+        title = str(spec.get("title", "")).strip()
+        if title:
+            subprocess.run(
+                ["tmux", "select-pane", "-t", pane_id, "-T", title],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        _enable_resume_pane_logging(session=window_target.split(":", 1)[0], cwd=cwd, pane_id=pane_id)
+        maybe_agent = _agent_from_subagent_title(title)
+        if maybe_agent:
+            preferred.setdefault(maybe_agent, pane_id)
+        anchor_pane = pane_id
+        prev_spec = spec
+    return preferred
+
+
+def _restore_tmux_layout_from_snapshot(
+    *,
+    session: str,
+    cwd: Path,
+    controller_pane: str,
+    snapshot: dict[str, Any],
+) -> dict[str, str]:
+    """Best-effort rebuild tmux windows/panes from saved snapshot and return sub-agent pane map."""
+    preferred: dict[str, str] = {}
+    if not isinstance(snapshot, dict) or not snapshot.get("available"):
+        return preferred
+    windows_raw = snapshot.get("windows", [])
+    windows = [item for item in windows_raw if isinstance(item, dict)]
+    if not windows:
+        return preferred
+
+    controller_window = None
+    for item in windows:
+        panes = item.get("panes", [])
+        if any(str(p.get("title", "")).strip() == "ai-collab:controller" for p in panes if isinstance(p, dict)):
+            controller_window = item
+            break
+    if controller_window is None:
+        controller_window = next((item for item in windows if str(item.get("active", "")).strip() == "1"), windows[0])
+
+    controller_name = str(controller_window.get("name", "")).strip()
+    if controller_name:
+        subprocess.run(
+            ["tmux", "rename-window", "-t", f"{session}:0", controller_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    preferred.update(
+        _restore_window_from_snapshot(
+            window_target=f"{session}:0",
+            cwd=cwd,
+            seed_pane_id=controller_pane,
+            pane_specs=controller_window.get("panes", []),
+        )
+    )
+
+    others = [item for item in windows if item is not controller_window]
+    for item in others:
+        window_name = str(item.get("name", "")).strip() or "ai-collab-resume"
+        pane = subprocess.run(
+            [
+                "tmux",
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                session,
+                "-n",
+                window_name,
+                "-c",
+                str(cwd),
+                os.environ.get("SHELL", "zsh"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if pane.returncode != 0 or not pane.stdout.strip():
+            continue
+        seed_pane = pane.stdout.strip()
+        _enable_resume_pane_logging(session=session, cwd=cwd, pane_id=seed_pane)
+        window_target = f"{session}:{window_name}"
+        preferred.update(
+            _restore_window_from_snapshot(
+                window_target=window_target,
+                cwd=cwd,
+                seed_pane_id=seed_pane,
+                pane_specs=item.get("panes", []),
+            )
+        )
+    return preferred
+
+
+def _build_resume_subagent_standby_prompt(*, lang: str, controller_agent: str, run_id: str) -> str:
+    if lang == "zh-CN":
+        return (
+            f"你已恢复为子Agent（run_id={run_id}）。当前进入待命状态。"
+            f"不要主动开始新任务，等待主控 {controller_agent} 的下一条明确指令。"
+            "收到主控指令后，先复述目标与边界，再执行。"
+        )
+    return (
+        f"You are resumed as sub-agent (run_id={run_id}). Enter standby now. "
+        f"Do not start new work until controller {controller_agent} gives explicit next instruction. "
+        "When instruction arrives, restate scope/boundaries first, then execute."
+    )
+
+
+def _build_resume_controller_summary_prompt(
+    *,
+    lang: str,
+    run_id: str,
+    workspace: Path,
+    previous_session: str,
+    recovered_session: str,
+    phase: str,
+    phase_detail: str,
+    controller_runtime_session_id: str,
+    pending_lines: str,
+    restored_subagents: list[dict[str, Any]],
+) -> str:
+    subs = []
+    for item in restored_subagents:
+        agent = str(item.get("agent", "")).strip()
+        pane = str(item.get("pane_id", "")).strip()
+        status = str(item.get("status", "")).strip() or "unknown"
+        resumed = "yes" if bool(item.get("runtime_session_restored")) else "no"
+        subs.append(f"- {agent} | pane={pane} | status={status} | runtime_restored={resumed}")
+    sub_lines = "\n".join(subs) if subs else "- none"
+    if lang == "zh-CN":
+        return (
+            f"恢复运行：{run_id}\n"
+            f"工作区：{workspace}\n"
+            f"旧 tmux session：{previous_session or '-'}\n"
+            f"当前 tmux session：{recovered_session}\n"
+            f"主控 runtime session id：{controller_runtime_session_id or '-'}\n"
+            f"当前阶段：{phase or '-'} ({phase_detail or '-'})\n"
+            "已恢复子控：\n"
+            f"{sub_lines}\n"
+            "未完成步骤：\n"
+            f"{pending_lines}\n"
+            "下一步请先做：\n"
+            "1) 向用户简要汇报：当前做到哪里、哪些子控已就绪。\n"
+            "2) 问用户：继续原计划 / 调整计划 / 提出新想法。\n"
+            "3) 若继续原计划，优先处理 pending steps，并继续用 tmux-watch 动态超时监控。"
+        )
+    return (
+        f"Resume run: {run_id}\n"
+        f"Workspace: {workspace}\n"
+        f"Previous tmux session: {previous_session or '-'}\n"
+        f"Recovered tmux session: {recovered_session}\n"
+        f"Controller runtime session id: {controller_runtime_session_id or '-'}\n"
+        f"Current phase: {phase or '-'} ({phase_detail or '-'})\n"
+        "Restored sub-agents:\n"
+        f"{sub_lines}\n"
+        "Pending steps:\n"
+        f"{pending_lines}\n"
+        "Do this first:\n"
+        "1) Brief user on current progress and ready sub-agents.\n"
+        "2) Ask user: continue original plan / adjust plan / provide new idea.\n"
+        "3) If continuing, execute pending steps first and keep using tmux-watch with dynamic timeout."
+    )
+
+
+def _spawn_resume_subagent_pane(*, session: str, cwd: Path, controller_pane: str, agent: str) -> str:
+    """Spawn one sub-agent pane under controller pane in standard ai-collab layout."""
+    prefix = "ai-collab:subagent:"
+    shell = os.environ.get("SHELL", "zsh")
+    panes_output = subprocess.run(
+        ["tmux", "list-panes", "-t", controller_pane, "-F", "#{pane_id}|#{pane_title}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if panes_output.returncode != 0:
+        raise TmuxWorkspaceError((panes_output.stderr or "").strip() or "failed to list panes for resume")
+    rows = [line for line in panes_output.stdout.splitlines() if line.strip()]
+    sub_panes: list[str] = []
+    for line in rows:
+        pane_id, pane_title = (line.split("|", 1) + [""])[:2]
+        if pane_title.startswith(prefix):
+            sub_panes.append(pane_id.strip())
+    if len(sub_panes) >= 3:
+        raise TmuxWorkspaceError("Maximum 3 sub-agent panes reached during resume")
+
+    if not sub_panes:
+        target_pane = controller_pane
+        split_args = ["-v", "-p", "50"]
+    else:
+        target_pane = sub_panes[-1]
+        split_args = ["-h", "-p", "50"]
+
+    pane = subprocess.run(
+        [
+            "tmux",
+            "split-window",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            target_pane,
+            *split_args,
+            "-c",
+            str(cwd),
+            shell,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if pane.returncode != 0 or not pane.stdout.strip():
+        raise TmuxWorkspaceError((pane.stderr or "").strip() or "failed to create resume sub-agent pane")
+    pane_id = pane.stdout.strip()
+    subprocess.run(
+        ["tmux", "select-pane", "-t", pane_id, "-T", f"{prefix}{agent}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    _enable_resume_pane_logging(session=session, cwd=cwd, pane_id=pane_id)
     return pane_id
+
+
+def _restore_subagent_panes_on_resume(
+    *,
+    store: RunStateStore,
+    state: dict[str, Any],
+    session: str,
+    controller_agent: str,
+    controller_pane: str,
+    cwd: Path,
+    preferred_agent_panes: Optional[dict[str, str]] = None,
+    runtime_lookup_sessions: Optional[list[str]] = None,
+    inject_standby_prompt: bool = False,
+    lang: str = "en-US",
+) -> list[dict[str, Any]]:
+    """Restore sub-agent panes and resume runtime sessions where possible."""
+    restored: list[dict[str, Any]] = []
+    agents_state = state.get("agents", {})
+    if not isinstance(agents_state, dict):
+        return restored
+    done_values = {"done", "complete", "completed", "accepted"}
+    for agent in sorted([str(name).strip() for name in agents_state.keys() if str(name).strip()]):
+        if agent == controller_agent:
+            continue
+        details = agents_state.get(agent, {})
+        if not isinstance(details, dict):
+            continue
+        runtime_session_id = str(details.get("runtime_session_id", "")).strip()
+        if not runtime_session_id:
+            runtime_session_id = _resolve_runtime_session_id_for_agent(
+                state=state,
+                agent=agent,
+                pane_id=str(details.get("pane_id", "")).strip(),
+                sessions=runtime_lookup_sessions or [session],
+                cwd=cwd,
+            )
+            if runtime_session_id:
+                store.set_agent_runtime_session_id(agent=agent, runtime_session_id=runtime_session_id)
+        status = str(details.get("status", "")).strip().lower()
+        if status in done_values and not runtime_session_id:
+            continue
+
+        saved_pane = str(details.get("pane_id", "")).strip()
+        preferred_pane = ""
+        if isinstance(preferred_agent_panes, dict):
+            preferred_pane = str(preferred_agent_panes.get(agent, "")).strip()
+        if preferred_pane:
+            saved_pane = preferred_pane
+        pane_exists = bool(saved_pane and _tmux_pane_exists_in_session(session=session, pane_id=saved_pane))
+        created_new_pane = False
+        pane_id = saved_pane
+        if not pane_exists:
+            pane_id = _spawn_resume_subagent_pane(
+                session=session,
+                cwd=cwd,
+                controller_pane=controller_pane,
+                agent=agent,
+            )
+            created_new_pane = True
+            tickets_raw = details.get("step_tickets", [])
+            tickets = tickets_raw if isinstance(tickets_raw, list) else []
+            store.bind_agent(agent=agent, pane_id=pane_id, step_tickets=tickets)
+
+        launch_command = ""
+        runtime_session_restored = False
+        launch_ready = False
+        if created_new_pane:
+            launch_command, runtime_session_restored, launch_ready = _launch_agent_in_pane_with_wait(
+                pane_id=pane_id,
+                agent=agent,
+                runtime_session_id=runtime_session_id,
+            )
+        elif _pane_agent_appears_ready(pane_id=pane_id, agent=agent):
+            launch_ready = True
+        else:
+            launch_command, runtime_session_restored, launch_ready = _launch_agent_in_pane_with_wait(
+                pane_id=pane_id,
+                agent=agent,
+                runtime_session_id=runtime_session_id,
+            )
+
+        standby_prompt_injected = False
+        if inject_standby_prompt and launch_ready:
+            standby_prompt = _build_resume_subagent_standby_prompt(
+                lang=lang,
+                controller_agent=controller_agent,
+                run_id=store.run_id,
+            )
+            standby_prompt_injected = _inject_prompt_to_pane(
+                pane_id=pane_id,
+                text=standby_prompt,
+                agent=agent,
+            )
+
+        restored.append(
+            {
+                "agent": agent,
+                "pane_id": pane_id,
+                "status": status or "unknown",
+                "created_new_pane": created_new_pane,
+                "runtime_session_id": runtime_session_id,
+                "runtime_session_restored": runtime_session_restored,
+                "launch_command": launch_command,
+                "launch_ready": launch_ready,
+                "standby_prompt_injected": standby_prompt_injected,
+            }
+        )
+    return restored
 
 
 @resume.command(name="list")
 @click.option("--cwd", "-w", default=".", show_default=True, help="Workspace root containing .ai-collab/runs")
 @click.option("--limit", "-n", type=int, default=20, show_default=True, help="Max runs to show")
+@click.option("--detail", "-d", is_flag=True, help="Show wide columns (session/controller/entry prompt)")
+@click.option(
+    "--columns",
+    "-c",
+    help=(
+        "Comma-separated columns. Available: id,name,status,sx,phase,mode,pending,created,updated,active,"
+        "session,controller,prompt,label,run_id"
+        ",workspace,cwd"
+    ),
+)
 @click.option("--json-output", "-j", is_flag=True, help="Print result as JSON")
-def resume_list(cwd: str, limit: int, json_output: bool) -> None:
+def resume_list(cwd: str, limit: int, detail: bool, columns: Optional[str], json_output: bool) -> None:
     """List resumable orchestration runs."""
     root = Path(cwd).expanduser().resolve()
     runs = RunStateStore.list_runs(cwd=root, limit=max(1, int(limit)))
+    if runs:
+        _refresh_runs_controller_progress_from_live_panes(cwd=root, runs=runs, source="resume_list")
+        runs = RunStateStore.list_runs(cwd=root, limit=max(1, int(limit)))
     if json_output:
-        console.print(json.dumps(runs, ensure_ascii=False, indent=2))
+        click.echo(json.dumps(runs, ensure_ascii=False, indent=2))
         return
     if not runs:
         console.print("[yellow]No run state found under .ai-collab/runs[/yellow]")
         return
+    column_spec = {
+        "id": ("id", {"style": "cyan", "no_wrap": True, "min_width": 8, "max_width": 10}),
+        "run_id": ("run_id", {"style": "cyan", "no_wrap": True, "min_width": 18, "max_width": 30}),
+        "name": ("name", {"style": "white", "no_wrap": False, "overflow": "fold", "min_width": 10}),
+        "label": ("label", {"style": "white", "no_wrap": False, "overflow": "fold", "min_width": 10}),
+        "status": ("status", {"style": "green", "no_wrap": True, "min_width": 7, "max_width": 10}),
+        "sx": ("steps", {"style": "blue", "no_wrap": True}),
+        "steps": ("steps", {"style": "blue", "no_wrap": True}),
+        "phase": ("phase", {"style": "blue", "no_wrap": False, "overflow": "fold", "min_width": 10, "max_width": 24}),
+        "mode": ("mode", {"style": "magenta", "no_wrap": True, "min_width": 4, "max_width": 7}),
+        "pending": ("pending", {"style": "yellow", "justify": "right", "no_wrap": True, "min_width": 2, "max_width": 7}),
+        "created": ("created", {"style": "yellow", "no_wrap": True, "min_width": 9, "max_width": 15}),
+        "updated": ("updated", {"style": "yellow", "no_wrap": True, "min_width": 9, "max_width": 15}),
+        "active": ("active", {"style": "yellow", "no_wrap": True, "min_width": 9, "max_width": 15}),
+        "session": ("session", {"style": "magenta", "no_wrap": False, "overflow": "fold", "max_width": 18}),
+        "controller": ("controller", {"style": "white", "no_wrap": False, "overflow": "fold", "max_width": 16}),
+        "prompt": ("entry_prompt", {"style": "white", "no_wrap": True, "overflow": "ellipsis", "min_width": 10, "max_width": 20}),
+        "workspace": ("workspace", {"style": "white", "no_wrap": False, "overflow": "fold", "min_width": 14, "max_width": 30}),
+        "cwd": ("workspace", {"style": "white", "no_wrap": False, "overflow": "fold", "min_width": 14, "max_width": 30}),
+    }
+    default_columns = ["id", "name", "status", "steps", "mode", "prompt", "created", "updated"]
+    detail_additions = ["active", "session", "workspace", "controller", "prompt", "phase"]
+    selected_columns = default_columns + detail_additions if detail else list(default_columns)
+    if columns:
+        requested = [part.strip().lower() for part in str(columns).split(",") if part.strip()]
+        unknown = [part for part in requested if part not in column_spec]
+        if unknown:
+            raise click.ClickException(f"unknown columns: {', '.join(unknown)}")
+        selected_columns = requested
+
     table = Table(title=f"Resumable Runs ({len(runs)})")
-    table.add_column("run_id", style="cyan")
-    table.add_column("label", style="white")
-    table.add_column("status", style="green")
-    table.add_column("phase", style="blue")
-    table.add_column("entry_prompt", style="white", no_wrap=True, overflow="ellipsis", max_width=36)
-    table.add_column("updated_at", style="yellow")
-    table.add_column("session", style="magenta")
-    table.add_column("controller", style="white")
+    for key in selected_columns:
+        header, options = column_spec[key]
+        table.add_column(header, **options)
     for item in runs:
-        label = str(item.get("label", "")).strip() or "-"
-        controller = f"{item.get('controller_agent', '')}:{item.get('controller_pane', '')}".strip(":")
-        table.add_row(
-            str(item.get("run_id", "")),
-            label,
-            str(item.get("status", "")),
-            str(item.get("phase", "")),
-            str(item.get("entry_prompt_preview", "")).strip() or "-",
-            str(item.get("updated_at", "")),
-            str(item.get("session", "")),
-            controller or "-",
-        )
+        controller = f"{item.get('controller_agent', '')}:{item.get('controller_pane', '')}".strip(":") or "-"
+        values = {
+            "id": str(item.get("short_id", "")),
+            "run_id": str(item.get("run_id", "")),
+            "name": str(item.get("name", "")).strip() or str(item.get("short_id", "")).strip() or "-",
+            "label": str(item.get("label", "")).strip() or "-",
+            "status": str(item.get("status", "")),
+            "sx": _format_steps_triad(item),
+            "steps": _format_steps_triad(item),
+            "phase": str(item.get("phase", "")),
+            "mode": str(item.get("mode", "")),
+            "pending": str(item.get("pending_count", 0)),
+            "created": _humanize_age(str(item.get("created_at", ""))),
+            "updated": _humanize_age(str(item.get("updated_at", ""))),
+            "active": _humanize_age(str(item.get("last_active_at", ""))),
+            "session": str(item.get("session", "")),
+            "controller": controller,
+            "prompt": _truncate_prompt_preview_for_table(str(item.get("entry_prompt_preview", "")).strip()),
+            "workspace": str(item.get("workspace", "")).strip() or "-",
+        }
+        table.add_row(*[values[key] for key in selected_columns])
     console.print(table)
+
+
+@resume.command(name="prune")
+@click.option("--cwd", "-w", default=".", show_default=True, help="Workspace root containing .ai-collab/runs")
+@click.option(
+    "--keep-run",
+    "-k",
+    multiple=True,
+    help="Keep one run by query (run_id / short_id / label). Can be used multiple times.",
+)
+@click.option("--keep-session", "-s", help="Keep all runs under this tmux session name")
+@click.option(
+    "--keep-current-session/--no-keep-current-session",
+    default=True,
+    show_default=True,
+    help="Keep all runs for current attached tmux session",
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+@click.option("--json-output", "-j", is_flag=True, help="Print prune result as JSON")
+def resume_prune(
+    cwd: str,
+    keep_run: tuple[str, ...],
+    keep_session: Optional[str],
+    keep_current_session: bool,
+    yes: bool,
+    json_output: bool,
+) -> None:
+    """Delete old run records while keeping current/selected run(s)."""
+    root = Path(cwd).expanduser().resolve()
+    runs_root = root / ".ai-collab" / "runs"
+    if not runs_root.exists():
+        console.print("[yellow]No run state found under .ai-collab/runs[/yellow]")
+        return
+
+    runs = RunStateStore.list_runs(cwd=root, limit=100000)
+    if not runs:
+        console.print("[yellow]No run state found under .ai-collab/runs[/yellow]")
+        return
+
+    keep_ids: set[str] = set()
+    for query in keep_run:
+        keep_ids.add(_resolve_run_query(cwd=root, query=query))
+
+    session_name = ""
+    if keep_current_session:
+        session_name = _detect_tmux_session_name(preferred=keep_session)
+    elif keep_session:
+        session_name = str(keep_session).strip()
+    if session_name:
+        for item in runs:
+            if str(item.get("session", "")).strip() == session_name:
+                run_id = str(item.get("run_id", "")).strip()
+                if run_id:
+                    keep_ids.add(run_id)
+
+    kept_latest_fallback = False
+    if not keep_ids and not keep_run and keep_current_session:
+        fallback = str(runs[0].get("run_id", "")).strip()
+        if fallback:
+            keep_ids.add(fallback)
+            kept_latest_fallback = True
+
+    if not keep_ids:
+        raise click.ClickException(
+            "no keep target resolved; pass --keep-run or --keep-session "
+            "(or run inside tmux and keep-current-session)"
+        )
+
+    run_dirs = sorted([item.name for item in runs_root.iterdir() if item.is_dir()])
+    to_delete = [name for name in run_dirs if name not in keep_ids]
+
+    if to_delete and not yes:
+        if not sys.stdin.isatty():
+            raise click.ClickException("refusing prune in non-interactive mode without --yes")
+        confirmed = Confirm.ask(f"Delete {len(to_delete)} run(s)?", default=False)
+        if not confirmed:
+            console.print("[yellow]prune cancelled[/yellow]")
+            return
+
+    deleted: list[str] = []
+    for run_id in to_delete:
+        run_dir = runs_root / run_id
+        if run_dir.exists() and run_dir.is_dir():
+            shutil.rmtree(run_dir)
+            deleted.append(run_id)
+
+    payload = {
+        "kept": sorted(keep_ids),
+        "deleted": deleted,
+        "kept_count": len(keep_ids),
+        "deleted_count": len(deleted),
+        "session_kept": session_name,
+        "fallback_keep_latest": kept_latest_fallback,
+    }
+    if json_output:
+        console.print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        console.print(
+            f"[green]prune done[/green] kept={payload['kept_count']} deleted={payload['deleted_count']} "
+            f"session={session_name or '-'}"
+        )
+        if kept_latest_fallback:
+            console.print("[yellow]No active tmux session detected; kept latest run as fallback.[/yellow]")
 
 
 @resume.command(name="show")
@@ -1026,10 +2468,12 @@ def resume_list(cwd: str, limit: int, json_output: bool) -> None:
 def resume_show(run_id: str, cwd: str, json_output: bool) -> None:
     """Show one run state detail."""
     root = Path(cwd).expanduser().resolve()
-    store = RunStateStore.load(cwd=root, run_id=run_id)
+    resolved_run_id = _resolve_run_query(cwd=root, query=run_id)
+    store = RunStateStore.load(cwd=root, run_id=resolved_run_id)
     if store is None:
         console.print(f"[red]Run not found:[/red] {run_id}")
         raise SystemExit(2)
+    _sync_controller_progress_from_live_pane(run_store=store, source="resume_show")
     state = store.snapshot()
     pending = _resume_pending_steps(state)
     if json_output:
@@ -1039,8 +2483,11 @@ def resume_show(run_id: str, cwd: str, json_output: bool) -> None:
     controller = state.get("controller", {})
     tmux_state = state.get("tmux", {})
     layout_history = tmux_state.get("layout_history", []) if isinstance(tmux_state, dict) else []
-    console.print(f"[bold]run_id[/bold]: {state.get('run_id', run_id)}")
+    console.print(f"[bold]run_id[/bold]: {state.get('run_id', resolved_run_id)}")
+    console.print(f"[bold]short_id[/bold]: {RunStateStore.short_id(str(state.get('run_id', resolved_run_id)))}")
     console.print(f"[bold]label[/bold]: {state.get('label', '')}")
+    console.print(f"[bold]mode[/bold]: {state.get('mode', '')}")
+    console.print(f"[bold]workspace[/bold]: {state.get('workspace', '')}")
     console.print(f"[bold]session[/bold]: {state.get('session', '')}")
     console.print(f"[bold]controller[/bold]: {controller.get('agent', '')} @ {controller.get('pane_id', '')}")
     console.print(f"[bold]controller_runtime_session_id[/bold]: {controller.get('runtime_session_id', '')}")
@@ -1063,7 +2510,8 @@ def resume_show(run_id: str, cwd: str, json_output: bool) -> None:
 def resume_rename(run_id: str, name: str, cwd: str) -> None:
     """Assign a readable label for one run."""
     root = Path(cwd).expanduser().resolve()
-    store = RunStateStore.load(cwd=root, run_id=run_id)
+    resolved_run_id = _resolve_run_query(cwd=root, query=run_id)
+    store = RunStateStore.load(cwd=root, run_id=resolved_run_id)
     if store is None:
         console.print(f"[red]Run not found:[/red] {run_id}")
         raise SystemExit(2)
@@ -1077,7 +2525,7 @@ def resume_rename(run_id: str, name: str, cwd: str) -> None:
         source="resume",
         payload={"label": label},
     )
-    console.print(f"[green]renamed[/green] {run_id} -> {label}")
+    console.print(f"[green]renamed[/green] {resolved_run_id} -> {label}")
 
 
 @resume.command(name="recover")
@@ -1092,7 +2540,8 @@ def resume_recover(run_id: str, cwd: str, session: Optional[str], attach: bool, 
         console.print("[red]tmux not found in PATH[/red]")
         raise SystemExit(2)
     root = Path(cwd).expanduser().resolve()
-    store = RunStateStore.load(cwd=root, run_id=run_id)
+    resolved_run_id = _resolve_run_query(cwd=root, query=run_id)
+    store = RunStateStore.load(cwd=root, run_id=resolved_run_id)
     if store is None:
         console.print(f"[red]Run not found:[/red] {run_id}")
         raise SystemExit(2)
@@ -1100,41 +2549,102 @@ def resume_recover(run_id: str, cwd: str, session: Optional[str], attach: bool, 
     state = store.snapshot()
     controller = state.get("controller", {})
     controller_agent = str(controller.get("agent", "")).strip() or "codex"
+    controller_runtime_session_id = str(controller.get("runtime_session_id", "")).strip()
+    lang = "zh-CN" if _system_prefers_zh_locale() else "en-US"
     previous_session = str(state.get("session", "")).strip()
-    target_session = str(session or previous_session or f"ai-collab-{run_id[:8]}").strip()
+    controller_pane = str(controller.get("pane_id", "")).strip()
+    explicit_session = str(session or "").strip()
+    pane_session = _tmux_resolve_session_for_pane(pane_id=controller_pane) if controller_pane else ""
+    auto_session = _detect_tmux_session_name()
+    runtime_lookup_sessions = [explicit_session, pane_session, previous_session, auto_session]
+    if not controller_runtime_session_id:
+        controller_runtime_session_id = _resolve_runtime_session_id_for_agent(
+            state=state,
+            agent=controller_agent,
+            pane_id=controller_pane,
+            sessions=runtime_lookup_sessions,
+            cwd=root,
+        )
+        if controller_runtime_session_id:
+            store.set_controller_runtime_session_id(runtime_session_id=controller_runtime_session_id)
+    target_session = str(
+        explicit_session or pane_session or previous_session or auto_session or f"ai-collab-{resolved_run_id[:8]}"
+    ).strip()
     if not target_session:
-        target_session = f"ai-collab-{run_id[:8]}"
+        target_session = f"ai-collab-{resolved_run_id[:8]}"
 
     created_new_session = False
-    controller_pane = str(controller.get("pane_id", "")).strip()
+    created_new_pane = False
+    launch_command = ""
+    runtime_session_restored = False
+    launch_ready = False
+    preferred_agent_panes: dict[str, str] = {}
     if not _tmux_session_exists(target_session):
         controller_pane = create_controller_workspace(
             session=target_session,
             cwd=root,
             controller=controller_agent,
             reset=False,
-            autorun=True,
+            autorun=False,
         )
         created_new_session = True
+        created_new_pane = True
+        tmux_state = state.get("tmux", {}) if isinstance(state.get("tmux", {}), dict) else {}
+        snapshot = tmux_state.get("layout_snapshot", {}) if isinstance(tmux_state, dict) else {}
+        preferred_agent_panes = _restore_tmux_layout_from_snapshot(
+            session=target_session,
+            cwd=root,
+            controller_pane=controller_pane,
+            snapshot=snapshot if isinstance(snapshot, dict) else {},
+        )
     elif not _tmux_pane_exists_in_session(session=target_session, pane_id=controller_pane):
         controller_pane = _spawn_resume_controller_pane(
             session=target_session,
             cwd=root,
-            controller_agent=controller_agent,
         )
+        created_new_pane = True
+
+    if created_new_pane:
+        launch_command, runtime_session_restored, launch_ready = _launch_agent_in_pane_with_wait(
+            pane_id=controller_pane,
+            agent=controller_agent,
+            runtime_session_id=controller_runtime_session_id,
+        )
+    elif _pane_agent_appears_ready(pane_id=controller_pane, agent=controller_agent):
+        launch_ready = True
+    else:
+        launch_command, runtime_session_restored, launch_ready = _launch_agent_in_pane_with_wait(
+            pane_id=controller_pane,
+            agent=controller_agent,
+            runtime_session_id=controller_runtime_session_id,
+        )
+
+    restored_subagents = _restore_subagent_panes_on_resume(
+        store=store,
+        state=state,
+        session=target_session,
+        controller_agent=controller_agent,
+        controller_pane=controller_pane,
+        cwd=root,
+        preferred_agent_panes=preferred_agent_panes,
+        runtime_lookup_sessions=runtime_lookup_sessions + [target_session],
+        inject_standby_prompt=created_new_session,
+        lang=lang,
+    )
 
     pending = _resume_pending_steps(state)
     pending_lines = "\n".join([f"- {sid} | {agent or '-'} | {status}" for sid, agent, status in pending]) or "- none"
-    prompt = (
-        f"Resume orchestration run: {run_id}\n"
-        f"Workspace: {root}\n"
-        f"Previous session: {previous_session or '-'}\n"
-        f"Recovered session: {target_session}\n"
-        f"Pending steps:\n{pending_lines}\n"
-        "Action:\n"
-        "1) Continue only pending scope and avoid redoing completed steps.\n"
-        "2) Use ai-collab tmux-watch with dynamic timeout decisions.\n"
-        "3) When sub-agent completes, ask user close/keep before next action."
+    prompt = _build_resume_controller_summary_prompt(
+        lang=lang,
+        run_id=resolved_run_id,
+        workspace=root,
+        previous_session=previous_session,
+        recovered_session=target_session,
+        phase=str(state.get("phase", "")).strip(),
+        phase_detail=str(state.get("phase_detail", "")).strip(),
+        controller_runtime_session_id=controller_runtime_session_id,
+        pending_lines=pending_lines,
+        restored_subagents=restored_subagents,
     )
     briefing = _write_briefing_file(
         cwd=root,
@@ -1143,18 +2653,22 @@ def resume_recover(run_id: str, cwd: str, session: Optional[str], attach: bool, 
         text=prompt,
     )
     dispatch = _build_prompt_dispatch_message(
-        lang="en-US",
+        lang=lang,
         path=briefing,
         role="controller-resume",
         agent=controller_agent,
     )
-    injected = _inject_prompt_to_pane(
-        pane_id=controller_pane,
-        text=dispatch,
-        agent=controller_agent,
-    )
+    injected = False
+    if launch_ready:
+        injected = _inject_prompt_to_pane(
+            pane_id=controller_pane,
+            text=dispatch,
+            agent=controller_agent,
+        )
 
     store.rebind_controller(session=target_session, pane_id=controller_pane)
+    store.set_mode(mode="tmux")
+    store.set_workspace(workspace=str(root))
     store.set_entry_prompt(text=dispatch)
     store.set_agent_status(agent=controller_agent, status="running", detail="resumed")
     store.set_phase(
@@ -1176,18 +2690,31 @@ def resume_recover(run_id: str, cwd: str, session: Optional[str], attach: bool, 
             "session": target_session,
             "controller_pane": controller_pane,
             "created_new_session": created_new_session,
+            "created_new_pane": created_new_pane,
+            "launch_command": launch_command,
+            "runtime_session_id": controller_runtime_session_id,
+            "runtime_session_restored": runtime_session_restored,
+            "launch_ready": launch_ready,
             "prompt_injected": injected,
+            "restored_subagents": restored_subagents,
         },
     )
 
     payload = {
-        "run_id": run_id,
+        "run_id": resolved_run_id,
         "session": target_session,
         "controller_agent": controller_agent,
         "controller_pane": controller_pane,
         "created_new_session": created_new_session,
+        "created_new_pane": created_new_pane,
+        "launch_command": launch_command,
+        "runtime_session_id": controller_runtime_session_id,
+        "runtime_session_restored": runtime_session_restored,
+        "launch_ready": launch_ready,
         "prompt_file": str(briefing),
         "prompt_injected": injected,
+        "restored_subagent_count": len(restored_subagents),
+        "restored_subagents": restored_subagents,
         "pending_steps": pending,
     }
     if json_output:
@@ -1409,6 +2936,24 @@ def tmux_close_pane(pane_id: str) -> None:
     if shutil.which("tmux") is None:
         console.print("[red]tmux not found in PATH[/red]")
         raise SystemExit(2)
+    target_session = _tmux_resolve_session_for_pane(pane_id=pane_id)
+    run_store: Optional[RunStateStore] = None
+    if target_session:
+        run_store = _find_active_run_store_for_session(cwd=Path.cwd(), session=target_session)
+    closed_agent = ""
+    if run_store is not None:
+        snap = run_store.snapshot()
+        controller = snap.get("controller", {}) if isinstance(snap.get("controller", {}), dict) else {}
+        if str(controller.get("pane_id", "")).strip() == str(pane_id).strip():
+            closed_agent = str(controller.get("agent", "")).strip() or "controller"
+        else:
+            agents = snap.get("agents", {}) if isinstance(snap.get("agents", {}), dict) else {}
+            for name, details in agents.items():
+                if not isinstance(details, dict):
+                    continue
+                if str(details.get("pane_id", "")).strip() == str(pane_id).strip():
+                    closed_agent = str(name).strip()
+                    break
     result = subprocess.run(
         ["tmux", "kill-pane", "-t", pane_id],
         capture_output=True,
@@ -1419,6 +2964,20 @@ def tmux_close_pane(pane_id: str) -> None:
         err = (result.stderr or "").strip() or "unknown tmux error"
         console.print(f"[red]tmux-close-pane failed:[/red] {err}")
         raise SystemExit(result.returncode)
+    if run_store is not None and target_session:
+        if closed_agent:
+            run_store.set_agent_status(agent=closed_agent, status="closed", detail="pane_closed")
+        run_store.append_event(
+            event_type="pane_closed",
+            source="controller_cmd",
+            agent=closed_agent,
+            payload={"pane_id": pane_id, "session": target_session},
+        )
+        _record_tmux_layout_snapshot(
+            run_store=run_store,
+            session=target_session,
+            reason="controller_close_pane",
+        )
     console.print(f"[green]closed pane[/green] {pane_id}")
 
 
@@ -1858,6 +3417,90 @@ def handoff(
         cmd.append("--verbose")
 
     result = subprocess.run(cmd, check=False)
+    if result.returncode == 0 and os.environ.get("AI_COLLAB_ACTIVE") == "1":
+        current_session = _detect_tmux_session_name(preferred=session)
+        if current_session:
+            store = _find_active_run_store_for_session(
+                cwd=Path(repo_root).expanduser().resolve(),
+                session=current_session,
+                controller_pane=str(controller_pane or "").strip(),
+            )
+            if store is not None:
+                ctrl_pane = str(controller_pane or "").strip()
+                if not ctrl_pane:
+                    snap = store.snapshot()
+                    ctrl = snap.get("controller", {}) if isinstance(snap.get("controller", {}), dict) else {}
+                    ctrl_pane = str(ctrl.get("pane_id", "")).strip()
+                if ctrl_pane:
+                    try:
+                        ctrl_text = capture_pane_text(pane_id=ctrl_pane, start_line=-320)
+                    except subprocess.CalledProcessError:
+                        ctrl_text = ""
+                    _sync_controller_progress_from_text(
+                        run_store=store,
+                        text=ctrl_text,
+                        source="controller_marker",
+                    )
+                current = store.snapshot()
+                tmux_state = current.get("tmux", {}) if isinstance(current.get("tmux", {}), dict) else {}
+                before_snapshot = (
+                    tmux_state.get("layout_snapshot", {}) if isinstance(tmux_state.get("layout_snapshot", {}), dict) else {}
+                )
+                before_panes = _snapshot_pane_ids(before_snapshot)
+                store.append_event(
+                    event_type="controller_handoff_command",
+                    source="controller_cmd",
+                    agent=agent,
+                    payload={
+                        "layout": tmux_layout,
+                        "split_policy": split_policy,
+                        "agent_cmd": bool(agent_cmd),
+                        "model": model or "",
+                    },
+                )
+                _record_tmux_layout_snapshot(
+                    run_store=store,
+                    session=current_session,
+                    reason="controller_handoff_command",
+                )
+                latest = store.snapshot()
+                latest_tmux = latest.get("tmux", {}) if isinstance(latest.get("tmux", {}), dict) else {}
+                after_snapshot = (
+                    latest_tmux.get("layout_snapshot", {})
+                    if isinstance(latest_tmux.get("layout_snapshot", {}), dict)
+                    else {}
+                )
+                after_panes = _snapshot_pane_ids(after_snapshot)
+                new_panes = sorted(after_panes - before_panes)
+                spawned_pane = new_panes[-1] if new_panes else ""
+                if spawned_pane:
+                    store.bind_agent(agent=agent, pane_id=spawned_pane, step_tickets=[])
+                    runtime_id = _resolve_runtime_session_id_for_agent(
+                        state=store.snapshot(),
+                        agent=agent,
+                        pane_id=spawned_pane,
+                        sessions=[current_session],
+                        cwd=Path(repo_root).expanduser().resolve(),
+                    )
+                    if runtime_id:
+                        store.set_agent_runtime_session_id(agent=agent, runtime_session_id=runtime_id)
+                else:
+                    store.set_agent_status(agent=agent, status="running", detail="handoff_launched")
+                    store.set_phase(
+                        phase="subagent_spawned",
+                        detail=f"{agent}:unknown",
+                        source="controller_cmd",
+                    )
+                store.append_event(
+                    event_type="subagent_spawned",
+                    source="controller_cmd",
+                    agent=agent,
+                    payload={
+                        "pane_id": spawned_pane,
+                        "layout": tmux_layout,
+                        "step_ids": [],
+                    },
+                )
     raise SystemExit(result.returncode)
 
 
@@ -2061,6 +3704,7 @@ def relay_smoke(
         controller_agent=controller_agent,
         controller_pane=controller_pane,
     )
+    run_store.set_mode(mode="tmux")
     steps = [
         {
             "id": "S1",
@@ -2279,7 +3923,7 @@ def _role_label(item: dict, lang: str) -> str:
 
 def _default_profile_label(provider: str, profile_key: str, options: list[tuple[str, str]]) -> str:
     if provider == "codex" and profile_key in {"low", "medium", "high"}:
-        return f"gpt-5.3-codex, {profile_key}"
+        return f"gpt-5.4, {profile_key}"
     for key, label in options:
         if key == profile_key:
             return label
@@ -2305,7 +3949,7 @@ def _set_auto_orchestration(auto_cfg: dict, enabled: bool) -> dict:
 AUTO_COLLAB_I18N = {
     "en-US": {
         "start": "🤝 Starting Collaborative Workflow",
-        "workflow": "Workflow",
+        "workflow": "Route",
         "primary": "Primary",
         "reviewers": "Reviewers",
         "project_categories": "Project Categories",
@@ -2370,7 +4014,7 @@ AUTO_COLLAB_I18N = {
     },
     "zh-CN": {
         "start": "🤝 启动多 AI 协作流程",
-        "workflow": "工作流",
+        "workflow": "编排路由",
         "primary": "主导 Agent",
         "reviewers": "审查 Agent",
         "project_categories": "项目分类",
@@ -2442,6 +4086,16 @@ def _auto_msg(lang: str, key: str, **kwargs: str) -> str:
     return text.format(**kwargs)
 
 
+def _result_workflow_label(result: Any) -> str:
+    blueprint = str(getattr(result, "workflow_blueprint", "") or "").strip()
+    session_preset = str(getattr(result, "session_preset", "") or "").strip()
+    if blueprint and session_preset:
+        return f"{blueprint} [{session_preset}]"
+    if blueprint:
+        return blueprint
+    return session_preset
+
+
 def _ask_text_input(prompt: str, *, questionary_module, default_value: str = "") -> str:
     """Prompt a free-form text value in TUI/text mode."""
     if questionary_module:
@@ -2466,7 +4120,11 @@ def _collect_runner_inputs(
 
     If task is provided in CLI args, reuse it; otherwise enter interactive 3-step flow.
     """
-    raw_task = " ".join(getattr(args, "task", [])).strip()
+    raw_task_positional = " ".join(getattr(args, "task", [])).strip()
+    raw_task_option = str(getattr(args, "prompt", "") or "").strip()
+    if raw_task_positional and raw_task_option:
+        raise SystemExit("Use either positional task or --prompt, not both.")
+    raw_task = raw_task_option or raw_task_positional
     provider = provider_prefix or args.provider or default_provider
     mode = str(getattr(args, "execution_mode", "auto"))
 
@@ -2567,6 +4225,21 @@ def _open_file_in_editor(*, path: Path, lang: str) -> bool:
         return False
 
 
+def _resolve_v2_prompt_defaults(config: Optional[Config]) -> tuple[str, str]:
+    """Resolve V2 prompt defaults without breaking legacy runtime defaults."""
+    preset = "auto"
+    if config is not None:
+        auto_cfg = config.auto_collaboration or {}
+        if isinstance(auto_cfg, dict):
+            preset = str(auto_cfg.get("default_session_preset", "auto")).strip() or "auto"
+    try:
+        blueprint = resolve_session_preset(preset).workflow_key
+    except KeyError:
+        preset = "auto"
+        blueprint = resolve_session_preset(preset).workflow_key
+    return preset, blueprint
+
+
 def _build_controller_prompt_document(
     *,
     task: str,
@@ -2583,6 +4256,11 @@ def _build_controller_prompt_document(
     auto_cfg = config.auto_collaboration or {}
     persona_phase_map = auto_cfg.get("persona_phase_map", {}) if isinstance(auto_cfg, dict) else {}
     persona_skill_map = auto_cfg.get("persona_skill_map", {}) if isinstance(auto_cfg, dict) else {}
+    role_leads = resolve_collaboration_role_leads(config)
+    architecture_lead = role_leads.get("architecture", "gemini")
+    implementation_lead = role_leads.get("implementation", "codex")
+    testing_lead = role_leads.get("testing", "claude")
+    session_preset, workflow_blueprint = _resolve_v2_prompt_defaults(config)
 
     roster_lines: list[str] = []
     for item in available:
@@ -2613,6 +4291,12 @@ def _build_controller_prompt_document(
         joined = ", ".join(skills) if isinstance(skills, list) else str(skills)
         persona_skill_lines.append(f"- {persona_name}: {joined}")
     persona_skill_text = "\n".join(persona_skill_lines) if persona_skill_lines else "- (none)"
+    policy_lines = [
+        f"- {'方案选项 / 技术骨架 / 架构取舍' if is_zh else 'Options / technical skeleton / architecture trade-offs'}: {architecture_lead}",
+        f"- {'主实现 / 跨文件编码 / 问题修复' if is_zh else 'Main implementation / cross-file coding / bug fixing'}: {implementation_lead}",
+        f"- {'验收 / 回归测试 / 质量审查 / 补充修改' if is_zh else 'Acceptance / regression testing / quality review / follow-up fixes'}: {testing_lead}",
+    ]
+    policy_text = "\n".join(policy_lines)
 
     if is_zh:
         return f"""# 主控 Agent 执行文档（可编辑）
@@ -2635,24 +4319,64 @@ def _build_controller_prompt_document(
 ## 建议角色分配（来自系统初始规划）
 {plan_text}
 
+## 当前协作偏好（优先遵守）
+{policy_text}
+- 不要因为当前 controller 是 {controller} 就默认把所有编码步骤都交给 {controller}；只有在任务明显不需要某个角色时，才可以省略该角色。
+
 ## 你的输出要求（第一步）
 请先输出一个 JSON（只输出 JSON，不要额外解释），结构如下：
 ```json
 {{
   "plan_version": "1.0",
+  "workflow_engine": "v2",
+  "session_preset": "{session_preset}",
+  "workflow_blueprint": "{workflow_blueprint}",
   "controller": "{controller}",
   "requires_multi_agent": true,
   "agents": [
-    {{"name": "codex", "model": "gpt-5.3-codex", "persona": "implementation-engineer", "why": "..." }}
+    {{"name": "{architecture_lead}", "model": "unknown", "persona": "options-architect", "why": "负责方案选项、技术骨架与架构取舍" }},
+    {{"name": "{implementation_lead}", "model": "unknown", "persona": "implementation-lead", "why": "负责主实现与跨文件修改" }},
+    {{"name": "{testing_lead}", "model": "unknown", "persona": "quality-reviewer", "why": "负责验收、测试设计与补充修补" }}
   ],
   "steps": [
     {{
       "id": "S1",
-      "owner": "claude",
-      "goal": "技术选型",
+      "owner": "{architecture_lead}",
+      "goal": "收集现状并明确方案方向",
       "input": "用户任务 + 配置",
-      "output": "选型结论",
-      "done_when": "给出可执行结论"
+      "output": "现状证据包与可执行方案方向",
+      "done_when": "完成现状收集，明确关键约束，并给出可执行方案方向或是否需要进入 artifact 阶段",
+      "eta_minutes": 15,
+      "responsibility_stage": "collect",
+      "artifact_type": "evidence-pack",
+      "boundary": "只收集现状，不直接改代码或重设方案",
+      "timebox_minutes": 15
+    }},
+    {{
+      "id": "S2",
+      "owner": "{implementation_lead}",
+      "goal": "完成主实现",
+      "input": "已确认的方案与技术骨架",
+      "output": "可运行主功能",
+      "done_when": "核心功能可运行，且关键交互或主流程可手动验证",
+      "eta_minutes": 45,
+      "responsibility_stage": "execute",
+      "artifact_type": "code-change",
+      "boundary": "仅在已批准方向内实现，不擅自扩大范围或改写需求",
+      "timebox_minutes": 45
+    }},
+    {{
+      "id": "S3",
+      "owner": "{testing_lead}",
+      "goal": "执行验收与补充修补",
+      "input": "已实现功能",
+      "output": "验收结论与必要修补",
+      "done_when": "给出明确通过/失败结论，列出检查项；若发现超出边界的问题，明确交回 correct 阶段",
+      "eta_minutes": 20,
+      "responsibility_stage": "validate",
+      "artifact_type": "validation-report",
+      "boundary": "以验收和风险识别为主，不在本阶段擅自重设方案",
+      "timebox_minutes": 20
     }}
   ],
   "approval_question": "是否同意该计划？"
@@ -2671,6 +4395,8 @@ def _build_controller_prompt_document(
    - `HANDOFF_TO: <next_owner>`
    - 简短结果摘要
 8. 全部结束后输出 `=== TASK_COMPLETE ===`。
+9. 如果 step 含有 `responsibility_stage` / `artifact_type` / `boundary` / `timebox_minutes`，必须按这些字段理解步骤边界。
+10. collect 阶段只负责现状采集；validate 阶段只负责验收与风险识别；超出边界的问题要交回 correct 阶段。
 """
 
     return f"""# Controller Execution Doc (Editable)
@@ -2693,24 +4419,64 @@ You are the controller agent: `{controller}`. Use only the configured agents/mod
 ## Suggested Initial Role Plan (system draft)
 {plan_text}
 
+## Current Collaboration Preference (prefer this split)
+{policy_text}
+- Do not assign every coding step to {controller} just because the current controller is {controller}; only omit a role when the task genuinely does not need it.
+
 ## Output Requirement (Step 1)
 First, return JSON only (no extra explanation) using this schema:
 ```json
 {{
   "plan_version": "1.0",
+  "workflow_engine": "v2",
+  "session_preset": "{session_preset}",
+  "workflow_blueprint": "{workflow_blueprint}",
   "controller": "{controller}",
   "requires_multi_agent": true,
   "agents": [
-    {{"name": "codex", "model": "gpt-5.3-codex", "persona": "implementation-engineer", "why": "..."}}
+    {{"name": "{architecture_lead}", "model": "unknown", "persona": "options-architect", "why": "Owns options, technical skeleton, and architecture trade-offs"}},
+    {{"name": "{implementation_lead}", "model": "unknown", "persona": "implementation-lead", "why": "Owns the main implementation and cross-file edits"}},
+    {{"name": "{testing_lead}", "model": "unknown", "persona": "quality-reviewer", "why": "Owns acceptance, test design, and follow-up fixes"}}
   ],
   "steps": [
     {{
       "id": "S1",
-      "owner": "claude",
-      "goal": "tech selection",
+      "owner": "{architecture_lead}",
+      "goal": "collect context and define the technical direction",
       "input": "user task + config",
-      "output": "selection conclusion",
-      "done_when": "actionable decision is produced"
+      "output": "evidence pack and execution direction",
+      "done_when": "Current constraints are collected and the next direction is explicit",
+      "eta_minutes": 15,
+      "responsibility_stage": "collect",
+      "artifact_type": "evidence-pack",
+      "boundary": "Collect current facts only; do not implement or redesign in this step",
+      "timebox_minutes": 15
+    }},
+    {{
+      "id": "S2",
+      "owner": "{implementation_lead}",
+      "goal": "deliver the main implementation",
+      "input": "selected approach and skeleton",
+      "output": "working core feature",
+      "done_when": "The primary workflow runs and the main interaction can be checked manually",
+      "eta_minutes": 45,
+      "responsibility_stage": "execute",
+      "artifact_type": "code-change",
+      "boundary": "Implement only within the approved direction; do not expand scope",
+      "timebox_minutes": 45
+    }},
+    {{
+      "id": "S3",
+      "owner": "{testing_lead}",
+      "goal": "run acceptance and follow-up fixes",
+      "input": "implemented feature",
+      "output": "acceptance result and necessary follow-up fixes",
+      "done_when": "Acceptance verdict is explicit, checks are listed, and out-of-bound issues are handed back for correction",
+      "eta_minutes": 20,
+      "responsibility_stage": "validate",
+      "artifact_type": "validation-report",
+      "boundary": "Validate and identify risk; do not silently reset the solution direction here",
+      "timebox_minutes": 20
     }}
   ],
   "approval_question": "Do you approve this plan?"
@@ -2729,6 +4495,8 @@ First, return JSON only (no extra explanation) using this schema:
    - `HANDOFF_TO: <next_owner>`
    - short result summary
 8. End with `=== TASK_COMPLETE ===`.
+9. If a step includes `responsibility_stage` / `artifact_type` / `boundary` / `timebox_minutes`, treat those fields as binding step boundaries.
+10. Collect is for evidence, validate is for acceptance/risk, and bounded issues should be handed back to a correct stage.
 """
 
 
@@ -2799,6 +4567,11 @@ def _build_controller_planning_request(
     auto_cfg = config.auto_collaboration or {}
     persona_phase_map = auto_cfg.get("persona_phase_map", {}) if isinstance(auto_cfg, dict) else {}
     persona_skill_map = auto_cfg.get("persona_skill_map", {}) if isinstance(auto_cfg, dict) else {}
+    role_leads = resolve_collaboration_role_leads(config)
+    architecture_lead = role_leads.get("architecture", "gemini")
+    implementation_lead = role_leads.get("implementation", "codex")
+    testing_lead = role_leads.get("testing", "claude")
+    session_preset, workflow_blueprint = _resolve_v2_prompt_defaults(config)
 
     roster_lines: list[str] = []
     for item in available:
@@ -2819,6 +4592,13 @@ def _build_controller_planning_request(
     ]
     persona_phase_text = "\n".join(persona_phase_lines) if persona_phase_lines else "- (none)"
     persona_skill_text = "\n".join(persona_skill_lines) if persona_skill_lines else "- (none)"
+    policy_text = "\n".join(
+        [
+            f"- {'方案选项 / 技术骨架 / 架构取舍' if is_zh else 'Options / technical skeleton / architecture trade-offs'}：{architecture_lead}",
+            f"- {'主实现 / 跨文件编码 / 问题修复' if is_zh else 'Main implementation / cross-file coding / bug fixing'}：{implementation_lead}",
+            f"- {'验收 / 回归测试 / 质量审查 / 补充修改' if is_zh else 'Acceptance / regression testing / quality review / follow-up fixes'}：{testing_lead}",
+        ]
+    )
 
     if is_zh:
         return f"""你是主控 Agent：{controller}。
@@ -2836,28 +4616,71 @@ persona_phase_map:
 persona_skill_map:
 {persona_skill_text}
 
+当前协作偏好（优先遵守）:
+{policy_text}
+- 不要因为当前 controller 是 {controller} 就默认把所有编码步骤都交给 {controller}；只有在任务明显不需要某个角色时，才可以省略该角色。
+
 只返回 JSON，不要 markdown，不要解释。字段要求:
 {{
   "plan_version": "1.0",
+  "workflow_engine": "v2",
+  "session_preset": "{session_preset}",
+  "workflow_blueprint": "{workflow_blueprint}",
   "controller": "{controller}",
   "requires_multi_agent": true,
   "agents": [
-    {{"name": "codex", "model": "gpt-5.3-codex", "persona": "implementation-engineer", "why": "..." }}
+    {{"name": "{architecture_lead}", "model": "unknown", "persona": "options-architect", "why": "负责方案选项、技术骨架与架构取舍" }},
+    {{"name": "{implementation_lead}", "model": "unknown", "persona": "implementation-lead", "why": "负责主实现与跨文件修改" }},
+    {{"name": "{testing_lead}", "model": "unknown", "persona": "quality-reviewer", "why": "负责验收、测试设计与补充修补" }}
   ],
   "steps": [
     {{
       "id": "S1",
-      "owner": "claude",
-      "goal": "技术选型",
+      "owner": "{architecture_lead}",
+      "goal": "收集现状并明确方案方向",
       "input": "用户任务 + 配置",
-      "output": "选型结论",
-      "done_when": "给出可执行结论"
+      "output": "现状证据包与可执行方案方向",
+      "done_when": "完成现状收集，明确关键约束，并给出可执行方案方向或是否需要进入 artifact 阶段",
+      "eta_minutes": 15,
+      "responsibility_stage": "collect",
+      "artifact_type": "evidence-pack",
+      "boundary": "只收集现状，不直接改代码或重设方案",
+      "timebox_minutes": 15
+    }},
+    {{
+      "id": "S2",
+      "owner": "{implementation_lead}",
+      "goal": "完成主实现",
+      "input": "已确认的方案与技术骨架",
+      "output": "可运行主功能",
+      "done_when": "核心功能可运行，且关键交互或主流程可手动验证",
+      "eta_minutes": 45,
+      "responsibility_stage": "execute",
+      "artifact_type": "code-change",
+      "boundary": "仅在已批准方向内实现，不擅自扩大范围或改写需求",
+      "timebox_minutes": 45
+    }},
+    {{
+      "id": "S3",
+      "owner": "{testing_lead}",
+      "goal": "执行验收与补充修补",
+      "input": "已实现功能",
+      "output": "验收结论与必要修补",
+      "done_when": "给出明确通过/失败结论，列出检查项；若发现超出边界的问题，明确交回 correct 阶段",
+      "eta_minutes": 20,
+      "responsibility_stage": "validate",
+      "artifact_type": "validation-report",
+      "boundary": "以验收和风险识别为主，不在本阶段擅自重设方案",
+      "timebox_minutes": 20
     }}
   ],
   "approval_question": "是否同意该计划？"
 }}
 
 额外约束（必须写入计划并执行）:
+- workflow_engine 固定为 `v2`；session_preset 与 workflow_blueprint 必须和当前任务匹配。
+- responsibility_stage 必须使用阶段职责，而不是直接写 Agent 名称；取值只能是 collect / model / plan / artifact / execute / validate / correct / deliver。
+- 如果任务需要 mockup / contract / skeleton，可新增 artifact 阶段；如果 validate 发现边界内问题，可新增 correct 阶段。
 - 子 Agent 必须在 tmux 可视窗格执行，禁止后台 shell 调用 claude/gemini。
 - 交接时必须输出 `HANDOFF_TO: <agent>` 或 `SPAWN_AGENT: <agent>`。
 - 禁止先运行 `--help` / `-h` / `--version` 或任何探活脚本；必须直接执行分配步骤。
@@ -2893,28 +4716,71 @@ persona_phase_map:
 persona_skill_map:
 {persona_skill_text}
 
+Current collaboration preference (prefer this split):
+{policy_text}
+- Do not assign every coding step to {controller} just because the current controller is {controller}; only omit a role when the task genuinely does not need it.
+
 Return JSON only (no markdown, no explanation) with this schema:
 {{
   "plan_version": "1.0",
+  "workflow_engine": "v2",
+  "session_preset": "{session_preset}",
+  "workflow_blueprint": "{workflow_blueprint}",
   "controller": "{controller}",
   "requires_multi_agent": true,
   "agents": [
-    {{"name": "codex", "model": "gpt-5.3-codex", "persona": "implementation-engineer", "why": "..."}}
+    {{"name": "{architecture_lead}", "model": "unknown", "persona": "options-architect", "why": "Owns options, technical skeleton, and architecture trade-offs"}},
+    {{"name": "{implementation_lead}", "model": "unknown", "persona": "implementation-lead", "why": "Owns the main implementation and cross-file edits"}},
+    {{"name": "{testing_lead}", "model": "unknown", "persona": "quality-reviewer", "why": "Owns acceptance, test design, and follow-up fixes"}}
   ],
   "steps": [
     {{
       "id": "S1",
-      "owner": "claude",
-      "goal": "tech selection",
+      "owner": "{architecture_lead}",
+      "goal": "collect context and define the technical direction",
       "input": "user task + config",
-      "output": "selection conclusion",
-      "done_when": "actionable decision is produced"
+      "output": "evidence pack and execution direction",
+      "done_when": "Current constraints are collected and the next direction is explicit",
+      "eta_minutes": 15,
+      "responsibility_stage": "collect",
+      "artifact_type": "evidence-pack",
+      "boundary": "Collect current facts only; do not implement or redesign in this step",
+      "timebox_minutes": 15
+    }},
+    {{
+      "id": "S2",
+      "owner": "{implementation_lead}",
+      "goal": "deliver the main implementation",
+      "input": "selected approach and skeleton",
+      "output": "working core feature",
+      "done_when": "The primary workflow runs and the main interaction can be checked manually",
+      "eta_minutes": 45,
+      "responsibility_stage": "execute",
+      "artifact_type": "code-change",
+      "boundary": "Implement only within the approved direction; do not expand scope",
+      "timebox_minutes": 45
+    }},
+    {{
+      "id": "S3",
+      "owner": "{testing_lead}",
+      "goal": "run acceptance and follow-up fixes",
+      "input": "implemented feature",
+      "output": "acceptance result and necessary follow-up fixes",
+      "done_when": "Acceptance verdict is explicit, checks are listed, and out-of-bound issues are handed back for correction",
+      "eta_minutes": 20,
+      "responsibility_stage": "validate",
+      "artifact_type": "validation-report",
+      "boundary": "Validate and identify risk; do not silently reset the solution direction here",
+      "timebox_minutes": 20
     }}
   ],
   "approval_question": "Do you approve this plan?"
 }}
 
 Mandatory constraints:
+- workflow_engine must stay `v2`, and session_preset / workflow_blueprint must be a sensible fit for the task.
+- responsibility_stage must describe stage intent, not an agent name; allowed values are collect / model / plan / artifact / execute / validate / correct / deliver.
+- Add an artifact stage when the task needs mockup / contract / skeleton work, and add a correct stage when validation finds bounded issues.
 - Sub-agents must run in visible tmux panes. Do not call claude/gemini via hidden background shell commands.
 - On handoff, output `HANDOFF_TO: <agent>` or `SPAWN_AGENT: <agent>`.
 - Do not run probe commands such as `--help` / `-h` / `--version` or ad-hoc health scripts before execution.
@@ -2951,52 +4817,627 @@ def _extract_json_object(text: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _controller_plan_schema() -> dict[str, Any]:
+    """Structured output schema for controller planning."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "plan_version": {"type": "string"},
+            "workflow_engine": {"type": ["string", "null"]},
+            "session_preset": {"type": ["string", "null"]},
+            "workflow_blueprint": {"type": ["string", "null"]},
+            "controller": {"type": "string"},
+            "requires_multi_agent": {"type": "boolean"},
+            "agents": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "name": {"type": "string"},
+                        "model": {"type": "string"},
+                        "persona": {"type": "string"},
+                        "why": {"type": "string"},
+                    },
+                    "required": ["name", "model", "persona", "why"],
+                },
+            },
+            "steps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "string"},
+                        "owner": {"type": "string"},
+                        "goal": {"type": "string"},
+                        "input": {"type": "string"},
+                        "output": {"type": "string"},
+                        "done_when": {"type": "string"},
+                        "eta_minutes": {"type": "integer"},
+                        "responsibility_stage": {"type": ["string", "null"]},
+                        "artifact_type": {"type": ["string", "null"]},
+                        "boundary": {"type": ["string", "null"]},
+                        "timebox_minutes": {"type": ["integer", "null"]},
+                    },
+                    "required": [
+                        "id",
+                        "owner",
+                        "goal",
+                        "input",
+                        "output",
+                        "done_when",
+                        "eta_minutes",
+                        "responsibility_stage",
+                        "artifact_type",
+                        "boundary",
+                        "timebox_minutes",
+                    ],
+                },
+            },
+            "approval_question": {"type": "string"},
+        },
+        "required": [
+            "plan_version",
+            "workflow_engine",
+            "session_preset",
+            "workflow_blueprint",
+            "controller",
+            "requires_multi_agent",
+            "agents",
+            "steps",
+            "approval_question",
+        ],
+    }
+
+
+def _drop_args(parts: list[str], names: tuple[str, ...], takes_value: bool) -> list[str]:
+    """Remove matching option tokens from a CLI argv list."""
+    cleaned: list[str] = []
+    idx = 0
+    while idx < len(parts):
+        token = parts[idx]
+        if token in names:
+            idx += 1
+            if takes_value and idx < len(parts) and not parts[idx].startswith("-"):
+                idx += 1
+            continue
+        if any(token.startswith(f"{name}=") for name in names):
+            idx += 1
+            continue
+        cleaned.append(token)
+        idx += 1
+    return cleaned
+
+
+def _build_controller_plan_schema_text() -> str:
+    """Serialize planner schema for providers that accept inline JSON schema."""
+    return json.dumps(_controller_plan_schema(), ensure_ascii=False, separators=(",", ":"))
+
+
+def _set_or_append_arg(parts: list[str], names: tuple[str, ...], value: Optional[str] = None) -> list[str]:
+    """Replace first matching CLI option or append it when absent."""
+    updated = list(parts)
+    for idx, token in enumerate(updated):
+        if token in names:
+            if value is None:
+                return updated
+            if idx + 1 >= len(updated):
+                updated.append(value)
+            elif updated[idx + 1].startswith("-"):
+                updated.insert(idx + 1, value)
+            else:
+                updated[idx + 1] = value
+            return updated
+        for name in names:
+            prefix = f"{name}="
+            if token.startswith(prefix):
+                if value is None:
+                    return updated
+                updated[idx] = f"{prefix}{value}"
+                return updated
+    updated.append(names[0])
+    if value is not None:
+        updated.append(value)
+    return updated
+
+
+def _build_controller_planner_command(
+    *,
+    provider_cli: str,
+    controller: str,
+    prompt_text: str,
+    schema_path: Optional[str] = None,
+    output_path: Optional[str] = None,
+) -> list[str]:
+    """Build provider-specific non-interactive planner command."""
+    parts = shlex.split(provider_cli)
+    controller_name = str(controller).strip().lower()
+
+    if controller_name == "codex":
+        parts = _drop_args(parts, ("--output-schema", "-o", "--output-last-message"), takes_value=True)
+        if parts and parts[0] == "codex" and (len(parts) == 1 or parts[1] != "exec"):
+            parts.insert(1, "exec")
+        if "--skip-git-repo-check" not in parts:
+            parts.append("--skip-git-repo-check")
+        if schema_path:
+            parts.extend(["--output-schema", schema_path])
+        if output_path:
+            parts.extend(["--output-last-message", output_path])
+        return parts + [prompt_text]
+
+    if controller_name == "claude":
+        parts = _drop_args(parts, ("-c", "--continue", "--fork-session"), takes_value=False)
+        parts = _drop_args(parts, ("-r", "--resume", "--session-id"), takes_value=True)
+        parts = _set_or_append_arg(parts, ("-p", "--print"), None)
+        parts = _set_or_append_arg(parts, ("--output-format",), "json")
+        parts = _set_or_append_arg(parts, ("--permission-mode",), "plan")
+        parts = _set_or_append_arg(parts, ("--json-schema",), _build_controller_plan_schema_text())
+        return parts + [prompt_text]
+
+    if controller_name == "gemini":
+        parts = _drop_args(parts, ("-p", "--prompt", "-i", "--prompt-interactive", "-r", "--resume"), takes_value=True)
+        parts = _drop_args(parts, ("-y", "--yolo"), takes_value=False)
+        parts = _set_or_append_arg(parts, ("-o", "--output-format"), "json")
+        parts = _set_or_append_arg(parts, ("--approval-mode",), "plan")
+        return parts + ["-p", prompt_text]
+
+    return parts + [prompt_text]
+
+
+def _copy_if_exists(source: Path, destination: Path) -> None:
+    if source.exists() and source.is_file():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+def _toml_literal(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_literal(item) for item in value) + "]"
+    raise TypeError(f"Unsupported TOML value: {type(value)!r}")
+
+
+def _dump_simple_toml(data: dict[str, Any]) -> str:
+    lines: list[str] = []
+
+    def _table_key(key: str) -> str:
+        return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else json.dumps(key, ensure_ascii=False)
+
+    def _emit_table(table: dict[str, Any], prefix: tuple[str, ...] = ()) -> None:
+        scalar_items = [(key, value) for key, value in table.items() if not isinstance(value, dict)]
+        nested_items = [(key, value) for key, value in table.items() if isinstance(value, dict)]
+        if prefix:
+            lines.append(f"[{'.'.join(_table_key(part) for part in prefix)}]")
+        for key, value in scalar_items:
+            lines.append(f"{key} = {_toml_literal(value)}")
+        if scalar_items and nested_items:
+            lines.append("")
+        for index, (key, value) in enumerate(nested_items):
+            next_prefix = prefix + (key,)
+            _emit_table(value, next_prefix)
+            if index != len(nested_items) - 1:
+                lines.append("")
+
+    _emit_table(data)
+    return "\n".join(lines).strip() + "\n"
+
+
+def _write_minimal_codex_planner_config(*, source_home: Path, isolated_home: Path, workdir: Path) -> None:
+    source_config = source_home / "config.toml"
+    destination = isolated_home / "config.toml"
+    if not source_config.exists():
+        return
+
+    try:
+        raw = tomllib.loads(source_config.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError):
+        _copy_if_exists(source_config, destination)
+        return
+
+    provider_name = str(raw.get("model_provider") or "").strip()
+    provider_table = raw.get("model_providers", {})
+    if not provider_name and isinstance(provider_table, dict) and provider_table:
+        provider_name = str(next(iter(provider_table.keys())))
+
+    sanitized: dict[str, Any] = {}
+    for key in ("model_provider", "model", "model_reasoning_effort", "disable_response_storage"):
+        if key in raw:
+            sanitized[key] = raw[key]
+
+    if provider_name and isinstance(provider_table, dict):
+        provider_config = provider_table.get(provider_name)
+        if isinstance(provider_config, dict):
+            sanitized["model_providers"] = {provider_name: provider_config}
+
+    resolved_workdir = str(workdir.expanduser().resolve())
+    project_table = raw.get("projects", {})
+    if isinstance(project_table, dict):
+        project_config = project_table.get(resolved_workdir)
+        if isinstance(project_config, dict):
+            sanitized["projects"] = {resolved_workdir: project_config}
+        else:
+            sanitized["projects"] = {resolved_workdir: {"trust_level": "trusted"}}
+    else:
+        sanitized["projects"] = {resolved_workdir: {"trust_level": "trusted"}}
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(_dump_simple_toml(sanitized), encoding="utf-8")
+
+
+def _build_controller_planner_env(*, controller: str, temp_dir: str) -> dict[str, str]:
+    env = dict(os.environ)
+    controller_name = str(controller).strip().lower()
+    if controller_name != "codex":
+        return env
+
+    source_home = Path.home() / ".codex"
+    isolated_home = Path(temp_dir) / "codex-home"
+    isolated_home.mkdir(parents=True, exist_ok=True)
+    _write_minimal_codex_planner_config(source_home=source_home, isolated_home=isolated_home, workdir=Path.cwd())
+    _copy_if_exists(source_home / "auth.json", isolated_home / "auth.json")
+    _copy_if_exists(source_home / "version.json", isolated_home / "version.json")
+    _copy_if_exists(source_home / ".codex-global-state.json", isolated_home / ".codex-global-state.json")
+    env["CODEX_HOME"] = str(isolated_home)
+    env["OTEL_SDK_DISABLED"] = "true"
+    env["OTEL_TRACES_EXPORTER"] = "none"
+    env["OTEL_METRICS_EXPORTER"] = "none"
+    env["OTEL_LOGS_EXPORTER"] = "none"
+    return env
+
+
+def _looks_like_controller_plan(payload: Any) -> bool:
+    """Whether payload already matches the controller plan shape."""
+    if not isinstance(payload, dict):
+        return False
+    required_keys = {
+        "plan_version",
+        "controller",
+        "requires_multi_agent",
+        "agents",
+        "steps",
+        "approval_question",
+    }
+    return required_keys.issubset(payload.keys()) and isinstance(payload.get("steps"), list)
+
+
+def _extract_controller_plan_payload(payload: Any) -> Optional[dict[str, Any]]:
+    """Find controller plan in direct or wrapped JSON/text payloads."""
+    if _looks_like_controller_plan(payload):
+        return payload
+    if isinstance(payload, str):
+        nested = _extract_json_object(payload)
+        if nested is not None:
+            return _extract_controller_plan_payload(nested)
+        return None
+    if isinstance(payload, list):
+        for item in payload:
+            found = _extract_controller_plan_payload(item)
+            if found:
+                return found
+        return None
+    if isinstance(payload, dict):
+        for value in payload.values():
+            found = _extract_controller_plan_payload(value)
+            if found:
+                return found
+    return None
+
+
+def _extract_controller_plan_from_jsonl(output_text: str) -> Optional[dict[str, Any]]:
+    """Best-effort extraction from Codex `--json` event stream."""
+    for raw_line in str(output_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        item = payload.get("item") if isinstance(payload, dict) else None
+        if isinstance(item, dict):
+            item_type = str(item.get("type", "")).strip().lower()
+            if item_type in {"agent_message", "assistant_message"}:
+                found = _extract_controller_plan_payload(item.get("text"))
+                if found:
+                    return found
+
+        if isinstance(payload, dict):
+            event_type = str(payload.get("type", "")).strip().lower()
+            role = str(payload.get("role", "")).strip().lower()
+            if event_type in {"assistant_message", "agent_message"} or role in {"assistant", "agent"}:
+                found = _extract_controller_plan_payload(payload.get("text"))
+                if found:
+                    return found
+    return None
+
+
+def _extract_codex_jsonl_error(output_text: str) -> Optional[str]:
+    """Extract the most meaningful failure message from Codex `--json` events."""
+    last_error: Optional[str] = None
+    for raw_line in str(output_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        event_type = str(payload.get("type", "")).strip().lower()
+        if event_type == "turn.failed":
+            error_payload = payload.get("error")
+            if isinstance(error_payload, dict):
+                message = str(error_payload.get("message") or "").strip()
+                if message:
+                    return message
+            message = str(payload.get("message") or "").strip()
+            if message:
+                return message
+        if event_type == "error":
+            message = str(payload.get("message") or "").strip()
+            if message and not message.lower().startswith("reconnecting..."):
+                last_error = message
+    return last_error
+
+
+def _build_codex_json_fallback_command(cmd_parts: list[str]) -> list[str]:
+    """Switch a Codex planner command from last-message file mode to JSONL mode."""
+    fallback = _drop_args(list(cmd_parts), ("-o", "--output-last-message"), takes_value=True)
+    if "--json" not in fallback:
+        fallback.append("--json")
+    return fallback
+
+
+def _codex_empty_last_message_warning(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    return "no last agent message" in normalized and "empty content" in normalized
+
+
 def _request_controller_plan(
     *,
     config: Config,
     controller: str,
     prompt_text: str,
+    progress_callback: Optional[Callable[[str, dict[str, Any]], None]] = None,
+    cancel_requested: Optional[Callable[[], bool]] = None,
 ) -> Tuple[Optional[dict[str, Any]], Optional[str]]:
     """Ask controller model for orchestration plan JSON."""
     provider_config = config.providers.get(controller)
     if not provider_config:
         return None, f"Unknown provider: {controller}"
-    try:
-        cmd_parts = shlex.split(provider_config.cli)
-    except ValueError as exc:
-        return None, f"Invalid provider CLI: {exc}"
 
-    # Keep behavior consistent with direct execution path.
-    if cmd_parts and cmd_parts[0] == "codex" and "--skip-git-repo-check" not in cmd_parts:
-        cmd_parts.append("--skip-git-repo-check")
+    controller_name = str(controller).strip().lower()
+    with tempfile.TemporaryDirectory(prefix="ai-collab-plan-") as temp_dir:
+        schema_path: Optional[str] = None
+        output_path: Optional[str] = None
+        if controller_name == "codex":
+            schema_path = str(Path(temp_dir) / "controller-plan-schema.json")
+            output_path = str(Path(temp_dir) / "controller-plan-output.json")
+            Path(schema_path).write_text(_build_controller_plan_schema_text(), encoding="utf-8")
 
-    try:
-        result = subprocess.run(
-            cmd_parts + [prompt_text],
-            shell=False,
-            capture_output=True,
-            text=True,
-            timeout=provider_config.timeout,
+        try:
+            cmd_parts = _build_controller_planner_command(
+                provider_cli=provider_config.cli,
+                controller=controller,
+                prompt_text=prompt_text,
+                schema_path=schema_path,
+                output_path=output_path,
+            )
+        except ValueError as exc:
+            return None, f"Invalid provider CLI: {exc}"
+
+        try:
+            planner_env = _build_controller_planner_env(controller=controller, temp_dir=temp_dir)
+            if progress_callback is not None:
+                progress_callback(
+                    "command_started",
+                    {
+                        "command_preview": " ".join(cmd_parts[:8]) + (" ..." if len(cmd_parts) > 8 else ""),
+                        "controller": controller,
+                    },
+                )
+            if progress_callback is None and cancel_requested is None:
+                result = subprocess.run(
+                    cmd_parts,
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=provider_config.timeout,
+                    env=planner_env,
+                )
+            else:
+                process = subprocess.Popen(
+                    cmd_parts,
+                    shell=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=planner_env,
+                    bufsize=1,
+                )
+                stdout_chunks: list[str] = []
+                stderr_chunks: list[str] = []
+                stream_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+                def _reader(stream, stream_name: str, sink: list[str]) -> None:  # noqa: ANN001
+                    try:
+                        if stream is None:
+                            return
+                        for line in iter(stream.readline, ""):
+                            sink.append(line)
+                            stream_queue.put((stream_name, line))
+                    finally:
+                        with contextlib.suppress(Exception):
+                            if stream is not None:
+                                stream.close()
+                        stream_queue.put((stream_name, None))
+
+                stdout_thread = threading.Thread(
+                    target=_reader,
+                    args=(process.stdout, "stdout", stdout_chunks),
+                    daemon=True,
+                )
+                stderr_thread = threading.Thread(
+                    target=_reader,
+                    args=(process.stderr, "stderr", stderr_chunks),
+                    daemon=True,
+                )
+                stdout_thread.start()
+                stderr_thread.start()
+                start_time = time.time()
+                seen_command_echo = False
+                while True:
+                    drained = False
+                    while True:
+                        try:
+                            stream_name, line = stream_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        drained = True
+                        if line is None:
+                            continue
+                        if progress_callback is None:
+                            continue
+                        preview = line.strip()
+                        if not preview:
+                            continue
+                        if (
+                            controller_name == "codex"
+                            and not seen_command_echo
+                            and preview == "codex"
+                        ):
+                            seen_command_echo = True
+                            continue
+                        progress_callback(
+                            "command_output",
+                            {"stream": stream_name, "text": preview},
+                        )
+                    if cancel_requested is not None and cancel_requested():
+                        process.terminate()
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=2)
+                        stdout_thread.join(timeout=1)
+                        stderr_thread.join(timeout=1)
+                        return None, "Planning canceled by user"
+                    if process.poll() is not None:
+                        stdout_thread.join(timeout=1)
+                        stderr_thread.join(timeout=1)
+                        stdout_text = "".join(stdout_chunks)
+                        stderr_text = "".join(stderr_chunks)
+                        result = subprocess.CompletedProcess(
+                            args=cmd_parts,
+                            returncode=process.returncode,
+                            stdout=stdout_text,
+                            stderr=stderr_text,
+                        )
+                        break
+                    if time.time() - start_time > provider_config.timeout:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=2)
+                        stdout_thread.join(timeout=1)
+                        stderr_thread.join(timeout=1)
+                        return None, f"Timeout after {provider_config.timeout}s"
+                    time.sleep(0.05 if drained else 0.1)
+        except FileNotFoundError:
+            executable = cmd_parts[0] if cmd_parts else controller
+            return None, f"Provider command not found: {executable}"
+        except subprocess.TimeoutExpired:
+            return None, f"Timeout after {provider_config.timeout}s"
+
+        payload_candidates: list[Any] = []
+        if output_path:
+            output_file = Path(output_path)
+            if output_file.exists():
+                output_text = output_file.read_text(encoding="utf-8").strip()
+                if output_text:
+                    payload_candidates.append(output_text)
+
+        combined_output = f"{result.stdout}\n{result.stderr}".strip()
+        stripped_output = combined_output.lstrip()
+        if combined_output and (
+            controller_name != "codex"
+            or (
+                stripped_output.startswith("{")
+                and _extract_controller_plan_payload(combined_output) is not None
+            )
+        ):
+            payload_candidates.append(combined_output)
+
+        for candidate in payload_candidates:
+            plan = _extract_controller_plan_payload(candidate)
+            if plan:
+                return plan, None
+
+        should_try_codex_fallback = controller_name == "codex" and (
+            result.returncode == 0 or _codex_empty_last_message_warning(result.stderr or result.stdout or "")
         )
-    except FileNotFoundError:
-        executable = cmd_parts[0] if cmd_parts else controller
-        return None, f"Provider command not found: {executable}"
-    except subprocess.TimeoutExpired:
-        return None, f"Timeout after {provider_config.timeout}s"
+        if should_try_codex_fallback:
+            fallback_cmd = _build_codex_json_fallback_command(cmd_parts)
+            try:
+                fallback_result = subprocess.run(
+                    fallback_cmd,
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=provider_config.timeout,
+                    env=planner_env,
+                )
+            except FileNotFoundError:
+                executable = fallback_cmd[0] if fallback_cmd else controller
+                return None, f"Provider command not found: {executable}"
+            except subprocess.TimeoutExpired:
+                return None, f"Timeout after {provider_config.timeout}s"
 
-    if result.returncode != 0:
-        error_text = (result.stderr or result.stdout or "").strip()
-        first_line = error_text.splitlines()[0] if error_text else f"exit code {result.returncode}"
-        return None, first_line
+            jsonl_plan = _extract_controller_plan_from_jsonl(fallback_result.stdout)
+            if jsonl_plan:
+                return jsonl_plan, None
+            fallback_error = _extract_codex_jsonl_error(fallback_result.stdout)
+            if fallback_error:
+                return None, fallback_error
 
-    combined_output = f"{result.stdout}\n{result.stderr}".strip()
-    if not combined_output:
-        return None, "Empty output from controller"
+        if result.returncode != 0:
+            error_text = (result.stderr or result.stdout or "").strip()
+            lines = [line.strip() for line in error_text.splitlines() if line.strip()]
+            ignored_prefixes = (
+                "OpenAI Codex v",
+                "Claude Code",
+                "--------",
+                "workdir:",
+                "model:",
+                "provider:",
+                "approval:",
+                "sandbox:",
+                "reasoning effort:",
+                "reasoning summaries:",
+                "session id:",
+                "user",
+                "mcp startup:",
+                "mcp:",
+                "codex",
+                "tokens used",
+            )
+            meaningful = [line for line in lines if not line.startswith(ignored_prefixes)]
+            summary = meaningful[-1] if meaningful else (lines[-1] if lines else f"exit code {result.returncode}")
+            return None, summary
 
-    plan = _extract_json_object(combined_output)
-    if not plan:
-        return None, "Controller output does not contain valid JSON object"
-    return plan, None
+    return None, "Controller output does not contain valid JSON object"
 
 
 def _build_controller_execution_prompt(
@@ -3039,6 +5480,9 @@ def _build_controller_execution_prompt(
 7. 监控超时参数必须动态调整，不得固定为同一个值。
 8. 若命令被权限/审批拦截，立即输出 `NEED_ELEVATION: <command> | reason=<error>`，等待用户处理。
 9. 全部完成输出 `=== TASK_COMPLETE ===`。
+10. 如果 step 含有 `responsibility_stage` / `artifact_type` / `boundary` / `timebox_minutes`，必须按这些字段理解步骤边界。
+11. 不得在 collect 阶段直接进入大规模实现；collect 的目标是收集现状与证据。
+12. 不得在 validate 阶段擅自重设方案；若发现边界内问题，交回 correct 阶段或显式请求用户确认。
 
 {command_contract_zh}
 """
@@ -3060,6 +5504,9 @@ Execution rules:
 7. Adjust monitor timeout dynamically from runtime status; do not keep one fixed timeout value.
 8. If blocked by permission/approval, output `NEED_ELEVATION: <command> | reason=<error>` and wait.
 9. Finish with `=== TASK_COMPLETE ===`.
+10. If a step includes `responsibility_stage` / `artifact_type` / `boundary` / `timebox_minutes`, treat those fields as binding execution boundaries.
+11. Do not jump into large-scale implementation during a collect stage; collect is for facts and evidence.
+12. Do not silently reset the solution direction during validate; hand bounded issues back to a correct stage or explicitly escalate.
 
 {command_contract_en}
 """
@@ -3070,7 +5517,13 @@ def _render_controller_plan(plan: dict[str, Any], *, lang: str) -> str:
     is_zh = lang == "zh-CN"
     lines: list[str] = []
 
-    controller = str(plan.get("controller", "")).strip() or "(unknown)"
+    def _string_value(value: Any) -> str:
+        return "" if value is None else str(value).strip()
+
+    controller = _string_value(plan.get("controller")) or "(unknown)"
+    workflow_engine = _string_value(plan.get("workflow_engine"))
+    session_preset = _string_value(plan.get("session_preset"))
+    workflow_blueprint = _string_value(plan.get("workflow_blueprint"))
     requires_multi = bool(plan.get("requires_multi_agent", False))
     agents = plan.get("agents", [])
     steps = plan.get("steps", [])
@@ -3078,11 +5531,23 @@ def _render_controller_plan(plan: dict[str, Any], *, lang: str) -> str:
 
     if is_zh:
         lines.append(f"主控: {controller}")
+        if workflow_engine:
+            lines.append(f"工作流引擎: {workflow_engine}")
+        if session_preset:
+            lines.append(f"会话预设: {session_preset}")
+        if workflow_blueprint:
+            lines.append(f"蓝图: {workflow_blueprint}")
         lines.append(f"是否多 Agent: {'是' if requires_multi else '否'}")
         lines.append("")
         lines.append("Agent 编排:")
     else:
         lines.append(f"Controller: {controller}")
+        if workflow_engine:
+            lines.append(f"Workflow engine: {workflow_engine}")
+        if session_preset:
+            lines.append(f"Session preset: {session_preset}")
+        if workflow_blueprint:
+            lines.append(f"Blueprint: {workflow_blueprint}")
         lines.append(f"Requires multi-agent: {'yes' if requires_multi else 'no'}")
         lines.append("")
         lines.append("Agent Assignment:")
@@ -3112,7 +5577,20 @@ def _render_controller_plan(plan: dict[str, Any], *, lang: str) -> str:
             owner = step.get("owner", "")
             goal = step.get("goal", "")
             done_when = step.get("done_when", "")
+            stage = _string_value(step.get("responsibility_stage"))
+            artifact_type = _string_value(step.get("artifact_type"))
+            timebox_minutes = step.get("timebox_minutes")
             lines.append(f"{idx}. [{sid}] {owner} - {goal}")
+            if stage or artifact_type or timebox_minutes:
+                meta_bits = []
+                if stage:
+                    meta_bits.append(f"stage={stage}")
+                if artifact_type:
+                    meta_bits.append(f"artifact={artifact_type}")
+                if isinstance(timebox_minutes, int):
+                    meta_bits.append(f"timebox={timebox_minutes}m")
+                if meta_bits:
+                    lines.append(f"   {' · '.join(meta_bits)}")
             if done_when:
                 lines.append(f"   done_when: {done_when}")
     else:
@@ -3574,6 +6052,22 @@ def _extract_step_done_ids(text: str) -> list[str]:
     return step_ids
 
 
+def _extract_step_start_ids(text: str) -> list[str]:
+    """Extract step-start markers from live terminal lines."""
+    step_ids: list[str] = []
+    normalized = _normalize_terminal_text_for_markers(text)
+    patterns = [
+        re.compile(r"(?mi)^\s*STEP_START\s*:\s*([A-Za-z0-9_.-]+)\b"),
+        re.compile(r"(?mi)^\s*(S[0-9][A-Za-z0-9_.-]*)_START\b"),
+    ]
+    for pattern in patterns:
+        for match in pattern.findall(normalized):
+            token = str(match).strip()
+            if token and not token.startswith("<") and token not in step_ids:
+                step_ids.append(token)
+    return step_ids
+
+
 def _extract_runtime_session_ids(text: str) -> list[str]:
     """Best-effort extraction for agent runtime session/conversation IDs."""
     normalized = _normalize_terminal_text_for_markers(text)
@@ -3671,11 +6165,222 @@ def _capture_tmux_layout_snapshot(*, session: str, preview_lines: int = 6) -> di
     return {"session": session, "available": True, "windows": windows}
 
 
+def _snapshot_pane_ids(snapshot: dict[str, Any]) -> set[str]:
+    """Collect all pane ids from a tmux layout snapshot payload."""
+    pane_ids: set[str] = set()
+    windows = snapshot.get("windows", []) if isinstance(snapshot, dict) else []
+    if not isinstance(windows, list):
+        return pane_ids
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        panes = window.get("panes", [])
+        if not isinstance(panes, list):
+            continue
+        for pane in panes:
+            if not isinstance(pane, dict):
+                continue
+            pane_id = str(pane.get("pane_id", "")).strip()
+            if pane_id:
+                pane_ids.add(pane_id)
+    return pane_ids
+
+
+def _sync_controller_progress_from_text(*, run_store: RunStateStore, text: str, source: str = "controller_marker") -> None:
+    """Sync STEP_START/STEP_DONE markers from controller output into run steps."""
+    raw = str(text or "")
+    if not raw:
+        return
+    snap = run_store.snapshot()
+    controller = snap.get("controller", {}) if isinstance(snap.get("controller", {}), dict) else {}
+    controller_agent = str(controller.get("agent", "")).strip() or "controller"
+    steps = snap.get("steps", {}) if isinstance(snap.get("steps", {}), dict) else {}
+    done_values = {"done", "complete", "completed", "accepted"}
+
+    for step_id in _extract_step_start_ids(raw):
+        current = steps.get(step_id, {}) if isinstance(steps.get(step_id, {}), dict) else {}
+        status = str(current.get("status", "")).strip().lower()
+        if status in done_values or status in {"running", "in_progress", "assigned"}:
+            continue
+        run_store.set_step_status(step_id=step_id, status="running", agent=controller_agent)
+        run_store.set_phase(phase="step_started", detail=f"{step_id}:running", source=source)
+        run_store.append_event(
+            event_type="step_started",
+            source=source,
+            agent=controller_agent,
+            payload={"step_id": step_id},
+        )
+        steps[step_id] = {"status": "running"}
+
+    for step_id in _extract_step_done_ids(raw):
+        current = steps.get(step_id, {}) if isinstance(steps.get(step_id, {}), dict) else {}
+        status = str(current.get("status", "")).strip().lower()
+        if status in done_values:
+            continue
+        run_store.set_step_status(step_id=step_id, status="done", agent=controller_agent)
+        run_store.append_event(
+            event_type="step_done",
+            source=source,
+            agent=controller_agent,
+            payload={"step_id": step_id},
+        )
+        steps[step_id] = {"status": "done"}
+
+
+def _sync_controller_progress_from_live_pane(
+    *,
+    run_store: RunStateStore,
+    source: str = "controller_marker",
+    start_line: int = -320,
+) -> None:
+    """Best-effort sync STEP_* markers by capturing current controller pane text."""
+    snap = run_store.snapshot()
+    controller = snap.get("controller", {}) if isinstance(snap.get("controller", {}), dict) else {}
+    pane_id = str(controller.get("pane_id", "")).strip()
+    if not pane_id:
+        return
+    try:
+        snapshot = capture_pane_text(pane_id=pane_id, start_line=int(start_line))
+    except subprocess.CalledProcessError:
+        return
+    for runtime_id in _extract_runtime_session_ids(snapshot):
+        run_store.set_controller_runtime_session_id(runtime_session_id=runtime_id)
+    _sync_controller_progress_from_text(run_store=run_store, text=snapshot, source=source)
+
+
+def _refresh_runs_controller_progress_from_live_panes(
+    *,
+    cwd: Path,
+    runs: list[dict[str, Any]],
+    source: str = "resume_list",
+) -> None:
+    """Refresh resumable runs by syncing controller markers from live pane text."""
+    for item in runs:
+        run_id = str(item.get("run_id", "")).strip() if isinstance(item, dict) else ""
+        if not run_id:
+            continue
+        status = str(item.get("status", "")).strip().lower() if isinstance(item, dict) else ""
+        if status == "completed":
+            continue
+        store = RunStateStore.load(cwd=cwd, run_id=run_id)
+        if store is None:
+            continue
+        _sync_controller_progress_from_live_pane(run_store=store, source=source)
+
+
+def _find_active_run_store_for_session(
+    *,
+    cwd: Path,
+    session: str,
+    controller_pane: str = "",
+) -> Optional[RunStateStore]:
+    """Find latest run store bound to a tmux session (optionally controller pane)."""
+    target_session = str(session).strip()
+    if not target_session:
+        return None
+    runs = RunStateStore.list_runs(cwd=cwd, limit=200)
+    pane_target = str(controller_pane).strip()
+    for item in runs:
+        if str(item.get("session", "")).strip() != target_session:
+            continue
+        run_id = str(item.get("run_id", "")).strip()
+        if not run_id:
+            continue
+        store = RunStateStore.load(cwd=cwd, run_id=run_id)
+        if store is None:
+            continue
+        if not pane_target:
+            return store
+        snap = store.snapshot()
+        pane = str((snap.get("controller", {}) or {}).get("pane_id", "")).strip()
+        if pane == pane_target:
+            return store
+    return None
+
+
+def _sync_runtime_session_ids_from_snapshot(*, run_store: RunStateStore, snapshot: dict[str, Any]) -> None:
+    """Best-effort sync runtime session ids by scanning live pane output."""
+    windows = snapshot.get("windows", []) if isinstance(snapshot, dict) else []
+    if not isinstance(windows, list):
+        return
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        panes = window.get("panes", [])
+        if not isinstance(panes, list):
+            continue
+        for pane in panes:
+            if not isinstance(pane, dict):
+                continue
+            pane_id = str(pane.get("pane_id", "")).strip()
+            if not pane_id:
+                continue
+            title = str(pane.get("title", "")).strip()
+            agent = ""
+            if title == "ai-collab:controller":
+                controller = run_store.snapshot().get("controller", {})
+                agent = str((controller or {}).get("agent", "")).strip()
+            elif title.startswith("ai-collab:subagent:"):
+                agent = title.split("ai-collab:subagent:", 1)[1].strip().lower()
+            if not agent:
+                continue
+            shot = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-J", "-t", pane_id, "-S", "-220"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if shot.returncode != 0:
+                continue
+            ids = _extract_runtime_session_ids(shot.stdout or "")
+            if not ids:
+                continue
+            runtime_id = ids[-1]
+            controller = run_store.snapshot().get("controller", {})
+            controller_agent = str((controller or {}).get("agent", "")).strip().lower()
+            if agent == controller_agent:
+                run_store.set_controller_runtime_session_id(runtime_session_id=runtime_id)
+            else:
+                run_store.set_agent_runtime_session_id(agent=agent, runtime_session_id=runtime_id)
+
+
+def _enrich_snapshot_with_runtime_sessions(*, run_store: RunStateStore, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Attach runtime session metadata to layout snapshot for resume diagnostics."""
+    snap = run_store.snapshot()
+    controller = snap.get("controller", {}) if isinstance(snap.get("controller", {}), dict) else {}
+    agents = snap.get("agents", {}) if isinstance(snap.get("agents", {}), dict) else {}
+    runtime_payload = {
+        "controller": {
+            "agent": str(controller.get("agent", "")).strip(),
+            "pane_id": str(controller.get("pane_id", "")).strip(),
+            "runtime_session_id": str(controller.get("runtime_session_id", "")).strip(),
+        },
+        "agents": [
+            {
+                "agent": str(name).strip(),
+                "pane_id": str((details or {}).get("pane_id", "")).strip(),
+                "runtime_session_id": str((details or {}).get("runtime_session_id", "")).strip(),
+            }
+            for name, details in agents.items()
+            if isinstance(details, dict)
+        ],
+        "workspace": str(snap.get("workspace", "")).strip(),
+    }
+    merged = dict(snapshot)
+    merged["runtime_sessions"] = runtime_payload
+    return merged
+
+
 def _record_tmux_layout_snapshot(*, run_store: Optional[RunStateStore], session: str, reason: str) -> None:
     """Store tmux snapshot diff into run state whenever topology/content changes."""
     if run_store is None:
         return
     snapshot = _capture_tmux_layout_snapshot(session=session, preview_lines=6)
+    try:
+        _sync_runtime_session_ids_from_snapshot(run_store=run_store, snapshot=snapshot)
+    except Exception:  # noqa: BLE001
+        pass
+    snapshot = _enrich_snapshot_with_runtime_sessions(run_store=run_store, snapshot=snapshot)
     changed = run_store.update_tmux_layout_snapshot(
         session=session,
         snapshot=snapshot,
@@ -4316,6 +7021,11 @@ def _start_handoff_watcher(
                 if run_store is not None:
                     for runtime_id in _extract_runtime_session_ids(delta):
                         run_store.set_controller_runtime_session_id(runtime_session_id=runtime_id)
+                    _sync_controller_progress_from_text(
+                        run_store=run_store,
+                        text=delta,
+                        source="controller_marker",
+                    )
                 for match in _extract_handoff_targets(tail):
                     key = match.lower()
                     agent = canonical.get(key)
@@ -4526,6 +7236,7 @@ def _launch_tmux_orchestration(
         controller_agent=controller,
         controller_pane=controller_pane,
     )
+    run_store.set_mode(mode="tmux")
     run_store.set_entry_prompt(text=entry_prompt_text or controller_prompt or task)
     run_store.set_phase(
         phase="controller_started",
@@ -4817,7 +7528,7 @@ def _run_init_wizard(config_obj: Config, *, ui_mode: str = "text") -> None:
 
     # Step 6: show default responsibility map.
     console.print(f"\n✓ {'主控' if lang == 'zh-CN' else 'Controller'}: {_provider_display_plain(controller)}")
-    console.print(f"\n[bold]{'默认职责分配 (Three brains, one workflow)' if lang == 'zh-CN' else 'Default Responsibility Map (Three brains, one workflow)'}[/bold]\n")
+    console.print(f"\n[bold]{'默认职责分配 (Three brains, one system)' if lang == 'zh-CN' else 'Default Responsibility Map (Three brains, one system)'}[/bold]\n")
 
     # Render role ownership summary.
     console.print(f"  🔴 [cyan]Codex[/cyan]")
@@ -5010,6 +7721,8 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
     parser = argparse.ArgumentParser(prog=prog_name, description="Auto-detect and run collaboration workflow")
     parser.add_argument("task", nargs="*", help="Task description")
     parser.add_argument("-p", "--provider", choices=sorted(providers), help="Current controller/provider")
+    parser.add_argument("--controller", dest="provider", choices=sorted(providers), help="Alias of --provider")
+    parser.add_argument("--prompt", help="Task text alias of positional [task...]")
     parser.add_argument("-d", "--dry-run", action="store_true", help="Only print the plan, do not execute")
     parser.add_argument("-o", "--output", choices=["text", "json"], default="text", help="Output format")
     parser.add_argument("-l", "--lang", choices=sorted(I18N.keys()), help="Force UI language for this run")
@@ -5020,6 +7733,12 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
         choices=["auto", "direct", "tmux"],
         default="auto",
         help="Execution mode for collaboration workflow",
+    )
+    parser.add_argument(
+        "--mode",
+        dest="execution_mode",
+        choices=["auto", "direct", "tmux"],
+        help="Alias of --execution-mode",
     )
     parser.add_argument(
         "-W",
@@ -5115,7 +7834,7 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
 
     if result.need_collaboration:
         console.print(f"\n[bold green]{_auto_msg(lang, 'start')}[/bold green]")
-        console.print(f"{_auto_msg(lang, 'workflow')}: {result.workflow_name}")
+        console.print(f"{_auto_msg(lang, 'workflow')}: {_result_workflow_label(result)}")
         console.print(f"{_auto_msg(lang, 'primary')}: {result.primary}")
         console.print(f"{_auto_msg(lang, 'reviewers')}: {', '.join(result.reviewers)}")
         if result.project_categories:
@@ -5126,6 +7845,8 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
         interactive_session = bool(args.interactive_decisions and sys.stdin.isatty())
         auto_cfg = config.auto_collaboration or {}
         default_controller_first = bool(auto_cfg.get("controller_first", True))
+        if args.controller_first is None and args.execution_mode == "tmux":
+            default_controller_first = False
         controller_first_enabled = (
             default_controller_first if args.controller_first is None else bool(args.controller_first)
         )
@@ -5355,13 +8076,20 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
             "controller": provider,
             "project_categories": ", ".join(result.project_categories),
             "auto_skills": ", ".join(result.suggested_skills),
-            "intent": result.intent or "",
+            "intent": getattr(result, "intent", "") or "",
+            "workflow_engine": getattr(result, "workflow_engine", "") or "",
+            "session_preset": getattr(result, "session_preset", "") or "",
+            "workflow_blueprint": getattr(result, "workflow_blueprint", "") or "",
             "interactive": bool(args.interactive_decisions and sys.stdin.isatty()),
         }
         if controller_plan:
             context["controller_plan"] = json.dumps(controller_plan, ensure_ascii=False)
         workflow_manager = WorkflowManager(config)
-        workflow_manager.execute_workflow(result.workflow_name, task, context)
+        workflow_manager.execute_workflow(
+            getattr(result, "workflow_blueprint", "") or "",
+            task,
+            context,
+        )
         return
 
     console.print(f"\n[yellow]{_auto_msg(lang, 'single_mode', provider=provider)}[/yellow]")
@@ -5497,13 +8225,167 @@ def _print_project_help() -> None:
         "Management commands:\n"
         "  init, status, config, detect, list, monitor, tmux-status, tmux-capture,\n"
         "  tmux-watch, tmux-close-pane, relay-smoke, handoff, tmux-open,\n"
-        "  tmux-close-test, resume, select\n\n"
+        "  tmux-close-test, resume, select, ux-lab, ux-lab-v3\n\n"
         "Examples:\n"
         "  ai-collab \"implement JWT auth with review\"\n"
         "  ai-collab --execution-mode tmux --tmux-target inline \"deliver fullstack feature\"\n"
+        "  ai-collab resume <run_id>\n"
         "  ai-collab detect \"design API contract\" --output json\n"
+        "  ai-collab ux-lab\n"
+        "  ai-collab ux-lab-v3\n"
     , markup=False)
 
+
+def _should_offer_startup_update(args: list[str]) -> bool:
+    if not args:
+        return True
+    command = str(args[0]).strip().lower()
+    if command in {"-h", "--help", "help", "--version", "-v", "-V", "init"}:
+        return False
+    if command in {"config", "settings", "run"}:
+        return True
+    admin_only = {
+        "detect", "handoff", "list", "monitor", "relay-smoke", "resume", "select",
+        "status", "tmux-capture", "tmux-close-pane", "tmux-close-test", "tmux-open",
+        "tmux-status", "tmux-watch", "ux-lab", "ux-lab-v3",
+    }
+    return command not in admin_only
+
+
+def _prompt_update_message(lang: str, *, local_version: str, remote_version: str) -> str:
+    if lang == "zh-CN":
+        return f"检测到 PyPI 新版本 {remote_version}（当前 {local_version}）。是否先更新 ai-collab？"
+    return f"PyPI has a newer ai-collab {remote_version} (current {local_version}). Update before continuing?"
+
+
+def _maybe_offer_startup_update(args: list[str]) -> bool:
+    if not _should_offer_startup_update(args):
+        return False
+
+    config = Config.load()
+    application = getattr(config, "application", {}) or {}
+    if not bool(application.get("auto_check_updates", True)):
+        return False
+
+    result = check_pypi_update(local_version=AI_COLLAB_VERSION)
+    if result.status != "behind" or not result.remote_version:
+        return False
+
+    lang = config.ui_language if config.ui_language in I18N else "en-US"
+    question = _prompt_update_message(lang, local_version=result.local_version, remote_version=result.remote_version)
+    if not Confirm.ask(question, default=True):
+        return False
+
+    console.print("[cyan]Updating ai-collab via pip...[/cyan]" if lang == "en-US" else "[cyan]正在通过 pip 更新 ai-collab...[/cyan]")
+    updated = run_self_update()
+    if updated:
+        console.print("[green]Update completed. Please rerun your command.[/green]" if lang == "en-US" else "[green]更新完成，请重新运行刚才的命令。[/green]")
+        return True
+
+    console.print("[yellow]Update failed, continuing with current version.[/yellow]" if lang == "en-US" else "[yellow]更新失败，将继续使用当前版本。[/yellow]")
+    return False
+
+
+def _rewrite_resume_shortcut_args(args: list[str]) -> list[str]:
+    """Support `ai-collab resume <run_id>` as shortcut for `resume recover`."""
+    if not args or str(args[0]).strip().lower() != "resume":
+        return args
+    if len(args) < 2:
+        return args
+    second = str(args[1]).strip()
+    if not second:
+        return args
+    known = {"list", "prune", "show", "rename", "recover", "help"}
+    if second.startswith("-") or second.lower() in known:
+        return args
+    return ["resume", "recover", *args[1:]]
+
+
+def _entry_prompt_copy(lang: str) -> dict[str, Any]:
+    return {
+        "en-US": {
+            "title": "ai-collab",
+            "hint": "Choose a common entry flow.",
+            "note": "Guided mode keeps the default terminal entry lightweight before you drop into a deeper surface.",
+            "items": [
+                ("1", "Start task", "Open the formal launcher for a new task."),
+                ("2", "Open config", "Adjust long-term defaults and personal preferences."),
+                ("3", "Run init", "Revisit bootstrap defaults from the beginning."),
+            ],
+            "quit": "Quit",
+            "footer_text": "Type a number · Enter confirm · q quit",
+            "footer_live": "↑/↓ move · Enter confirm · q quit · Esc cancel",
+        },
+        "zh-CN": {
+            "title": "ai-collab",
+            "hint": "选择一个常用入口。",
+            "note": "引导模式先保持终端入口轻量，再按需要进入更深一层的操作界面。",
+            "items": [
+                ("1", "开始新任务", "进入正式 Launcher，开始一次新的任务流程。"),
+                ("2", "打开配置", "调整长期默认项与个人偏好。"),
+                ("3", "重新初始化", "从头重新确认启动默认值。"),
+            ],
+            "quit": "退出",
+            "footer_text": "输入数字 · Enter 确认 · q 退出",
+            "footer_live": "↑/↓ 移动 · Enter 确认 · q 退出 · Esc 取消",
+        },
+    }[lang]
+
+
+def _entry_prompt_fragments(config_obj: Config, *, pointed_value: str = "1") -> list[tuple[str, str]]:
+    from ai_collab.entry_prompt import _entry_prompt_fragments as _impl
+
+    return _impl(config_obj, pointed_value=pointed_value)
+
+def _render_entry_prompt_screen(
+    config_obj: Config,
+    *,
+    console_obj: Console,
+    clear_screen: bool,
+    pointed_value: str | None = None,
+    live: bool = False,
+) -> list[tuple[str, str, str]]:
+    from ai_collab.entry_prompt import _render_entry_prompt_screen as _impl
+
+    return _impl(
+        config_obj,
+        console_obj=console_obj,
+        clear_screen=clear_screen,
+        pointed_value=pointed_value,
+        live=live,
+    )
+
+def _select_entry_prompt_with_prompt_toolkit(
+    config_obj: Config,
+    *,
+    console_obj: Console,
+    clear_screen: bool,
+) -> str:
+    from ai_collab.entry_prompt import _select_entry_prompt_with_prompt_toolkit as _impl
+
+    return _impl(config_obj, console_obj=console_obj, clear_screen=clear_screen)
+
+def run_entry_prompt(
+    config_obj: Config,
+    *,
+    input_fn: Callable[..., str] | None = None,
+    selector_fn: Callable[..., str] | None = None,
+    console_obj: Console | None = None,
+    clear_screen: bool = True,
+) -> None:
+    """Thin guided entry aligned with init/config prompt style."""
+    from ai_collab.entry_prompt import run_entry_prompt as _impl
+
+    console_obj = console_obj or console
+    return _impl(
+        config_obj,
+        input_fn=input_fn,
+        selector_fn=selector_fn,
+        console_obj=console_obj,
+        clear_screen=clear_screen,
+        dispatch_command=lambda args: main.main(args=args, prog_name="ai-collab", standalone_mode=True),
+        cwd=Path.cwd(),
+    )
 
 def project_main() -> None:
     """Unified project entrypoint for ai-collab."""
@@ -5513,11 +8395,13 @@ def project_main() -> None:
         "detect",
         "handoff",
         "init",
+        "launch",
         "list",
         "monitor",
         "relay-smoke",
         "resume",
         "select",
+        "settings",
         "status",
         "tmux-capture",
         "tmux-close-pane",
@@ -5525,6 +8409,8 @@ def project_main() -> None:
         "tmux-open",
         "tmux-status",
         "tmux-watch",
+        "ux-lab",
+        "ux-lab-v3",
     }
 
     if args and args[0] in {"-h", "--help", "help"}:
@@ -5533,6 +8419,19 @@ def project_main() -> None:
 
     if args and args[0] in {"--version", "-V"}:
         main.main(args=["--version"], prog_name="ai-collab", standalone_mode=True)
+        return
+
+    args = _rewrite_resume_shortcut_args(args)
+
+    if _maybe_offer_startup_update(args):
+        return
+
+    if not args:
+        config_obj = Config.load()
+        if str(getattr(config_obj, "entry_surface", "guided") or "guided") == "guided":
+            run_entry_prompt(config_obj)
+            return
+        runner_main(argv=[], prog_name="ai-collab")
         return
 
     if args and args[0] in admin_commands:

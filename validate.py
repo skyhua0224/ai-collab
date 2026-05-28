@@ -72,17 +72,10 @@ def test_detector():
                     "patterns": ["test"],
                     "primary": "claude",
                     "reviewers": ["codex"],
-                    "workflow": "test-workflow",
+                    "session_preset": "auto",
+                    "workflow_blueprint": "delivery-loop",
                 }
             ],
-        }
-        config.workflows = {
-            "test-workflow": {
-                "description": "Test workflow",
-                "phases": [
-                    {"agent": "claude", "action": "test", "output": "result"}
-                ],
-            }
         }
 
         detector = CollaborationDetector(config)
@@ -90,7 +83,9 @@ def test_detector():
 
         # Should detect collaboration
         assert result.need_collaboration is True
-        assert result.trigger == "test"
+        assert result.workflow_engine == "v2"
+        assert result.workflow_blueprint
+        assert result.execution_mode == "multi-agent"
 
         print("✅ Collaboration detector working")
         return True

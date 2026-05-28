@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from ai_collab.core.config import Config, ProviderConfig, QualityGateConfig
+from ai_collab.core.config import (
+    RECOMMENDED_INTENT_PREFERENCES,
+    Config,
+    ProviderConfig,
+    QualityGateConfig,
+    resolve_collaboration_role_leads,
+)
 
 
 def test_create_default_config():
@@ -74,36 +80,29 @@ def test_config_save_and_load(tmp_path):
         Config.get_config_dir = original_get_config_dir
 
 
-def test_config_with_workflows(tmp_path):
-    """Test configuration with workflows."""
+def test_config_load_strips_legacy_workflow_sections(tmp_path):
+    """Loading config should drop deprecated workflow storage and rewrite clean JSON."""
     config = Config.create_default()
-    config.workflows = {
-        "test-workflow": {
-            "description": "Test workflow",
-            "phases": [
-                {"agent": "claude", "action": "test", "output": "result"}
-            ],
-        }
-    }
-
-    # Mock config directory
     original_get_config_dir = Config.get_config_dir
     Config.get_config_dir = classmethod(lambda cls: tmp_path)
 
     try:
-        # Save config
-        config.save()
+        data = config.model_dump()
+        data["workflows"] = {
+            "old-flow": {
+                "description": "Deprecated workflow",
+                "phases": [{"agent": "claude", "action": "review", "output": "notes"}],
+            }
+        }
+        (tmp_path / "config.json").write_text(json.dumps(data), encoding="utf-8")
+        (tmp_path / "workflows.json").write_text("{}", encoding="utf-8")
 
-        # Check workflows file exists
-        workflows_file = tmp_path / "workflows.json"
-        assert workflows_file.exists()
+        loaded = Config.load()
 
-        # Load config
-        loaded_config = Config.load()
-
-        assert "test-workflow" in loaded_config.workflows
-        assert loaded_config.workflows["test-workflow"]["description"] == "Test workflow"
-
+        assert not hasattr(loaded, "workflows")
+        persisted = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+        assert "workflows" not in persisted
+        assert (tmp_path / "workflows.json").exists()
     finally:
         Config.get_config_dir = original_get_config_dir
 
@@ -128,7 +127,7 @@ def test_apply_template_defaults_migrates_model_ids():
                 "model_selection": "default",
             },
             "codex": {
-                "cli": "codex exec --model gpt-5.3-codex",
+                "cli": "codex exec --model gpt-5.4",
                 "enabled": True,
                 "timeout": 300,
                 "strengths": [],
@@ -150,7 +149,6 @@ def test_apply_template_defaults_migrates_model_ids():
         },
         "delegation_strategy": "auto",
         "quality_gate": {"enabled": True, "threshold": 75},
-        "workflows": {},
         "auto_collaboration": {"enabled": True, "auto_orchestration_enabled": True, "triggers": []},
     }
 
@@ -162,3 +160,148 @@ def test_apply_template_defaults_migrates_model_ids():
     assert merged["providers"]["claude"]["models"]["powerful"]["model"] == "claude-opus-4-6"
     assert merged["providers"]["gemini"]["model_selection"] == "powerful"
     assert merged["providers"]["gemini"]["models"]["auto_route_default"] is False
+
+
+
+def test_create_default_config_includes_routing_preferences():
+    config = Config.create_default()
+
+    assert config.routing["mode"] == "recommended"
+    assert config.routing["cost_bias"] == "balanced"
+    assert config.routing["intent_preferences"]["implementation"][0] == "codex"
+    assert config.auto_collaboration["preset"] == "auto-route"
+    assert config.auto_collaboration["default_session_preset"] == "auto"
+    assert config.auto_collaboration["workflow_engine"] == "v2"
+
+
+def test_recommended_routing_aligns_with_product_role_split():
+    assert RECOMMENDED_INTENT_PREFERENCES["architecture"][0] == "gemini"
+    assert RECOMMENDED_INTENT_PREFERENCES["implementation"][0] == "codex"
+    assert RECOMMENDED_INTENT_PREFERENCES["testing"][0] == "claude"
+
+    leads = resolve_collaboration_role_leads(Config.create_default())
+
+    assert leads["research"] == "gemini"
+    assert leads["architecture"] == "gemini"
+    assert leads["implementation"] == "codex"
+    assert leads["testing"] == "claude"
+
+
+def test_create_default_config_includes_economics_preferences():
+    config = Config.create_default()
+
+    assert config.economics["pricing_mode"] == "disabled"
+    assert config.economics["providers"]["codex"]["billing_mode"] == "unconfigured"
+    assert config.economics["providers"]["claude"]["billing_mode"] == "unconfigured"
+    assert config.economics["providers"]["gemini"]["billing_mode"] == "unconfigured"
+
+
+def test_apply_template_defaults_adds_economics_section():
+    data = {
+        "version": "1.1",
+        "ui_language": "zh-CN",
+        "current_controller": "codex",
+        "providers": {
+            "claude": {"cli": "claude", "enabled": True, "timeout": 120, "strengths": [], "models": {}, "model_selection": "default"},
+            "codex": {"cli": "codex exec --model gpt-5.4", "enabled": True, "timeout": 300, "strengths": [], "models": {}, "model_selection": "default"},
+            "gemini": {"cli": "gemini -o text --approval-mode yolo", "enabled": True, "timeout": 600, "strengths": [], "models": {}, "model_selection": "powerful"},
+        },
+        "delegation_strategy": "auto",
+        "quality_gate": {"enabled": True, "threshold": 75},
+        "routing": {"mode": "recommended", "cost_bias": "balanced", "intent_preferences": {}},
+        "auto_collaboration": {"enabled": True, "auto_orchestration_enabled": True, "triggers": []},
+    }
+
+    merged, changed = Config._apply_template_defaults(data)
+
+    assert changed is True
+    assert merged["economics"]["pricing_mode"] == "disabled"
+    assert merged["economics"]["providers"]["codex"]["billing_mode"] == "unconfigured"
+    assert merged["economics"]["providers"]["claude"]["quota_window"] == "none"
+
+
+def test_apply_template_defaults_upgrades_legacy_trigger_workflow_field() -> None:
+    data = {
+        "version": "1.1",
+        "ui_language": "zh-CN",
+        "current_controller": "codex",
+        "providers": {
+            "claude": {"cli": "claude", "enabled": True, "timeout": 120, "strengths": [], "models": {}, "model_selection": "default"},
+            "codex": {"cli": "codex exec --model gpt-5.4", "enabled": True, "timeout": 300, "strengths": [], "models": {}, "model_selection": "default"},
+            "gemini": {"cli": "gemini -o text --approval-mode yolo", "enabled": True, "timeout": 600, "strengths": [], "models": {}, "model_selection": "powerful"},
+        },
+        "delegation_strategy": "auto",
+        "quality_gate": {"enabled": True, "threshold": 75},
+        "routing": {"mode": "recommended", "cost_bias": "balanced", "intent_preferences": {}},
+        "auto_collaboration": {
+            "enabled": True,
+            "auto_orchestration_enabled": True,
+            "triggers": [
+                {
+                    "name": "docs-writing",
+                    "description": "Documentation tasks",
+                    "patterns": ["doc", "readme"],
+                    "primary": "claude",
+                    "reviewers": ["gemini"],
+                    "workflow": "docs-review",
+                }
+            ],
+        },
+    }
+
+    merged, changed = Config._apply_template_defaults(data)
+    trigger = merged["auto_collaboration"]["triggers"][0]
+
+    assert changed is True
+    assert "workflow" not in trigger
+    assert "legacy_workflow" not in trigger
+    assert trigger["session_preset"] == "document-first"
+    assert trigger["workflow_blueprint"] == "document-loop"
+
+
+def test_apply_template_defaults_does_not_map_deprecated_workflow_name_for_unknown_trigger() -> None:
+    data = {
+        "version": "1.1",
+        "ui_language": "zh-CN",
+        "current_controller": "codex",
+        "providers": {
+            "claude": {"cli": "claude", "enabled": True, "timeout": 120, "strengths": [], "models": {}, "model_selection": "default"},
+            "codex": {"cli": "codex exec --model gpt-5.4", "enabled": True, "timeout": 300, "strengths": [], "models": {}, "model_selection": "default"},
+            "gemini": {"cli": "gemini -o text --approval-mode yolo", "enabled": True, "timeout": 600, "strengths": [], "models": {}, "model_selection": "powerful"},
+        },
+        "delegation_strategy": "auto",
+        "quality_gate": {"enabled": True, "threshold": 75},
+        "routing": {"mode": "recommended", "cost_bias": "balanced", "intent_preferences": {}},
+        "auto_collaboration": {
+            "enabled": True,
+            "auto_orchestration_enabled": True,
+            "triggers": [
+                {
+                    "name": "custom-review",
+                    "description": "Custom trigger",
+                    "patterns": ["review"],
+                    "primary": "claude",
+                    "reviewers": ["codex"],
+                    "workflow": "docs-review",
+                }
+            ],
+        },
+    }
+
+    merged, changed = Config._apply_template_defaults(data)
+    trigger = merged["auto_collaboration"]["triggers"][0]
+
+    assert changed is True
+    assert "workflow" not in trigger
+    assert "legacy_workflow" not in trigger
+    assert "workflow_blueprint" not in trigger
+
+
+def test_create_default_config_includes_app_and_billing_strategy_defaults():
+    config = Config.create_default()
+
+    assert config.application["auto_check_updates"] is True
+    assert config.economics["quota_strategy"] == "balanced"
+    assert config.economics["cross_provider_fallback"] == "same-provider-first"
+    assert "xhigh" in config.providers["codex"].models["enabled_profiles"]
+    assert config.providers["codex"].models["default_model"] == "gpt-5.4"

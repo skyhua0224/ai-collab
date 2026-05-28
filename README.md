@@ -109,6 +109,7 @@ ai-collab --dry-run --output json "<task>"
 
 - [快速开始指南](./QUICKSTART.md)
 - [详细使用文档](./docs/USAGE.md)
+- [vNext Rust 平台架构基准](./docs/VNEXT_RUST_PLATFORM_ARCHITECTURE_ZH.md)
 - [版本发布流程](./docs/RELEASE.md)
 
 ## 开发与验证

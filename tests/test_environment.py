@@ -12,7 +12,7 @@ def test_detect_os_name_variants():
 
 
 def test_resolve_executable_from_cli():
-    assert resolve_executable("codex exec --model gpt-5.3-codex") == "codex"
+    assert resolve_executable("codex exec --model gpt-5.4") == "codex"
     assert resolve_executable("claude --model opus-4.6") == "claude"
     assert resolve_executable("gemini -o text --approval-mode yolo") == "gemini"
 

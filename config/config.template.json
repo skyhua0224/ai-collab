@@ -1,16 +1,28 @@
 {
-  "version": "1.1",
+  "version": "1.2",
   "ui_language": "en-US",
+  "entry_surface": "guided",
+  "runtime_mode": "tmux",
   "current_controller": "codex",
   "providers": {
     "claude": {
       "cli": "claude",
       "enabled": true,
       "timeout": 120,
-      "strengths": ["reasoning", "code-review", "architecture", "documentation", "security"],
+      "strengths": [
+        "reasoning",
+        "code-review",
+        "architecture",
+        "documentation",
+        "security"
+      ],
       "models": {
         "default": "claude-sonnet-4-6",
-        "enabled_profiles": ["default", "cost_effective", "powerful"],
+        "enabled_profiles": [
+          "default",
+          "cost_effective",
+          "powerful"
+        ],
         "cost_effective": {
           "model": "claude-haiku-4-5",
           "flag": "--model claude-haiku-4-5",
@@ -25,27 +37,43 @@
       "model_selection": "default"
     },
     "codex": {
-      "cli": "codex exec --model gpt-5.3-codex",
+      "cli": "codex exec --model gpt-5.4",
       "enabled": true,
       "timeout": 300,
-      "strengths": ["implementation", "testing", "debugging", "integration", "backend"],
+      "strengths": [
+        "implementation",
+        "testing",
+        "debugging",
+        "integration",
+        "backend"
+      ],
       "models": {
         "default_thinking": "high",
-        "enabled_profiles": ["low", "medium", "high"],
+        "enabled_profiles": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ],
         "thinking_levels": {
           "low": {
             "flag": "--thinking low",
-            "description": "Simple tasks (formatting, small edits)"
+            "description": "Quick execution for tiny edits, cleanup, and terminal checks"
           },
           "medium": {
             "flag": "--thinking medium",
-            "description": "Feature implementation and refactoring"
+            "description": "Standard development for routine features, refactors, and focused fixes"
           },
           "high": {
             "flag": "--thinking high",
-            "description": "Complex architecture and multi-module logic"
+            "description": "Deep development for multi-file implementation and integration work"
+          },
+          "xhigh": {
+            "flag": "--thinking xhigh",
+            "description": "Max-depth mode for hard planning, architecture tradeoffs, and long-horizon changes"
           }
-        }
+        },
+        "default_model": "gpt-5.4"
       },
       "model_selection": "default"
     },
@@ -53,10 +81,20 @@
       "cli": "gemini -o text --approval-mode yolo",
       "enabled": true,
       "timeout": 600,
-      "strengths": ["visual-design", "html-css", "research", "ecosystem", "frontend"],
+      "strengths": [
+        "visual-design",
+        "html-css",
+        "research",
+        "ecosystem",
+        "frontend"
+      ],
       "models": {
         "auto_route_default": false,
-        "enabled_profiles": ["auto", "cost_effective", "powerful"],
+        "enabled_profiles": [
+          "auto",
+          "cost_effective",
+          "powerful"
+        ],
         "cost_effective": {
           "model": "gemini-3-flash-preview",
           "flag": "--model gemini-3-flash-preview",
@@ -79,6 +117,8 @@
   "auto_collaboration": {
     "enabled": true,
     "auto_orchestration_enabled": true,
+    "default_session_preset": "auto",
+    "workflow_engine": "v2",
     "controller_first": true,
     "planner_first": true,
     "project_profiles_enabled": true,
@@ -91,11 +131,26 @@
       "deliver": "quality-auditor"
     },
     "persona_skill_map": {
-      "research-analyst": ["ecosystem-research", "alternatives-matrix"],
-      "requirements-architect": ["scope-control", "tradeoff-analysis"],
-      "implementation-engineer": ["feature-implementation", "integration-check"],
-      "quality-auditor": ["code-review", "risk-review"],
-      "security-auditor": ["security-review", "owasp-checklist"]
+      "research-analyst": [
+        "ecosystem-research",
+        "alternatives-matrix"
+      ],
+      "requirements-architect": [
+        "scope-control",
+        "tradeoff-analysis"
+      ],
+      "implementation-engineer": [
+        "feature-implementation",
+        "integration-check"
+      ],
+      "quality-auditor": [
+        "code-review",
+        "risk-review"
+      ],
+      "security-auditor": [
+        "security-review",
+        "owasp-checklist"
+      ]
     },
     "phase_completion_criteria": {
       "default": {
@@ -165,133 +220,420 @@
       }
     },
     "skill_map": {
-      "visual-design": ["frontend-mockup-designer", "dark-mode-consistency", "responsive-layout"],
-      "architecture": ["architecture-review", "tradeoff-analysis"],
-      "implementation": ["feature-implementation", "integration-check"],
-      "fullstack-superapp": ["widget-system", "api-integration", "state-management"],
-      "macos-native": ["swift-native", "cocoa-lifecycle", "audio-pipeline"],
-      "mobile-native": ["mobile-native", "offline-sync", "performance"],
-      "systems-tooling": ["cli-tooling", "automation", "release-pipeline"],
-      "game-dev": ["gameplay-loop", "state-machine", "performance"],
-      "debugging": ["systematic-debugging", "regression-hunt"],
-      "security-audit": ["security-review", "owasp-checklist"],
-      "research": ["ecosystem-research", "alternatives-matrix"],
-      "testing": ["tdd", "coverage-validation"],
-      "docs-writing": ["technical-writing", "editorial-review"]
+      "visual-design": [
+        "frontend-mockup-designer",
+        "dark-mode-consistency",
+        "responsive-layout"
+      ],
+      "architecture": [
+        "architecture-review",
+        "tradeoff-analysis"
+      ],
+      "implementation": [
+        "feature-implementation",
+        "integration-check"
+      ],
+      "fullstack-superapp": [
+        "widget-system",
+        "api-integration",
+        "state-management"
+      ],
+      "macos-native": [
+        "swift-native",
+        "cocoa-lifecycle",
+        "audio-pipeline"
+      ],
+      "mobile-native": [
+        "mobile-native",
+        "offline-sync",
+        "performance"
+      ],
+      "systems-tooling": [
+        "cli-tooling",
+        "automation",
+        "release-pipeline"
+      ],
+      "game-dev": [
+        "gameplay-loop",
+        "state-machine",
+        "performance"
+      ],
+      "debugging": [
+        "systematic-debugging",
+        "regression-hunt"
+      ],
+      "security-audit": [
+        "security-review",
+        "owasp-checklist"
+      ],
+      "research": [
+        "ecosystem-research",
+        "alternatives-matrix"
+      ],
+      "testing": [
+        "tdd",
+        "coverage-validation"
+      ],
+      "docs-writing": [
+        "technical-writing",
+        "editorial-review"
+      ]
     },
     "profile_skill_map": {
-      "docs-text": ["technical-writing", "editorial-review"],
-      "superapp-fullstack": ["frontend-mockup-designer", "api-integration", "code-review"],
-      "macos-swift": ["swift-native", "debugging", "code-review"],
-      "mobile-native": ["mobile-native", "testing", "security-review"],
-      "systems-tooling": ["cli-tooling", "automation", "testing"],
-      "game-dev": ["game-design", "state-machine", "performance"]
+      "docs-text": [
+        "technical-writing",
+        "editorial-review"
+      ],
+      "superapp-fullstack": [
+        "frontend-mockup-designer",
+        "api-integration",
+        "code-review"
+      ],
+      "macos-swift": [
+        "swift-native",
+        "debugging",
+        "code-review"
+      ],
+      "mobile-native": [
+        "mobile-native",
+        "testing",
+        "security-review"
+      ],
+      "systems-tooling": [
+        "cli-tooling",
+        "automation",
+        "testing"
+      ],
+      "game-dev": [
+        "game-design",
+        "state-machine",
+        "performance"
+      ]
     },
     "triggers": [
       {
         "name": "visual-design",
         "description": "Visual design and HTML/CSS tasks",
-        "patterns": ["html", "css", "mockup", "design", "ui", "界面", "设计", "交互", "布局"],
+        "patterns": [
+          "html",
+          "css",
+          "mockup",
+          "design",
+          "ui",
+          "\u754c\u9762",
+          "\u8bbe\u8ba1",
+          "\u4ea4\u4e92",
+          "\u5e03\u5c40"
+        ],
         "primary": "gemini",
-        "reviewers": ["claude"],
-        "workflow": "design-review"
+        "reviewers": [
+          "claude"
+        ],
+        "session_preset": "design-first",
+        "workflow_blueprint": "design-led-loop"
       },
       {
         "name": "architecture",
         "description": "System architecture and design decisions",
-        "patterns": ["architecture", "design pattern", "refactor", "架构", "重构", "方案", "模块划分"],
+        "patterns": [
+          "architecture",
+          "design pattern",
+          "refactor",
+          "\u67b6\u6784",
+          "\u91cd\u6784",
+          "\u65b9\u6848",
+          "\u6a21\u5757\u5212\u5206"
+        ],
         "primary": "claude",
-        "reviewers": ["codex", "gemini"],
-        "workflow": "architecture-review"
+        "reviewers": [
+          "codex",
+          "gemini"
+        ],
+        "session_preset": "research-priority",
+        "workflow_blueprint": "research-loop"
       },
       {
         "name": "implementation",
         "description": "Feature implementation and coding",
-        "patterns": ["implement", "feature", "function", "实现", "功能", "开发", "落地"],
+        "patterns": [
+          "implement",
+          "feature",
+          "function",
+          "\u5b9e\u73b0",
+          "\u529f\u80fd",
+          "\u5f00\u53d1",
+          "\u843d\u5730"
+        ],
         "primary": "codex",
-        "reviewers": ["claude"],
-        "workflow": "code-review"
+        "reviewers": [
+          "claude"
+        ],
+        "session_preset": "auto",
+        "workflow_blueprint": "delivery-loop"
       },
       {
         "name": "fullstack-superapp",
         "description": "Complex full-stack superapp development",
-        "patterns": ["小程序", "vue", "react", "spring", "backend", "docker", "全链路", "admin", "web client", "pp"],
+        "patterns": [
+          "\u5c0f\u7a0b\u5e8f",
+          "vue",
+          "react",
+          "spring",
+          "backend",
+          "docker",
+          "\u5168\u94fe\u8def",
+          "admin",
+          "web client",
+          "pp"
+        ],
         "primary": "codex",
-        "reviewers": ["claude", "gemini"],
-        "workflow": "full-stack"
+        "reviewers": [
+          "claude",
+          "gemini"
+        ],
+        "session_preset": "design-first",
+        "workflow_blueprint": "design-led-loop"
       },
       {
         "name": "macos-native",
         "description": "Native macOS Swift development",
-        "patterns": ["macos", "swift", "xcode", "cocoa", "moonlight", "appkit", "metal"],
+        "patterns": [
+          "macos",
+          "swift",
+          "xcode",
+          "cocoa",
+          "moonlight",
+          "appkit",
+          "metal"
+        ],
         "primary": "codex",
-        "reviewers": ["claude", "gemini"],
-        "workflow": "native-macos"
+        "reviewers": [
+          "claude",
+          "gemini"
+        ],
+        "session_preset": "auto",
+        "workflow_blueprint": "delivery-loop"
       },
       {
         "name": "mobile-native",
         "description": "Native Android/iOS development",
-        "patterns": ["android", "ios", "swiftui", "kotlin", "jetpack", "xcodeproj", "gradle"],
+        "patterns": [
+          "android",
+          "ios",
+          "swiftui",
+          "kotlin",
+          "jetpack",
+          "xcodeproj",
+          "gradle"
+        ],
         "primary": "codex",
-        "reviewers": ["claude", "gemini"],
-        "workflow": "mobile-native"
+        "reviewers": [
+          "claude",
+          "gemini"
+        ],
+        "session_preset": "auto",
+        "workflow_blueprint": "delivery-loop"
       },
       {
         "name": "systems-tooling",
         "description": "Systems-level tooling with bash/python/node/rust",
-        "patterns": ["bash", "python", "nodejs", "rust", "cli", "脚本", "自动化", "pipeline", "工具链"],
+        "patterns": [
+          "bash",
+          "python",
+          "nodejs",
+          "rust",
+          "cli",
+          "\u811a\u672c",
+          "\u81ea\u52a8\u5316",
+          "pipeline",
+          "\u5de5\u5177\u94fe"
+        ],
         "primary": "codex",
-        "reviewers": ["claude"],
-        "workflow": "systems-tooling"
+        "reviewers": [
+          "claude"
+        ],
+        "session_preset": "auto",
+        "workflow_blueprint": "delivery-loop"
       },
       {
         "name": "game-dev",
         "description": "Game development with Unity/UE/Ren'Py",
-        "patterns": ["unity", "unreal", "ue", "renpy", "game", "游戏", "战斗", "关卡", "状态机"],
+        "patterns": [
+          "unity",
+          "unreal",
+          "ue",
+          "renpy",
+          "game",
+          "\u6e38\u620f",
+          "\u6218\u6597",
+          "\u5173\u5361",
+          "\u72b6\u6001\u673a"
+        ],
         "primary": "gemini",
-        "reviewers": ["codex", "claude"],
-        "workflow": "game-dev"
+        "reviewers": [
+          "codex",
+          "claude"
+        ],
+        "session_preset": "design-first",
+        "workflow_blueprint": "design-led-loop"
       },
       {
         "name": "debugging",
         "description": "Bug diagnosis and fix",
-        "patterns": ["debug", "调试", "fix", "bug", "crash", "错误", "问题"],
+        "patterns": [
+          "debug",
+          "\u8c03\u8bd5",
+          "fix",
+          "bug",
+          "crash",
+          "\u9519\u8bef",
+          "\u95ee\u9898"
+        ],
         "primary": "codex",
-        "reviewers": ["claude"],
-        "workflow": "debug-fix-verify"
+        "reviewers": [
+          "claude"
+        ],
+        "session_preset": "debug-priority",
+        "workflow_blueprint": "diagnose-loop"
       },
       {
         "name": "security-audit",
         "description": "Security scanning and remediation",
-        "patterns": ["security", "安全", "漏洞", "audit", "owasp", "证书", "认证"],
+        "patterns": [
+          "security",
+          "\u5b89\u5168",
+          "\u6f0f\u6d1e",
+          "audit",
+          "owasp",
+          "\u8bc1\u4e66",
+          "\u8ba4\u8bc1"
+        ],
         "primary": "claude",
-        "reviewers": ["codex", "gemini"],
-        "workflow": "security-remediation"
+        "reviewers": [
+          "codex",
+          "gemini"
+        ],
+        "session_preset": "validation-first",
+        "workflow_blueprint": "validation-loop"
       },
       {
         "name": "research",
         "description": "Research and alternatives analysis",
-        "patterns": ["research", "调研", "探索", "对比", "study", "benchmark", "比较"],
+        "patterns": [
+          "research",
+          "\u8c03\u7814",
+          "\u63a2\u7d22",
+          "\u5bf9\u6bd4",
+          "study",
+          "benchmark",
+          "\u6bd4\u8f83"
+        ],
         "primary": "gemini",
-        "reviewers": ["claude"],
-        "workflow": "research-synthesis"
+        "reviewers": [
+          "claude"
+        ],
+        "session_preset": "research-priority",
+        "workflow_blueprint": "research-loop"
       },
       {
         "name": "testing",
         "description": "Test planning and execution",
-        "patterns": ["test", "测试", "tdd", "coverage", "回归", "验证"],
+        "patterns": [
+          "test",
+          "\u6d4b\u8bd5",
+          "tdd",
+          "coverage",
+          "\u56de\u5f52",
+          "\u9a8c\u8bc1"
+        ],
         "primary": "codex",
-        "reviewers": ["claude"],
-        "workflow": "test-driven"
+        "reviewers": [
+          "claude"
+        ],
+        "session_preset": "validation-first",
+        "workflow_blueprint": "validation-loop"
       },
       {
         "name": "docs-writing",
         "description": "Documentation and blog editing",
-        "patterns": ["文档", "博客", "blog", "文章", "readme", "教程", "说明"],
+        "patterns": [
+          "\u6587\u6863",
+          "\u535a\u5ba2",
+          "blog",
+          "\u6587\u7ae0",
+          "readme",
+          "\u6559\u7a0b",
+          "\u8bf4\u660e"
+        ],
         "primary": "claude",
-        "reviewers": ["gemini"],
-        "workflow": "docs-review"
+        "reviewers": [
+          "gemini"
+        ],
+        "session_preset": "document-first",
+        "workflow_blueprint": "document-loop"
       }
-    ]
+    ],
+    "preset": "auto-route"
+  },
+  "routing": {
+    "mode": "recommended",
+    "cost_bias": "balanced",
+    "intent_preferences": {
+      "implementation": [
+        "codex",
+        "claude",
+        "gemini"
+      ],
+      "codebase_understanding": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "research": [
+        "gemini",
+        "claude",
+        "codex"
+      ],
+      "architecture": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "testing": [
+        "codex",
+        "claude",
+        "gemini"
+      ],
+      "multimodal": [
+        "gemini",
+        "claude",
+        "codex"
+      ]
+    }
+  },
+  "economics": {
+    "pricing_mode": "disabled",
+    "providers": {
+      "codex": {
+        "billing_mode": "unconfigured",
+        "quota_window": "none",
+        "relative_cost_tier": "standard"
+      },
+      "claude": {
+        "billing_mode": "unconfigured",
+        "quota_window": "none",
+        "relative_cost_tier": "standard"
+      },
+      "gemini": {
+        "billing_mode": "unconfigured",
+        "quota_window": "none",
+        "relative_cost_tier": "standard"
+      }
+    },
+    "quota_strategy": "balanced",
+    "cross_provider_fallback": "same-provider-first"
+  },
+  "application": {
+    "auto_check_updates": true
   }
 }

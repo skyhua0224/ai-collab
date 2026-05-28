@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 from ai_collab.core.config import Config
-from ai_collab.core.workflow import WorkflowManager
+from ai_collab.core.workflow import WorkflowManager, WorkflowPhase
 
 
 @pytest.fixture
@@ -35,8 +35,8 @@ def config() -> Config:
         },
         "phase_completion_criteria": {
             "default": {"min_output_chars": 40},
-            "discover": {"min_output_chars": 60},
-            "develop": {"min_output_chars": 80},
+            "collect": {"min_output_chars": 60},
+            "execute": {"min_output_chars": 80},
         },
         "escalation_policy": {
             "max_retries": 1,
@@ -57,46 +57,34 @@ def _err(stderr: str = "failed") -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(args=["fake"], returncode=1, stdout="", stderr=stderr)
 
 
-def test_auto_assign_persona_and_activate_skills(config: Config, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Workflow should auto-assign persona and merge persona + auto skills into prompt."""
-    config.workflows = {
-        "impl-workflow": {
-            "description": "Implementation workflow",
-            "phases": [
-                {
-                    "agent": "codex",
-                    "action": "develop",
-                    "output": "feature patch",
-                    "skills": ["tests-first"],
-                }
-            ],
-        }
-    }
-
-    captured_prompts: list[str] = []
-
-    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        captured_prompts.append(str(cmd[-1]))
-        return _ok(
-            "Implementation complete with tests, integration notes, rollback plan, and risk checklist."
-        )
-
-    monkeypatch.setattr("ai_collab.core.workflow.subprocess.run", fake_run)
-
+def test_resolve_execute_phase_assigns_implementation_persona_and_skills(config: Config) -> None:
+    """V2 execute stage should resolve to implementation persona and merged skills."""
     manager = WorkflowManager(config)
-    results = manager.execute_workflow(
-        "impl-workflow",
-        "Implement auth flow",
-        {"auto_skills": "systematic-debugging"},
+    phase = WorkflowPhase(
+        agent="codex",
+        action="execute:execute-change",
+        output="feature patch",
+        skills=["tests-first"],
+        responsibility_stage="execute",
+        goal="Implement the requested change",
     )
 
-    assert results["phase_1"]["success"] is True
-    assert results["phase_1"]["persona"] == "implementation-engineer"
-    assert "feature-implementation" in results["phase_1"]["active_skills"]
-    assert "systematic-debugging" in results["phase_1"]["active_skills"]
-    assert "Persona: implementation-engineer" in captured_prompts[0]
-    assert "feature-implementation" in captured_prompts[0]
-    assert "systematic-debugging" in captured_prompts[0]
+    resolved = manager._resolve_phase_plan(phase, {"auto_skills": "systematic-debugging"})
+    prompt = manager._build_phase_prompt(
+        resolved_phase=resolved,
+        task="Implement auth flow",
+        context={"auto_skills": "systematic-debugging"},
+        previous_results={},
+        attempt=1,
+    )
+
+    assert resolved["persona"] == "implementation-engineer"
+    assert "feature-implementation" in resolved["active_skills"]
+    assert "integration-check" in resolved["active_skills"]
+    assert "systematic-debugging" in resolved["active_skills"]
+    assert "Persona: implementation-engineer" in prompt
+    assert "feature-implementation" in prompt
+    assert "systematic-debugging" in prompt
 
 
 def test_quality_completion_criteria_retries_until_satisfied(
@@ -104,12 +92,16 @@ def test_quality_completion_criteria_retries_until_satisfied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Short outputs should fail completion criteria and trigger retry."""
-    config.workflows = {
-        "discover-workflow": {
-            "description": "Discover workflow",
-            "phases": [{"agent": "gemini", "action": "discover", "output": "research notes"}],
-        }
-    }
+    manager = WorkflowManager(config)
+    resolved = manager._resolve_phase_plan(
+        WorkflowPhase(
+            agent="gemini",
+            action="collect:collect-context",
+            output="research notes",
+            responsibility_stage="collect",
+        ),
+        {},
+    )
 
     calls = {"count": 0}
 
@@ -117,26 +109,34 @@ def test_quality_completion_criteria_retries_until_satisfied(
         calls["count"] += 1
         if calls["count"] == 1:
             return _ok("too short")
-        return _ok("Long enough discover output with findings, alternatives, and trade-offs.")
+        return _ok("Long enough collect output with evidence, constraints, alternatives, and next steps.")
 
     monkeypatch.setattr("ai_collab.core.workflow.subprocess.run", fake_run)
 
-    manager = WorkflowManager(config)
-    results = manager.execute_workflow("discover-workflow", "Research options", {})
+    result = manager._execute_phase_with_policy(
+        resolved_phase=resolved,
+        task="Research options",
+        context={},
+        previous_results={},
+    )
 
     assert calls["count"] == 2
-    assert results["phase_1"]["success"] is True
-    assert results["phase_1"]["attempts"] == 2
+    assert result["success"] is True
+    assert result["attempts"] == 2
 
 
 def test_repeated_failure_triggers_codex_takeover(config: Config, monkeypatch: pytest.MonkeyPatch) -> None:
     """Repeated phase failures should trigger takeover by configured controller agent."""
-    config.workflows = {
-        "design-workflow": {
-            "description": "Design workflow",
-            "phases": [{"agent": "gemini", "action": "discover", "output": "draft"}],
-        }
-    }
+    manager = WorkflowManager(config)
+    resolved = manager._resolve_phase_plan(
+        WorkflowPhase(
+            agent="gemini",
+            action="collect:collect-context",
+            output="draft",
+            responsibility_stage="collect",
+        ),
+        {},
+    )
 
     calls = {"gemini": 0, "codex": 0}
 
@@ -147,19 +147,23 @@ def test_repeated_failure_triggers_codex_takeover(config: Config, monkeypatch: p
             return _err("gemini failed")
         if binary == "codex":
             calls["codex"] += 1
-            return _ok("Codex takeover delivered stable output with concrete actions.")
+            return _ok("Codex takeover delivered stable output with evidence, actions, and bounded risk notes.")
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr("ai_collab.core.workflow.subprocess.run", fake_run)
 
-    manager = WorkflowManager(config)
-    results = manager.execute_workflow("design-workflow", "Design widgets", {})
+    result = manager._execute_phase_with_policy(
+        resolved_phase=resolved,
+        task="Design widgets",
+        context={},
+        previous_results={},
+    )
 
     assert calls["gemini"] == 2
     assert calls["codex"] == 1
-    assert results["phase_1"]["success"] is True
-    assert results["phase_1"]["taken_over"] is True
-    assert results["phase_1"]["agent"] == "codex"
+    assert result["success"] is True
+    assert result["taken_over"] is True
+    assert result["agent"] == "codex"
 
 
 def test_repeated_failure_can_escalate_to_user_decision(
@@ -167,26 +171,29 @@ def test_repeated_failure_can_escalate_to_user_decision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When repeated failures happen on controller agent, workflow asks user for decision."""
-    config.workflows = {
-        "review-workflow": {
-            "description": "Review workflow",
-            "phases": [{"agent": "codex", "action": "deliver", "output": "final report"}],
-        }
-    }
+    manager = WorkflowManager(config)
+    resolved = manager._resolve_phase_plan(
+        WorkflowPhase(
+            agent="codex",
+            action="deliver:deliver-outcome",
+            output="final report",
+            responsibility_stage="deliver",
+        ),
+        {},
+    )
 
     monkeypatch.setattr("ai_collab.core.workflow.subprocess.run", lambda *_args, **_kwargs: _err("still failing"))
     monkeypatch.setattr("builtins.input", lambda _prompt="": "skip")
 
-    manager = WorkflowManager(config)
-    results = manager.execute_workflow(
-        "review-workflow",
-        "Deliver final report",
-        {"interactive": True},
+    result = manager._execute_phase_with_policy(
+        resolved_phase=resolved,
+        task="Deliver final report",
+        context={"interactive": True},
+        previous_results={},
     )
 
-    assert results["phase_1"]["success"] is False
-    assert results["phase_1"]["status"] == "skipped_by_user"
-    assert results["_summary"]["status"] == "completed_with_skips"
+    assert result["success"] is False
+    assert result["status"] == "skipped_by_user"
 
 
 def test_codex_cli_auto_adds_skip_repo_check_outside_git(config: Config, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -197,3 +204,85 @@ def test_codex_cli_auto_adds_skip_repo_check_outside_git(config: Config, monkeyp
     cli = manager._build_phase_cli("codex", "high")
 
     assert "--skip-git-repo-check" in cli
+
+
+def test_execute_workflow_uses_intent_routed_v2_when_no_route(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ai_collab.core.workflow.subprocess.run",
+        lambda *_args, **_kwargs: _ok(
+            "Collected context, modeled trade-offs, built an execution direction, implemented the change, "
+            "validated outcomes, corrected drift, and delivered a concise summary."
+        ),
+    )
+
+    manager = WorkflowManager(config)
+    results = manager.execute_workflow("", "实现一个新功能", {"intent": "implementation"})
+
+    assert results["_summary"]["workflow_engine"] == "v2"
+    assert results["_summary"]["workflow_blueprint"] == "delivery-loop"
+    assert results["_summary"]["compatibility_mode"] == "intent-routed-v2"
+    assert results["_summary"]["requested_route"] == ""
+    assert results["_summary"]["total_phases"] == 7
+
+
+def test_explicit_v2_blueprint_aligns_summary_session_preset(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ai_collab.core.workflow.subprocess.run",
+        lambda *_args, **_kwargs: _ok(
+            "Validation completed with acceptance notes, bounded fix guidance, and a concise handoff."
+        ),
+    )
+
+    manager = WorkflowManager(config)
+    results = manager.execute_workflow(
+        "",
+        "验收当前改动",
+        {
+            "workflow_engine": "v2",
+            "workflow_blueprint": "validation-loop",
+        },
+    )
+
+    assert results["_summary"]["workflow_engine"] == "v2"
+    assert results["_summary"]["workflow_blueprint"] == "validation-loop"
+    assert results["_summary"]["session_preset"] == "validation-first"
+    assert results["_summary"]["compatibility_mode"] == "direct-v2-blueprint"
+
+
+def test_session_preset_context_resolves_v2_route(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ai_collab.core.workflow.subprocess.run",
+        lambda *_args, **_kwargs: _ok(
+            "Document structure chosen, source material collected, final document drafted, and handoff completed."
+        ),
+    )
+
+    manager = WorkflowManager(config)
+    results = manager.execute_workflow(
+        "",
+        "写一份 README",
+        {
+            "session_preset": "document-first",
+        },
+    )
+
+    assert results["_summary"]["workflow_engine"] == "v2"
+    assert results["_summary"]["workflow_blueprint"] == "document-loop"
+    assert results["_summary"]["session_preset"] == "document-first"
+    assert results["_summary"]["compatibility_mode"] == "direct-v2-preset"
+
+
+def test_execute_workflow_rejects_unknown_route(config: Config) -> None:
+    manager = WorkflowManager(config)
+
+    with pytest.raises(ValueError, match="Unknown workflow route: code-review"):
+        manager.execute_workflow("code-review", "实现一个新功能", {})

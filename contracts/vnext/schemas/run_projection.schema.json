@@ -1,0 +1,342 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AgentKind": {
+      "enum": [
+        "codex",
+        "claude_code",
+        "gemini_cli",
+        "mock"
+      ],
+      "type": "string"
+    },
+    "ApprovalRequest": {
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "responded_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "response_note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/ApprovalStatus"
+        },
+        "step_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_at",
+        "id",
+        "reason",
+        "run_id",
+        "scope",
+        "status",
+        "title"
+      ],
+      "type": "object"
+    },
+    "ApprovalStatus": {
+      "enum": [
+        "pending",
+        "approved",
+        "denied",
+        "expired"
+      ],
+      "type": "string"
+    },
+    "Artifact": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/ArtifactKind"
+        },
+        "label": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "registered_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "label",
+        "registered_at",
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "ArtifactKind": {
+      "enum": [
+        "plan_bundle",
+        "run_summary",
+        "report",
+        "contract",
+        "mockup",
+        "skeleton",
+        "code_change",
+        "log_excerpt"
+      ],
+      "type": "string"
+    },
+    "Plan": {
+      "properties": {
+        "generated_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/definitions/PlanStep"
+          },
+          "type": "array"
+        },
+        "version": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "generated_at",
+        "id",
+        "steps",
+        "version"
+      ],
+      "type": "object"
+    },
+    "PlanStep": {
+      "properties": {
+        "assignee": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AgentKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "completed_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "done_when": {
+          "type": "string"
+        },
+        "eta_minutes": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "stage": {
+          "$ref": "#/definitions/ResponsibilityStage"
+        },
+        "started_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/StepStatus"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "done_when",
+        "id",
+        "stage",
+        "status",
+        "title"
+      ],
+      "type": "object"
+    },
+    "ResponsibilityStage": {
+      "enum": [
+        "collect",
+        "model",
+        "plan",
+        "artifact",
+        "execute",
+        "validate",
+        "correct",
+        "deliver"
+      ],
+      "type": "string"
+    },
+    "RunMetadata": {
+      "properties": {
+        "controller": {
+          "$ref": "#/definitions/AgentKind"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/definitions/RunPhase"
+        },
+        "task": {
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "controller",
+        "created_at",
+        "id",
+        "phase",
+        "task",
+        "updated_at",
+        "workspace"
+      ],
+      "type": "object"
+    },
+    "RunPhase": {
+      "enum": [
+        "created",
+        "ready",
+        "running",
+        "waiting_approval",
+        "completed",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "StepStatus": {
+      "enum": [
+        "pending",
+        "running",
+        "completed",
+        "failed",
+        "blocked"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "approvals": {
+      "items": {
+        "$ref": "#/definitions/ApprovalRequest"
+      },
+      "type": "array"
+    },
+    "artifacts": {
+      "items": {
+        "$ref": "#/definitions/Artifact"
+      },
+      "type": "array"
+    },
+    "event_count": {
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "last_sequence": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "plan": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Plan"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "run": {
+      "$ref": "#/definitions/RunMetadata"
+    }
+  },
+  "required": [
+    "approvals",
+    "artifacts",
+    "event_count",
+    "last_sequence",
+    "run"
+  ],
+  "title": "RunProjection",
+  "type": "object"
+}

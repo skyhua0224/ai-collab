@@ -58,11 +58,13 @@ def test_run_state_store_load_list_and_rebind(tmp_path) -> None:
     assert state["label"] == "nightly-rollback"
     assert state["session"] == "s2"
     assert state["controller"]["pane_id"] == "%9"
+    assert state["workspace"] == str(tmp_path)
 
     items = RunStateStore.list_runs(cwd=tmp_path, limit=10)
     assert items
     assert items[0]["run_id"] == store.run_id
     assert items[0]["status"] in {"running", "paused", "created", "completed", "degraded"}
+    assert items[0]["workspace"] == str(tmp_path)
     assert "phase" in items[0]
     assert "entry_prompt_preview" in items[0]
     assert "Read and execute task file" in items[0]["entry_prompt_preview"]
@@ -102,3 +104,27 @@ def test_run_state_store_tracks_runtime_ids_phase_and_layout_snapshots(tmp_path)
     assert state["phase"] == "monitoring"
     assert state["tmux"]["layout_hash"]
     assert len(state["tmux"]["layout_history"]) == 1
+
+
+def test_run_state_store_list_includes_short_id_name_mode_and_pending_count(tmp_path) -> None:
+    store = RunStateStore.create(
+        cwd=tmp_path,
+        session="s1",
+        controller_agent="codex",
+        controller_pane="%1",
+    )
+    store.bind_agent(
+        agent="claude",
+        pane_id="%2",
+        step_tickets=[{"step_id": "S2", "nonce": "n2"}],
+    )
+    store.set_mode(mode="tmux")
+
+    rows = RunStateStore.list_runs(cwd=tmp_path, limit=10)
+    assert rows
+    assert rows[0]["short_id"] == store.run_id.split("-")[-1]
+    assert rows[0]["name"] == rows[0]["short_id"]
+    assert rows[0]["workspace"] == str(tmp_path)
+    assert rows[0]["mode"] == "tmux"
+    assert rows[0]["pending_count"] >= 1
+    assert rows[0]["steps_progress"].endswith("done")

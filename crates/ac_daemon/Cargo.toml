@@ -1,0 +1,33 @@
+[package]
+name = "ac_daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ai-collabd"
+path = "src/main.rs"
+
+[dependencies]
+ac_core = { path = "../ac_core" }
+ac_engine = { path = "../ac_engine" }
+ac_protocol = { path = "../ac_protocol" }
+ac_storage = { path = "../ac_storage" }
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+tokio-tungstenite.workspace = true

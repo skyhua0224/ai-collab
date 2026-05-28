@@ -1,0 +1,32 @@
+{
+  "version": "ux-lab-v1",
+  "created_at": "2026-03-07T20:46:28+08:00",
+  "workspace": "/Users/skyhua/ai-collab",
+  "controller": "codex",
+  "task": "Validate the new single-input ux-lab flow",
+  "lang": "zh-CN",
+  "planner_mode": "mock",
+  "plan": [
+    {
+      "sx": "S1",
+      "title": "Codex 先完成主控拆解",
+      "agent": "codex",
+      "eta_minutes": 8,
+      "done_when": "输出覆盖目标、分工、验收标准的计划 JSON，任务主题为：Validate the new single-input ux-lab flow"
+    },
+    {
+      "sx": "S2",
+      "title": "Claude 执行第一条并行子任务",
+      "agent": "claude",
+      "eta_minutes": 14,
+      "done_when": "对应子控完成分配任务，并明确输出“任务完成”。"
+    },
+    {
+      "sx": "S3",
+      "title": "Gemini 复核收尾与关闭策略",
+      "agent": "gemini",
+      "eta_minutes": 10,
+      "done_when": "主控汇总结果，并询问用户关闭还是保留协作窗格。"
+    }
+  ]
+}

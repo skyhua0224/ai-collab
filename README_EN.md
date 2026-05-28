@@ -104,7 +104,8 @@ ai-collab --dry-run --output json "<task>"
 
 1. [Quick Start](./QUICKSTART.md)
 2. [Usage Guide](./docs/USAGE.md)
-3. [Release Guide](./docs/RELEASE.md)
+3. [vNext Rust Platform Architecture (ZH)](./docs/VNEXT_RUST_PLATFORM_ARCHITECTURE_ZH.md)
+4. [Release Guide](./docs/RELEASE.md)
 
 ## Development Verification
 

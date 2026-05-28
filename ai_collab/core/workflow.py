@@ -10,9 +10,23 @@ from typing import Any, Dict, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from ai_collab.core.config import Config
+from ai_collab.core.workflow_v2 import (
+    builtin_session_presets,
+    find_session_preset_for_workflow_blueprint,
+    resolve_session_preset,
+    resolve_workflow_blueprint,
+)
 
 
 DEFAULT_PERSONA_PHASE_MAP = {
+    "collect": "research-analyst",
+    "model": "requirements-architect",
+    "plan": "requirements-architect",
+    "artifact": "frontend-designer",
+    "execute": "implementation-engineer",
+    "validate": "quality-auditor",
+    "correct": "implementation-engineer",
+    "deliver": "quality-auditor",
     "discover": "research-analyst",
     "define": "requirements-architect",
     "develop": "implementation-engineer",
@@ -37,6 +51,14 @@ DEFAULT_PERSONA_SKILL_MAP = {
 
 DEFAULT_PHASE_COMPLETION_CRITERIA = {
     "default": {"min_output_chars": 30, "must_succeed": True},
+    "collect": {"min_output_chars": 80},
+    "model": {"min_output_chars": 80},
+    "plan": {"min_output_chars": 60},
+    "artifact": {"min_output_chars": 60},
+    "execute": {"min_output_chars": 80},
+    "validate": {"min_output_chars": 60},
+    "correct": {"min_output_chars": 60},
+    "deliver": {"min_output_chars": 60},
     "discover": {"min_output_chars": 80},
     "define": {"min_output_chars": 60},
     "develop": {"min_output_chars": 80},
@@ -51,6 +73,18 @@ DEFAULT_ESCALATION_POLICY = {
     "stop_on_failure": True,
 }
 
+V2_INTENT_PRESET_MAP = {
+    "design": "design-first",
+    "documentation": "auto",
+    "research": "research-priority",
+    "architecture": "research-priority",
+    "implementation": "auto",
+    "debug": "debug-priority",
+    "security": "auto",
+    "testing": "auto",
+    "gameplay": "design-first",
+}
+
 
 class WorkflowPhase(BaseModel):
     """Workflow phase definition."""
@@ -60,6 +94,12 @@ class WorkflowPhase(BaseModel):
     output: str
     timeout: Optional[int] = None
     skills: list[str] = Field(default_factory=list)
+    responsibility_stage: str = ""
+    artifact_type: str = ""
+    allowed_artifacts: list[str] = Field(default_factory=list)
+    boundary: str = ""
+    timebox_minutes: Optional[int] = None
+    goal: str = ""
 
 
 class Workflow(BaseModel):
@@ -78,28 +118,24 @@ class WorkflowManager:
 
     def execute_workflow(
         self,
-        workflow_name: str,
+        route_key: str,
         task: str,
         context: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Execute a workflow with persona routing, completion gates, and escalation policy."""
-        workflow_data = self.config.workflows.get(workflow_name)
-        if not workflow_data:
-            raise ValueError(f"Workflow not found: {workflow_name}")
-
-        workflow = Workflow(
-            name=workflow_name,
-            description=workflow_data.get("description", ""),
-            phases=[WorkflowPhase(**phase) for phase in workflow_data.get("phases", [])],
-        )
+        """Execute a V2 route using stage-based orchestration."""
+        route_key = str(route_key or "").strip()
+        execution = self._resolve_execution_target(route_key=route_key, context=context)
+        workflow = execution["workflow"]
         results: Dict[str, Any] = {}
         summary: Dict[str, Any] = {
             "status": "completed",
-            "workflow": workflow_name,
+            "workflow": workflow.name,
+            "requested_route": route_key,
             "total_phases": len(workflow.phases),
             "completed_phases": 0,
             "skipped_phases": 0,
         }
+        summary.update(execution["summary_meta"])
 
         for index, phase in enumerate(workflow.phases, 1):
             resolved_phase = self._resolve_phase_plan(phase, context)
@@ -140,6 +176,122 @@ class WorkflowManager:
         results["_summary"] = summary
         return results
 
+    def _resolve_execution_target(
+        self,
+        *,
+        route_key: str,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Resolve the V2 target route and build executable stages."""
+        v2_target = self._resolve_v2_target(route_key=route_key, context=context)
+        workflow = self._build_v2_compat_workflow(v2_target["workflow_blueprint"])
+        return {
+            "workflow": workflow,
+            "summary_meta": {
+                "workflow_engine": "v2",
+                "session_preset": v2_target["session_preset"],
+                "workflow_blueprint": v2_target["workflow_blueprint"],
+                "compatibility_mode": v2_target["compatibility_mode"],
+            },
+        }
+
+    def _workflow_engine(self, context: Dict[str, Any]) -> str:
+        _ = context
+        return "v2"
+
+    def _resolve_v2_target(
+        self,
+        *,
+        route_key: str,
+        context: Dict[str, Any],
+    ) -> Dict[str, str]:
+        workflow_blueprint = str(context.get("workflow_blueprint", "")).strip()
+        if not workflow_blueprint and route_key and self._is_v2_blueprint(route_key):
+            workflow_blueprint = route_key
+        if workflow_blueprint:
+            requested_preset = str(context.get("session_preset", "")).strip()
+            resolve_workflow_blueprint(workflow_blueprint)
+            preset = find_session_preset_for_workflow_blueprint(
+                workflow_blueprint,
+                preferred=requested_preset,
+            ) or requested_preset
+            return {
+                "session_preset": preset,
+                "workflow_blueprint": workflow_blueprint,
+                "compatibility_mode": "direct-v2-blueprint",
+            }
+
+        session_preset = str(context.get("session_preset", "")).strip()
+        if not session_preset and route_key:
+            try:
+                resolve_session_preset(route_key)
+                session_preset = route_key
+            except KeyError:
+                session_preset = ""
+        if session_preset:
+            workflow_blueprint = resolve_session_preset(session_preset).workflow_key
+            return {
+                "session_preset": session_preset,
+                "workflow_blueprint": workflow_blueprint,
+                "compatibility_mode": "direct-v2-preset",
+            }
+
+        if route_key:
+            raise ValueError(f"Unknown workflow route: {route_key}")
+
+        intent = str(context.get("intent", "")).strip().lower()
+        preset = V2_INTENT_PRESET_MAP.get(intent, self._default_session_preset())
+        workflow_blueprint = resolve_session_preset(preset).workflow_key
+        return {
+            "session_preset": preset,
+            "workflow_blueprint": workflow_blueprint,
+            "compatibility_mode": "intent-routed-v2",
+        }
+
+    def _default_session_preset(self) -> str:
+        auto_cfg = self.config.auto_collaboration or {}
+        configured = str(auto_cfg.get("default_session_preset", "auto")).strip() or "auto"
+        try:
+            resolve_session_preset(configured)
+            return configured
+        except KeyError:
+            return "auto"
+
+    def _build_v2_compat_workflow(self, workflow_blueprint: str) -> Workflow:
+        """Translate a V2 blueprint into executable phases using the existing runner."""
+        blueprint = resolve_workflow_blueprint(workflow_blueprint)
+        phases = [
+            WorkflowPhase(
+                agent=stage.default_agent or self.config.current_controller,
+                action=f"{stage.responsibility_stage}:{stage.key}",
+                output=stage.outputs[0] if stage.outputs else stage.goal,
+                timeout=(int(stage.timebox_minutes) * 60) if stage.timebox_minutes else None,
+                skills=[],
+                responsibility_stage=stage.responsibility_stage,
+                artifact_type=stage.outputs[0] if stage.outputs else "",
+                allowed_artifacts=list(stage.allowed_artifacts),
+                boundary=stage.boundary,
+                timebox_minutes=stage.timebox_minutes,
+                goal=stage.goal,
+            )
+            for stage in blueprint.stages
+        ]
+        return Workflow(
+            name=workflow_blueprint,
+            description=blueprint.description,
+            phases=phases,
+        )
+
+    def _is_v2_blueprint(self, key: str) -> bool:
+        candidate = str(key or "").strip()
+        if not candidate:
+            return False
+        try:
+            resolve_workflow_blueprint(candidate)
+            return True
+        except KeyError:
+            return False
+
     def _resolve_phase_plan(self, phase: WorkflowPhase, context: Dict[str, Any]) -> Dict[str, Any]:
         """Resolve phase owner, persona, and active skills with config overrides."""
         auto_cfg = dict(self.config.auto_collaboration or {})
@@ -176,6 +328,12 @@ class WorkflowManager:
             "phase_key": phase_key,
             "persona": persona,
             "active_skills": active_skills,
+            "goal": phase.goal,
+            "responsibility_stage": phase.responsibility_stage,
+            "artifact_type": phase.artifact_type,
+            "allowed_artifacts": list(phase.allowed_artifacts),
+            "boundary": phase.boundary,
+            "timebox_minutes": phase.timebox_minutes,
         }
 
     def _execute_phase_with_policy(
@@ -455,6 +613,24 @@ Persona: {resolved_phase['persona']}
 Your role: {resolved_phase['action']}
 Expected output: {resolved_phase['output']}
 """
+        responsibility_stage = str(resolved_phase.get("responsibility_stage", "")).strip()
+        goal = str(resolved_phase.get("goal", "")).strip()
+        artifact_type = str(resolved_phase.get("artifact_type", "")).strip()
+        allowed_artifacts = self._normalize_skill_input(resolved_phase.get("allowed_artifacts", []))
+        boundary = str(resolved_phase.get("boundary", "")).strip()
+        timebox_minutes = resolved_phase.get("timebox_minutes")
+        if responsibility_stage:
+            prompt += f"Responsibility stage: {responsibility_stage}\n"
+        if goal:
+            prompt += f"Stage goal: {goal}\n"
+        if artifact_type:
+            prompt += f"Artifact type: {artifact_type}\n"
+        if allowed_artifacts:
+            prompt += f"Allowed artifacts: {', '.join(allowed_artifacts)}\n"
+        if boundary:
+            prompt += f"Boundary: {boundary}\n"
+        if isinstance(timebox_minutes, int) and timebox_minutes > 0:
+            prompt += f"Timebox minutes: {timebox_minutes}\n"
         if resolved_phase["active_skills"]:
             prompt += (
                 "\nAuto-trigger skills (apply if available): "
@@ -636,6 +812,9 @@ Expected output: {resolved_phase['output']}
     def _normalize_phase_key(self, action: str) -> str:
         """Normalize phase key from action text."""
         lowered = action.strip().lower()
+        for key in ("collect", "model", "plan", "artifact", "execute", "validate", "correct", "deliver"):
+            if key in lowered:
+                return key
         for key in ("discover", "define", "develop", "deliver"):
             if key in lowered:
                 return key
@@ -672,14 +851,12 @@ Expected output: {resolved_phase['output']}
         return deduped
 
     def list_workflows(self) -> list[Dict[str, Any]]:
-        """List all available workflows."""
-        workflows = []
-        for name, workflow_data in self.config.workflows.items():
-            workflows.append(
-                {
-                    "name": name,
-                    "description": workflow_data.get("description", ""),
-                    "phases": len(workflow_data.get("phases", [])),
-                }
-            )
-        return workflows
+        """List built-in V2 session presets."""
+        return [
+            {
+                "name": key,
+                "description": preset.description,
+                "workflow_blueprint": preset.workflow_key,
+            }
+            for key, preset in builtin_session_presets().items()
+        ]

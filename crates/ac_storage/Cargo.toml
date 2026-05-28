@@ -1,0 +1,18 @@
+[package]
+name = "ac_storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ac_core = { path = "../ac_core" }
+ac_protocol = { path = "../ac_protocol" }
+chrono.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ac_engine = { path = "../ac_engine" }
+tempfile.workspace = true

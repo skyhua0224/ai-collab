@@ -1,72 +1,49 @@
-"""Tests for orchestration planning outputs embedded in detector results."""
-
-from __future__ import annotations
-
 from ai_collab.core.config import Config
-from ai_collab.core.detector import CollaborationDetector
-from ai_collab.core.profiler import ProjectProfile
+from ai_collab.core.orchestrator import OrchestrationPlanner
 
 
-def test_orchestration_plan_exposes_available_agents_and_model_info() -> None:
-    """Detector result should surface available agents and selected model/profile per role."""
+def test_orchestrator_prefers_product_role_policy_for_default_config() -> None:
     config = Config.create_default()
-    config.auto_collaboration = {
-        "enabled": True,
-        "profile_trigger_map": {
-            "superapp-fullstack": {
-                "default": "fullstack-superapp",
-                "implementation": "fullstack-superapp",
-            }
-        },
-        "assignment_map": {
-            "discover": {"agent": "gemini", "profile": "powerful"},
-            "define": {"agent": "claude", "profile": "default"},
-            "develop": {"agent": "codex", "profile": "medium"},
-            "deliver": {"agent": "claude", "profile": "default"},
-        },
-        "triggers": [
-            {
-                "name": "fullstack-superapp",
-                "description": "Fullstack development",
-                "patterns": ["fullstack"],
-                "primary": "codex",
-                "reviewers": ["claude", "gemini"],
-                "workflow": "full-stack",
-            }
-        ],
-    }
-    config.workflows = {
-        "full-stack": {
-            "description": "Full-stack workflow",
-            "phases": [
-                {"agent": "claude", "action": "plan", "output": "architecture notes"},
-                {"agent": "gemini", "action": "design-frontend", "output": "ui draft"},
-                {"agent": "codex", "action": "implement-core", "output": "api and ui"},
-                {"agent": "claude", "action": "review-gate", "output": "quality report"},
-            ],
-        }
-    }
+    planner = OrchestrationPlanner(config)
 
-    from ai_collab.core import profiler as profiler_module
-
-    original_detect = profiler_module.ProjectProfiler.detect
-    profiler_module.ProjectProfiler.detect = (
-        lambda self: ProjectProfile(root="/tmp/workspace", categories=["superapp-fullstack"], signals={})
+    plan = planner.build_plan(
+        task="制作一个贪吃蛇小游戏",
+        current_provider="codex",
+        intent="architecture",
     )
-    detector = CollaborationDetector(config)
-    try:
-        task = "Build a tiny todo app"
-        result = detector.detect(task, "codex")
-    finally:
-        profiler_module.ProjectProfiler.detect = original_detect
 
-    assert result.need_collaboration is True
-    assert result.available_agents
-    assert any(item.get("agent") == "codex" for item in result.available_agents)
-    assert any(item.get("selected_model") for item in result.available_agents)
+    assignments = {step["role"]: step["agent"] for step in plan["orchestration_plan"]}
 
-    assert result.orchestration_plan
-    backend_steps = [item for item in result.orchestration_plan if item.get("role") == "backend-build"]
-    assert backend_steps
-    assert backend_steps[0]["agent"] == "codex"
-    assert backend_steps[0]["selected_model"]
+    assert assignments["tech-selection"] == "gemini"
+    assert assignments["implementation"] == "codex"
+    assert assignments["quality-review"] == "claude"
+
+
+def test_orchestrator_uses_v2_metadata_by_default() -> None:
+    config = Config.create_default()
+    planner = OrchestrationPlanner(config)
+
+    plan = planner.build_plan(
+        task="实现一个管理端模块",
+        current_provider="codex",
+        intent="implementation",
+    )
+
+    assert plan["workflow_engine"] == "v2"
+    assert plan["session_preset"] == "auto"
+    assert plan["workflow_blueprint"] == "delivery-loop"
+
+
+def test_orchestrator_can_override_session_preset_per_run() -> None:
+    config = Config.create_default()
+    planner = OrchestrationPlanner(config)
+
+    plan = planner.build_plan(
+        task="做一个更精致的贪吃蛇小游戏",
+        current_provider="codex",
+        intent="implementation",
+        session_preset="design-first",
+    )
+
+    assert plan["session_preset"] == "design-first"
+    assert plan["workflow_blueprint"] == "design-led-loop"

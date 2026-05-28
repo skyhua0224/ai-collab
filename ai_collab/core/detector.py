@@ -12,6 +12,11 @@ from pydantic import BaseModel, Field
 from ai_collab.core.config import Config
 from ai_collab.core.orchestrator import OrchestrationPlanner
 from ai_collab.core.profiler import ProjectProfiler
+from ai_collab.core.workflow_v2 import (
+    find_session_preset_for_workflow_blueprint,
+    resolve_session_preset,
+    resolve_workflow_blueprint,
+)
 
 
 DEFAULT_INTENT_TRIGGER_MAP = {
@@ -80,6 +85,19 @@ CATEGORY_PRIORITY = {
 }
 
 
+TRIGGER_SESSION_PRESET_MAP = {
+    "visual-design": "design-first",
+    "fullstack-superapp": "design-first",
+    "game-dev": "design-first",
+    "debugging": "debug-priority",
+    "research": "research-priority",
+    "architecture": "research-priority",
+    "testing": "validation-first",
+    "security-audit": "validation-first",
+    "docs-writing": "document-first",
+}
+
+
 class CollaborationResult(BaseModel):
     """Result of collaboration detection."""
 
@@ -88,7 +106,6 @@ class CollaborationResult(BaseModel):
     description: Optional[str] = None
     primary: Optional[str] = None
     reviewers: List[str] = Field(default_factory=list)
-    workflow_name: Optional[str] = None
     workflow: Dict = Field(default_factory=dict)
     consensus_threshold: float = 0.75
     intent: Optional[str] = None
@@ -99,6 +116,11 @@ class CollaborationResult(BaseModel):
     orchestration_plan: List[Dict[str, str]] = Field(default_factory=list)
     selected_agents: List[str] = Field(default_factory=list)
     execution_mode: str = "single-agent"
+    workflow_engine: str = "v2"
+    session_preset: Optional[str] = None
+    workflow_blueprint: Optional[str] = None
+    compatibility_mode: Optional[str] = None
+    responsibility_stages: List[str] = Field(default_factory=list)
 
 
 class CollaborationDetector:
@@ -145,13 +167,21 @@ class CollaborationDetector:
             categories=categories,
             orchestration_plan=seed_plan.get("orchestration_plan", []),
         )
+        resolved_session_preset = self._choose_session_preset(
+            plan=seed_plan,
+            trigger=trigger,
+            trigger_name=trigger.get("name") if trigger else None,
+            intent=intent,
+            categories=categories,
+        )
         plan = seed_plan
-        if intent or trigger:
+        if intent or trigger or resolved_session_preset != str(seed_plan.get("session_preset", "")).strip():
             refined = planner.build_plan(
                 task=task,
                 current_provider=current_provider,
                 intent=intent,
                 trigger_name=trigger.get("name") if trigger else None,
+                session_preset=resolved_session_preset,
             )
             if refined.get("orchestration_plan"):
                 plan = refined
@@ -159,6 +189,23 @@ class CollaborationDetector:
             promoted = self._get_trigger_by_name("fullstack-superapp")
             if promoted:
                 trigger = promoted
+                promoted_session_preset = self._choose_session_preset(
+                    plan=plan,
+                    trigger=promoted,
+                    trigger_name=promoted.get("name"),
+                    intent=intent,
+                    categories=categories,
+                )
+                if promoted_session_preset != str(plan.get("session_preset", "")).strip():
+                    promoted_plan = planner.build_plan(
+                        task=task,
+                        current_provider=current_provider,
+                        intent=intent,
+                        trigger_name=promoted.get("name"),
+                        session_preset=promoted_session_preset,
+                    )
+                    if promoted_plan.get("orchestration_plan"):
+                        plan = promoted_plan
 
         planner_first = bool(auto_cfg.get("planner_first", True))
         if planner_first and self._is_planner_multi_agent(plan):
@@ -172,11 +219,12 @@ class CollaborationDetector:
                 if inferred_trigger_name:
                     selected_trigger = self._get_trigger_by_name(inferred_trigger_name)
 
-            fallback_workflow = self._fallback_workflow_name(plan)
-            workflow_name = (
-                str(selected_trigger.get("workflow", "")).strip()
-                if selected_trigger
-                else fallback_workflow
+            route_meta = self._resolve_route_metadata(
+                plan=plan,
+                trigger=selected_trigger,
+                trigger_name=selected_trigger.get("name") if selected_trigger else None,
+                intent=intent,
+                categories=categories,
             )
             primary_from_plan = self._plan_primary_agent(plan, current_provider)
             primary = (
@@ -191,15 +239,14 @@ class CollaborationDetector:
             )
 
             return CollaborationResult(
-                need_collaboration=bool(workflow_name),
+                need_collaboration=bool(route_meta["workflow_blueprint"] or route_meta["workflow"]),
                 trigger=selected_trigger.get("name", "planner-derived") if selected_trigger else "planner-derived",
                 description=selected_trigger.get("description", "Planner-derived multi-agent orchestration")
                 if selected_trigger
                 else "Planner-derived multi-agent orchestration",
                 primary=primary,
                 reviewers=reviewers,
-                workflow_name=workflow_name,
-                workflow=self.config.workflows.get(workflow_name, {}),
+                workflow=route_meta["workflow"],
                 consensus_threshold=auto_cfg.get("consensus_threshold", 0.75),
                 intent=intent,
                 matched_patterns=matched_patterns,
@@ -209,6 +256,11 @@ class CollaborationDetector:
                 orchestration_plan=plan.get("orchestration_plan", []),
                 selected_agents=plan.get("selected_agents", []),
                 execution_mode=str(plan.get("mode", "single-agent")),
+                workflow_engine=str(route_meta["workflow_engine"]),
+                session_preset=route_meta["session_preset"],
+                workflow_blueprint=route_meta["workflow_blueprint"],
+                compatibility_mode=route_meta["compatibility_mode"],
+                responsibility_stages=list(route_meta["responsibility_stages"]),
             )
 
         if not trigger:
@@ -221,17 +273,22 @@ class CollaborationDetector:
                 trigger = self._get_trigger_by_name(inferred_trigger_name)
 
         if not trigger and self._is_planner_multi_agent(plan):
-            fallback_workflow = self._fallback_workflow_name(plan)
+            route_meta = self._resolve_route_metadata(
+                plan=plan,
+                trigger=None,
+                trigger_name=None,
+                intent=intent,
+                categories=categories,
+            )
             primary = self._plan_primary_agent(plan, current_provider)
             reviewers = [item for item in plan.get("selected_agents", []) if item != primary]
             return CollaborationResult(
-                need_collaboration=bool(fallback_workflow),
-                trigger="planner-derived" if fallback_workflow else None,
+                need_collaboration=bool(route_meta["workflow_blueprint"] or route_meta["workflow"]),
+                trigger="planner-derived",
                 description="Planner-derived multi-agent orchestration",
                 primary=primary,
                 reviewers=reviewers,
-                workflow_name=fallback_workflow,
-                workflow=self.config.workflows.get(fallback_workflow, {}),
+                workflow=route_meta["workflow"],
                 consensus_threshold=auto_cfg.get("consensus_threshold", 0.75),
                 intent=intent,
                 matched_patterns=matched_patterns,
@@ -241,9 +298,21 @@ class CollaborationDetector:
                 orchestration_plan=plan.get("orchestration_plan", []),
                 selected_agents=plan.get("selected_agents", []),
                 execution_mode=str(plan.get("mode", "single-agent")),
+                workflow_engine=str(route_meta["workflow_engine"]),
+                session_preset=route_meta["session_preset"],
+                workflow_blueprint=route_meta["workflow_blueprint"],
+                compatibility_mode=route_meta["compatibility_mode"],
+                responsibility_stages=list(route_meta["responsibility_stages"]),
             )
 
         if not trigger:
+            route_meta = self._resolve_route_metadata(
+                plan=plan,
+                trigger=None,
+                trigger_name=None,
+                intent=intent,
+                categories=categories,
+            )
             return CollaborationResult(
                 need_collaboration=False,
                 intent=intent,
@@ -253,9 +322,21 @@ class CollaborationDetector:
                 orchestration_plan=plan.get("orchestration_plan", []),
                 selected_agents=plan.get("selected_agents", []),
                 execution_mode=str(plan.get("mode", "single-agent")),
+                workflow_engine=str(route_meta["workflow_engine"]),
+                session_preset=route_meta["session_preset"],
+                workflow_blueprint=route_meta["workflow_blueprint"],
+                compatibility_mode=route_meta["compatibility_mode"],
+                responsibility_stages=list(route_meta["responsibility_stages"]),
             )
 
         if not self._is_planner_multi_agent(plan):
+            route_meta = self._resolve_route_metadata(
+                plan=plan,
+                trigger=trigger,
+                trigger_name=trigger.get("name"),
+                intent=intent,
+                categories=categories,
+            )
             return CollaborationResult(
                 need_collaboration=False,
                 trigger=trigger.get("name", ""),
@@ -267,10 +348,20 @@ class CollaborationDetector:
                 orchestration_plan=plan.get("orchestration_plan", []),
                 selected_agents=plan.get("selected_agents", []),
                 execution_mode=str(plan.get("mode", "single-agent")),
+                workflow_engine=str(route_meta["workflow_engine"]),
+                session_preset=route_meta["session_preset"],
+                workflow_blueprint=route_meta["workflow_blueprint"],
+                compatibility_mode=route_meta["compatibility_mode"],
+                responsibility_stages=list(route_meta["responsibility_stages"]),
             )
 
-        workflow_name = trigger.get("workflow", "")
-        workflow = self.config.workflows.get(workflow_name, {})
+        route_meta = self._resolve_route_metadata(
+            plan=plan,
+            trigger=trigger,
+            trigger_name=trigger.get("name"),
+            intent=intent,
+            categories=categories,
+        )
 
         return CollaborationResult(
             need_collaboration=True,
@@ -278,8 +369,7 @@ class CollaborationDetector:
             description=trigger.get("description", ""),
             primary=trigger.get("primary", current_provider),
             reviewers=trigger.get("reviewers", []),
-            workflow_name=workflow_name,
-            workflow=workflow,
+            workflow=route_meta["workflow"],
             consensus_threshold=auto_cfg.get("consensus_threshold", 0.75),
             intent=intent,
             matched_patterns=matched_patterns,
@@ -289,6 +379,11 @@ class CollaborationDetector:
             orchestration_plan=plan.get("orchestration_plan", []),
             selected_agents=plan.get("selected_agents", []),
             execution_mode=str(plan.get("mode", "single-agent")),
+            workflow_engine=str(route_meta["workflow_engine"]),
+            session_preset=route_meta["session_preset"],
+            workflow_blueprint=route_meta["workflow_blueprint"],
+            compatibility_mode=route_meta["compatibility_mode"],
+            responsibility_stages=list(route_meta["responsibility_stages"]),
         )
 
     def _is_auto_collaboration_enabled(self, auto_cfg: Dict) -> bool:
@@ -315,18 +410,143 @@ class CollaborationDetector:
                     return str(step.get("agent"))
         return current_provider
 
-    def _fallback_workflow_name(self, plan: Dict[str, object]) -> str:
-        steps = plan.get("orchestration_plan", [])
-        roles = set()
-        if isinstance(steps, list):
-            roles = {str(step.get("role", "")) for step in steps if isinstance(step, dict)}
+    def _trigger_session_preset(self, trigger: Optional[Dict]) -> str:
+        if not isinstance(trigger, dict):
+            return ""
+        return str(trigger.get("session_preset", "")).strip()
 
-        if {"frontend-build", "backend-build"}.issubset(roles) and "full-stack" in self.config.workflows:
-            return "full-stack"
-        if "code-review" in self.config.workflows:
-            return "code-review"
-        workflows = list(self.config.workflows.keys())
-        return workflows[0] if workflows else ""
+    def _trigger_workflow_blueprint(self, trigger: Optional[Dict]) -> str:
+        if not isinstance(trigger, dict):
+            return ""
+        return str(trigger.get("workflow_blueprint", "")).strip()
+
+    def _choose_session_preset(
+        self,
+        *,
+        plan: Dict[str, object],
+        trigger: Optional[Dict],
+        trigger_name: Optional[str],
+        intent: Optional[str],
+        categories: List[str],
+    ) -> str:
+        explicit = self._trigger_session_preset(trigger)
+        if explicit:
+            try:
+                resolve_session_preset(explicit)
+                return explicit
+            except KeyError:
+                pass
+
+        requested = str(plan.get("session_preset", "")).strip()
+        if requested and requested != "auto":
+            try:
+                resolve_session_preset(requested)
+                return requested
+            except KeyError:
+                pass
+
+        if trigger_name:
+            mapped = TRIGGER_SESSION_PRESET_MAP.get(trigger_name)
+            if mapped:
+                return mapped
+
+        if "docs-text" in categories:
+            return "document-first"
+        if any(category in {"superapp-fullstack", "game-dev"} for category in categories):
+            return "design-first"
+
+        intent_map = {
+            "design": "design-first",
+            "architecture": "research-priority",
+            "research": "research-priority",
+            "debug": "debug-priority",
+            "testing": "validation-first",
+            "documentation": "document-first",
+        }
+        if intent:
+            mapped = intent_map.get(intent)
+            if mapped:
+                return mapped
+
+        return requested or "auto"
+
+    def _resolve_route_metadata(
+        self,
+        *,
+        plan: Dict[str, object],
+        trigger: Optional[Dict],
+        trigger_name: Optional[str],
+        intent: Optional[str],
+        categories: List[str],
+    ) -> Dict[str, object]:
+        workflow_engine = str(plan.get("workflow_engine", "v2")).strip() or "v2"
+        session_preset = self._choose_session_preset(
+            plan=plan,
+            trigger=trigger,
+            trigger_name=trigger_name,
+            intent=intent,
+            categories=categories,
+        )
+        trigger_blueprint = self._trigger_workflow_blueprint(trigger)
+        plan_blueprint = str(plan.get("workflow_blueprint", "")).strip()
+        workflow_blueprint = trigger_blueprint or plan_blueprint
+
+        blueprint_source = ""
+        if workflow_blueprint:
+            try:
+                resolve_workflow_blueprint(workflow_blueprint)
+                blueprint_source = "blueprint"
+            except KeyError:
+                workflow_blueprint = ""
+
+        if not workflow_blueprint:
+            try:
+                workflow_blueprint = resolve_session_preset(session_preset).workflow_key
+                blueprint_source = "preset" if self._trigger_session_preset(trigger) or str(plan.get("session_preset", "")).strip() else "planner"
+            except KeyError:
+                workflow_blueprint = ""
+
+        if workflow_blueprint:
+            matched_session_preset = find_session_preset_for_workflow_blueprint(
+                workflow_blueprint,
+                preferred=session_preset,
+            )
+            if matched_session_preset:
+                session_preset = matched_session_preset
+            blueprint = resolve_workflow_blueprint(workflow_blueprint)
+            responsibility_stages = [stage.responsibility_stage for stage in blueprint.stages]
+            workflow_preview = {
+                "description": blueprint.description,
+                "phases": [
+                    {
+                        "agent": stage.default_agent or "",
+                        "action": stage.responsibility_stage,
+                        "output": stage.outputs[0] if stage.outputs else stage.goal,
+                    }
+                    for stage in blueprint.stages
+                ],
+            }
+        else:
+            responsibility_stages = []
+            workflow_preview = {}
+
+        if workflow_engine != "v2":
+            compatibility_mode = "planner-v2"
+        elif blueprint_source == "blueprint":
+            compatibility_mode = "direct-v2-blueprint"
+        elif blueprint_source == "preset":
+            compatibility_mode = "direct-v2-preset"
+        else:
+            compatibility_mode = "planner-v2"
+
+        return {
+            "workflow_engine": workflow_engine,
+            "session_preset": session_preset,
+            "workflow_blueprint": workflow_blueprint or None,
+            "compatibility_mode": compatibility_mode,
+            "responsibility_stages": responsibility_stages,
+            "workflow": workflow_preview,
+        }
 
     def _get_trigger_by_name(self, name: str) -> Optional[Dict]:
         triggers = self.config.auto_collaboration.get("triggers", [])
@@ -513,6 +733,7 @@ class CollaborationDetector:
 
         workflow = result.workflow
         phases = workflow.get("phases", [])
+        workflow_label = result.workflow_blueprint or result.session_preset or "(none)"
 
         lang = str(getattr(self.config, "ui_language", "en-US"))
         is_zh = lang == "zh-CN"
@@ -524,7 +745,7 @@ class CollaborationDetector:
 任务类型: {result.trigger} - {result.description}
 用户请求: {task}
 
-工作流: {result.workflow_name}
+编排路由: {workflow_label}
 {workflow.get('description', '')}
 
 执行步骤:
@@ -536,7 +757,7 @@ class CollaborationDetector:
 Task Type: {result.trigger} - {result.description}
 User Request: {task}
 
-Workflow: {result.workflow_name}
+Route: {workflow_label}
 {workflow.get('description', '')}
 
 Execution Steps:
@@ -564,6 +785,8 @@ Execution Steps:
 自动技能: {skills}
 执行模式: {result.execution_mode}
 已选 Agent: {', '.join(result.selected_agents) if result.selected_agents else '(none)'}
+会话预设: {result.session_preset or '(none)'}
+蓝图: {result.workflow_blueprint or '(none)'}
 
 质量门阈值: {result.consensus_threshold * 100}%
 
@@ -580,6 +803,8 @@ Project Categories: {categories}
 Auto Skills: {skills}
 Execution Mode: {result.execution_mode}
 Selected Agents: {', '.join(result.selected_agents) if result.selected_agents else '(none)'}
+Session Preset: {result.session_preset or '(none)'}
+Blueprint: {result.workflow_blueprint or '(none)'}
 
 Quality Gate Threshold: {result.consensus_threshold * 100}%
 

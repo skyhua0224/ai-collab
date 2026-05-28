@@ -1,0 +1,32 @@
+{
+  "version": "ux-lab-v1",
+  "created_at": "2026-03-07T20:26:19+08:00",
+  "workspace": "/Users/skyhua/ai-collab",
+  "controller": "codex",
+  "task": "Test the new fullscreen ai-collab UX lab flow",
+  "lang": "en-US",
+  "planner_mode": "mock",
+  "plan": [
+    {
+      "sx": "S1",
+      "title": "Codex drafts the controller plan",
+      "agent": "codex",
+      "eta_minutes": 8,
+      "done_when": "Produce an editable task list with scope, owners, and acceptance criteria for Test the new fullscreen ai-collab UX lab flow."
+    },
+    {
+      "sx": "S2",
+      "title": "Claude executes the first delegated track",
+      "agent": "claude",
+      "eta_minutes": 14,
+      "done_when": "The delegated agent finishes the assigned track and explicitly reports task completion."
+    },
+    {
+      "sx": "S3",
+      "title": "Gemini reviews closure and handoff",
+      "agent": "gemini",
+      "eta_minutes": 10,
+      "done_when": "The controller can summarize status and ask whether helper panes should stay open or close."
+    }
+  ]
+}

@@ -21,7 +21,8 @@ def config():
                 "patterns": ["html", "css", "mockup", "design"],
                 "primary": "gemini",
                 "reviewers": ["claude"],
-                "workflow": "design-review",
+                "session_preset": "design-first",
+                "workflow_blueprint": "design-led-loop",
             },
             {
                 "name": "implementation",
@@ -29,7 +30,8 @@ def config():
                 "patterns": ["implement", "feature", "function"],
                 "primary": "codex",
                 "reviewers": ["claude"],
-                "workflow": "code-review",
+                "session_preset": "auto",
+                "workflow_blueprint": "delivery-loop",
             },
             {
                 "name": "docs-writing",
@@ -37,32 +39,10 @@ def config():
                 "patterns": ["doc", "readme"],
                 "primary": "claude",
                 "reviewers": ["gemini"],
-                "workflow": "docs-review",
+                "session_preset": "document-first",
+                "workflow_blueprint": "document-loop",
             },
         ],
-    }
-    config.workflows = {
-        "design-review": {
-            "description": "Design review workflow",
-            "phases": [
-                {"agent": "gemini", "action": "design", "output": "mockup"},
-                {"agent": "claude", "action": "review", "output": "feedback"},
-            ],
-        },
-        "code-review": {
-            "description": "Code review workflow",
-            "phases": [
-                {"agent": "codex", "action": "implement", "output": "code"},
-                {"agent": "claude", "action": "review", "output": "feedback"},
-            ],
-        },
-        "docs-review": {
-            "description": "Docs workflow",
-            "phases": [
-                {"agent": "claude", "action": "draft", "output": "document"},
-                {"agent": "gemini", "action": "polish", "output": "clarity improvements"},
-            ],
-        },
     }
     return config
 
@@ -87,7 +67,11 @@ def test_detect_prefers_profile_mapping_over_task_keywords(config, monkeypatch):
     assert result.trigger == "docs-writing"
     assert result.primary == "claude"
     assert "gemini" in result.reviewers
-    assert result.workflow_name == "docs-review"
+    assert result.workflow_engine == "v2"
+    assert result.session_preset == "document-first"
+    assert result.workflow_blueprint == "document-loop"
+    assert result.responsibility_stages == ["collect", "model", "plan", "deliver"]
+    assert "workflow_name" not in result.model_dump()
     assert result.matched_patterns == []
 
 
@@ -113,7 +97,8 @@ def test_empty_task_still_builds_multi_agent_plan_from_config(config, monkeypatc
             "patterns": ["fullstack"],
             "primary": "codex",
             "reviewers": ["claude", "gemini"],
-            "workflow": "code-review",
+            "session_preset": "design-first",
+            "workflow_blueprint": "design-led-loop",
         }
     )
     detector = CollaborationDetector(config)
@@ -128,6 +113,20 @@ def test_empty_task_still_builds_multi_agent_plan_from_config(config, monkeypatc
     assert "quality-review" in roles
 
 
+def test_planner_derived_v2_route_does_not_backfill_legacy_workflow_name(config, monkeypatch):
+    """Planner-derived V2 routes should no longer invent a legacy workflow name."""
+    _mock_profile(monkeypatch, categories=["systems-tooling"])
+    config.auto_collaboration["triggers"] = []
+
+    detector = CollaborationDetector(config)
+    result = detector.detect("实现一个命令行工具的小功能", "codex")
+
+    assert result.need_collaboration is True
+    assert result.workflow_engine == "v2"
+    assert result.workflow_blueprint == "delivery-loop"
+    assert "workflow_name" not in result.model_dump()
+
+
 def test_detect_implementation(config, monkeypatch):
     """Implementation intent should still map to implementation trigger via planner-derived intent."""
     _mock_profile(monkeypatch, categories=["systems-tooling"])
@@ -138,7 +137,10 @@ def test_detect_implementation(config, monkeypatch):
     assert result.trigger == "implementation"
     assert result.primary == "codex"
     assert "claude" in result.reviewers
-    assert result.workflow_name == "code-review"
+    assert result.workflow_engine == "v2"
+    assert result.session_preset == "auto"
+    assert result.workflow_blueprint == "delivery-loop"
+    assert result.responsibility_stages == ["collect", "model", "plan", "execute", "validate", "correct", "deliver"]
 
 
 def test_no_collaboration_when_only_one_provider_enabled(config, monkeypatch):
@@ -193,18 +195,10 @@ def test_detect_fullstack_from_profile_mapping_without_keyword_match(config, mon
             "patterns": ["superapp", "fullstack"],
             "primary": "codex",
             "reviewers": ["claude", "gemini"],
-            "workflow": "full-stack",
+            "session_preset": "design-first",
+            "workflow_blueprint": "design-led-loop",
         }
     )
-    config.workflows["full-stack"] = {
-        "description": "Full-stack workflow",
-        "phases": [
-            {"agent": "claude", "action": "plan", "output": "architecture notes"},
-            {"agent": "gemini", "action": "design-frontend", "output": "ui draft"},
-            {"agent": "codex", "action": "implement-core", "output": "api and ui"},
-            {"agent": "claude", "action": "review-gate", "output": "quality report"},
-        ],
-    }
     detector = CollaborationDetector(config)
 
     task = "实现一个极小的待办功能"
@@ -212,12 +206,80 @@ def test_detect_fullstack_from_profile_mapping_without_keyword_match(config, mon
 
     assert result.need_collaboration is True
     assert result.trigger == "fullstack-superapp"
-    assert result.workflow_name == "full-stack"
+    assert result.workflow_engine == "v2"
+    assert result.session_preset == "design-first"
+    assert result.workflow_blueprint == "design-led-loop"
+    assert "artifact" in result.responsibility_stages
     assert len(result.orchestration_plan) >= 3
     roles = {item["role"] for item in result.orchestration_plan}
     assert "frontend-build" in roles
     assert "backend-build" in roles
     assert "quality-review" in roles
+
+
+def test_detector_prefers_explicit_trigger_session_preset(config, monkeypatch):
+    _mock_profile(monkeypatch, categories=["docs-text"])
+    config.auto_collaboration["triggers"] = [
+        {
+            "name": "docs-writing",
+            "description": "Documentation tasks",
+            "patterns": ["doc", "readme"],
+            "primary": "claude",
+            "reviewers": ["gemini"],
+            "session_preset": "document-first",
+        }
+    ]
+
+    detector = CollaborationDetector(config)
+    result = detector.detect("Write a README", "claude")
+
+    assert result.need_collaboration is True
+    assert result.session_preset == "document-first"
+    assert result.workflow_blueprint == "document-loop"
+    assert "workflow_name" not in result.model_dump()
+
+
+def test_detector_prefers_explicit_trigger_workflow_blueprint(config, monkeypatch):
+    _mock_profile(monkeypatch, categories=["systems-tooling"])
+    config.auto_collaboration["triggers"] = [
+        {
+            "name": "implementation",
+            "description": "Implementation tasks",
+            "patterns": ["implement", "feature", "function"],
+            "primary": "codex",
+            "reviewers": ["claude"],
+            "workflow_blueprint": "validation-loop",
+        }
+    ]
+
+    detector = CollaborationDetector(config)
+    result = detector.detect("Implement user authentication feature", "claude")
+
+    assert result.need_collaboration is True
+    assert result.workflow_blueprint == "validation-loop"
+    assert result.session_preset == "validation-first"
+
+
+def test_detector_aligns_session_preset_with_explicit_workflow_blueprint(config, monkeypatch):
+    _mock_profile(monkeypatch, categories=["systems-tooling"])
+    config.auto_collaboration["triggers"] = [
+        {
+            "name": "implementation",
+            "description": "Implementation tasks",
+            "patterns": ["implement", "feature", "function"],
+            "primary": "codex",
+            "reviewers": ["claude"],
+            "workflow_blueprint": "validation-loop",
+        }
+    ]
+
+    detector = CollaborationDetector(config)
+    result = detector.detect("Implement user authentication feature", "claude")
+
+    assert result.need_collaboration is True
+    assert result.workflow_blueprint == "validation-loop"
+    assert result.session_preset == "validation-first"
+    assert "workflow_name" not in result.model_dump()
 
 
 def test_generate_prompt(config, monkeypatch):

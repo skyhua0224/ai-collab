@@ -6,8 +6,9 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Set
 
-from ai_collab.core.config import Config
+from ai_collab.core.config import Config, resolve_collaboration_role_leads
 from ai_collab.core.selector import ModelSelectionResult, ModelSelector
+from ai_collab.core.workflow_v2 import builtin_session_presets, resolve_session_preset
 
 ROLE_CAPABILITY_HINTS: Dict[str, List[str]] = {
     "tech-selection": ["architecture", "reasoning", "research", "ecosystem"],
@@ -38,6 +39,15 @@ ROLE_COMPLEXITY: Dict[str, str] = {
     "quality-review": "high",
     "testing": "medium",
 }
+ROLE_POLICY_INTENTS: Dict[str, str] = {
+    "tech-selection": "architecture",
+    "frontend-build": "implementation",
+    "backend-build": "implementation",
+    "implementation": "implementation",
+    "ecosystem-research": "research",
+    "quality-review": "testing",
+    "testing": "testing",
+}
 
 PHASE_ROLE_MAP: Dict[str, str] = {
     "discover": "ecosystem-research",
@@ -61,8 +71,12 @@ class OrchestrationPlanner:
         current_provider: str,
         intent: Optional[str] = None,
         trigger_name: Optional[str] = None,
+        session_preset: Optional[str] = None,
     ) -> Dict[str, object]:
         available_agents = self._available_agents(task)
+        resolved_session_preset = self._resolve_session_preset_key(session_preset)
+        workflow_blueprint = self._resolve_workflow_blueprint_key(resolved_session_preset)
+        workflow_engine = self._workflow_engine()
         roles = self._plan_roles(
             task=task,
             intent=intent,
@@ -93,8 +107,34 @@ class OrchestrationPlanner:
             "capabilities": [],
             "available_agents": available_agents,
             "selected_agents": selected_agents,
+            "workflow_engine": workflow_engine,
+            "session_preset": resolved_session_preset,
+            "workflow_blueprint": workflow_blueprint,
             "orchestration_plan": steps,
         }
+
+    def _workflow_engine(self) -> str:
+        auto_cfg = self.config.auto_collaboration or {}
+        value = str(auto_cfg.get("workflow_engine", "v2")).strip() or "v2"
+        return value
+
+    def _resolve_session_preset_key(self, session_preset: Optional[str]) -> str:
+        requested = str(session_preset or "").strip()
+        if requested:
+            try:
+                resolve_session_preset(requested)
+                return requested
+            except KeyError:
+                pass
+
+        auto_cfg = self.config.auto_collaboration or {}
+        configured = str(auto_cfg.get("default_session_preset", "auto")).strip() or "auto"
+        if configured in builtin_session_presets():
+            return configured
+        return "auto"
+
+    def _resolve_workflow_blueprint_key(self, session_preset: str) -> str:
+        return resolve_session_preset(session_preset).workflow_key
 
     def _available_agents(self, task: str) -> List[Dict[str, str]]:
         agents: List[Dict[str, str]] = []
@@ -248,6 +288,12 @@ class OrchestrationPlanner:
                 break
 
         if not chosen_agent:
+            preferred_agent = self._preferred_agent_for_role(role=role, enabled_agents=enabled_agents)
+            if preferred_agent:
+                chosen_agent = preferred_agent
+                assigned_by = "routing_policy"
+
+        if not chosen_agent:
             chosen_agent = self._best_agent_by_strength(
                 role=role,
                 current_provider=current_provider,
@@ -302,6 +348,8 @@ class OrchestrationPlanner:
                 score += 1
             if role == "quality-review" and "code-review" in strengths:
                 score += 2
+            if role == "testing" and "code-review" in strengths:
+                score += 2
             if role == "backend-build" and "backend" in strengths:
                 score += 2
             if score > best_score:
@@ -309,6 +357,16 @@ class OrchestrationPlanner:
                 best_agent = agent
 
         return best_agent
+
+    def _preferred_agent_for_role(self, *, role: str, enabled_agents: Set[str]) -> str:
+        intent = ROLE_POLICY_INTENTS.get(role, "")
+        if not intent:
+            return ""
+        leads = resolve_collaboration_role_leads(self.config)
+        candidate = str(leads.get(intent, "")).strip()
+        if candidate in enabled_agents:
+            return candidate
+        return ""
 
     def _select_model_for_role(self, *, agent: str, role: str, task: str) -> ModelSelectionResult:
         complexity = ROLE_COMPLEXITY.get(role, "default")
@@ -327,7 +385,7 @@ class OrchestrationPlanner:
             fallback_model = "default"
             if provider_cfg.models and isinstance(provider_cfg.models, dict):
                 if agent == "codex":
-                    fallback_model = "gpt-5.3-codex"
+                    fallback_model = "gpt-5.4"
                 else:
                     fallback_model = str(provider_cfg.models.get("default", "default"))
             return ModelSelectionResult(

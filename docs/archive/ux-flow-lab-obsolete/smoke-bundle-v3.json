@@ -1,0 +1,32 @@
+{
+  "version": "ux-lab-v3",
+  "created_at": "2026-03-07T21:04:47+08:00",
+  "workspace": "/Users/skyhua/ai-collab",
+  "controller": "codex",
+  "task": "Validate the V3 command-bar flow",
+  "lang": "zh-CN",
+  "planner_mode": "mock",
+  "plan": [
+    {
+      "sx": "S1",
+      "title": "Codex 先完成主控拆解",
+      "agent": "codex",
+      "eta_minutes": 8,
+      "done_when": "输出 JSON 计划，覆盖任务主题：Validate the V3 command-bar flow"
+    },
+    {
+      "sx": "S2",
+      "title": "Claude 执行第一条并行子任务",
+      "agent": "claude",
+      "eta_minutes": 14,
+      "done_when": "子控明确输出“任务完成”。"
+    },
+    {
+      "sx": "S3",
+      "title": "Gemini 负责收尾检查",
+      "agent": "gemini",
+      "eta_minutes": 10,
+      "done_when": "主控询问关闭还是保留协作窗口。"
+    }
+  ]
+}
