@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import is_dataclass, replace
 from datetime import datetime, timezone
 import importlib
 import json
@@ -21,6 +22,7 @@ import time
 import threading
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Optional, Tuple
 from uuid import uuid4
 
@@ -5678,7 +5680,20 @@ def _result_for_tmux_launch(result, controller_plan: Optional[dict[str, Any]]):
         try:
             return result.model_copy(update=payload)
         except Exception:  # noqa: BLE001
-            return result
+            pass
+    if is_dataclass(result):
+        try:
+            allowed = set(getattr(result, "__dataclass_fields__", {}).keys())
+            return replace(result, **{key: value for key, value in payload.items() if key in allowed})
+        except Exception:  # noqa: BLE001
+            pass
+    if hasattr(result, "__dict__"):
+        try:
+            merged = dict(vars(result))
+            merged.update(payload)
+            return SimpleNamespace(**merged)
+        except Exception:  # noqa: BLE001
+            pass
     return result
 
 
@@ -7054,15 +7069,16 @@ def _start_handoff_watcher(
 
 
 def _print_orchestration_plan(result, *, lang: str) -> None:
-    available = result.available_agents or []
-    plan = result.orchestration_plan or []
+    available = getattr(result, "available_agents", None) or []
+    plan = getattr(result, "orchestration_plan", None) or []
     if not available and not plan:
         return
 
     console.print(f"\n[bold cyan]{_auto_msg(lang, 'plan_title')}[/bold cyan]")
-    console.print(f"{_auto_msg(lang, 'mode')}: {result.execution_mode}")
-    if result.selected_agents:
-        console.print(f"{_auto_msg(lang, 'selected_agents')}: {', '.join(result.selected_agents)}")
+    console.print(f"{_auto_msg(lang, 'mode')}: {getattr(result, 'execution_mode', 'single-agent')}")
+    selected_agents = getattr(result, "selected_agents", None) or []
+    if selected_agents:
+        console.print(f"{_auto_msg(lang, 'selected_agents')}: {', '.join(selected_agents)}")
 
     if available:
         console.print(f"{_auto_msg(lang, 'available_agents')}:")
@@ -7100,7 +7116,10 @@ def _print_available_agents(result, *, lang: str) -> None:
 def _can_launch_tmux(result) -> bool:
     if shutil.which("tmux") is None:
         return False
-    return bool(result.execution_mode == "multi-agent" and result.orchestration_plan)
+    return bool(
+        getattr(result, "execution_mode", "single-agent") == "multi-agent"
+        and (getattr(result, "orchestration_plan", None) or [])
+    )
 
 
 def _tmux_session_exists(session: str) -> bool:

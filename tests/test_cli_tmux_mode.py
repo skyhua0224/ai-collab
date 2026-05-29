@@ -13,6 +13,7 @@ from click.testing import CliRunner
 from ai_collab.core.config import Config
 from ai_collab.core.detector import CollaborationResult
 from ai_collab.core.run_state import RunStateStore
+from ai_collab.ux_lab_v3 import UxLabV3Result
 from rich.console import Console
 
 
@@ -1515,6 +1516,39 @@ def test_result_for_tmux_launch_prefers_controller_plan_multi_agent() -> None:
     assert launch_result.execution_mode == "multi-agent"
     assert len(launch_result.orchestration_plan) == 2
     assert launch_result.selected_agents == ["codex", "claude"]
+
+
+def test_result_for_tmux_launch_updates_ux_lab_v3_result(monkeypatch) -> None:
+    """V3 launcher results should be upgraded for tmux instead of crashing on missing fields."""
+    result = UxLabV3Result(
+        status="planned",
+        workspace=Path("/tmp/workspace"),
+        controller="codex",
+        task="Ship tmux run",
+        lang="zh-CN",
+        planner_mode="mock",
+        plan=[],
+    )
+    controller_plan = {
+        "requires_multi_agent": True,
+        "agents": [
+            {"name": "codex", "model": "gpt-5.4"},
+            {"name": "claude", "model": "claude-sonnet-4-6"},
+        ],
+        "steps": [
+            {"id": "S1", "owner": "codex", "goal": "controller step"},
+            {"id": "S2", "owner": "claude", "goal": "review step"},
+        ],
+    }
+
+    launch_result = cli._result_for_tmux_launch(result, controller_plan)
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: "/opt/homebrew/bin/tmux")
+
+    assert isinstance(launch_result, UxLabV3Result)
+    assert launch_result.execution_mode == "multi-agent"
+    assert len(launch_result.orchestration_plan) == 2
+    assert launch_result.selected_agents == ["codex", "claude"]
+    assert cli._can_launch_tmux(launch_result) is True
 
 
 def test_resolve_agent_ready_timeout_defaults(monkeypatch) -> None:
