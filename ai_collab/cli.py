@@ -36,7 +36,12 @@ from ai_collab import __version__ as AI_COLLAB_VERSION
 
 from ai_collab.core.config import Config, resolve_collaboration_role_leads
 from ai_collab.core.detector import CollaborationDetector
-from ai_collab.core.environment import detect_os_name, detect_provider_status, resolve_executable
+from ai_collab.core.environment import (
+    detect_os_name,
+    detect_provider_status,
+    resolve_executable,
+    resolve_subprocess_command,
+)
 from ai_collab.core.selector import ModelSelector
 from ai_collab.core.run_state import RunStateStore
 from ai_collab.core.updates import check_pypi_update, run_self_update
@@ -3767,6 +3772,7 @@ def _safe_execute(cli: str, task: str, timeout: Optional[int] = None) -> int:
     except ValueError as exc:
         console.print(f"[red]Invalid provider CLI: {exc}[/red]")
         return 2
+    cmd_parts = resolve_subprocess_command(cmd_parts)
 
     try:
         result = subprocess.run(
@@ -3778,6 +3784,9 @@ def _safe_execute(cli: str, task: str, timeout: Optional[int] = None) -> int:
     except FileNotFoundError:
         console.print("[red]Provider command not found. Check your PATH and provider CLI installation.[/red]")
         return 127
+    except PermissionError as exc:
+        console.print(f"[red]Provider command is not executable: {exc}[/red]")
+        return 126
 
 
 def _provider_profiles(
@@ -5237,6 +5246,7 @@ def _request_controller_plan(
             )
         except ValueError as exc:
             return None, f"Invalid provider CLI: {exc}"
+        cmd_parts = resolve_subprocess_command(cmd_parts)
 
         try:
             planner_env = _build_controller_planner_env(controller=controller, temp_dir=temp_dir)
@@ -5360,6 +5370,9 @@ def _request_controller_plan(
         except FileNotFoundError:
             executable = cmd_parts[0] if cmd_parts else controller
             return None, f"Provider command not found: {executable}"
+        except PermissionError as exc:
+            executable = cmd_parts[0] if cmd_parts else controller
+            return None, f"Provider command is not executable: {executable} ({exc})"
         except subprocess.TimeoutExpired:
             return None, f"Timeout after {provider_config.timeout}s"
 
@@ -5404,6 +5417,9 @@ def _request_controller_plan(
             except FileNotFoundError:
                 executable = fallback_cmd[0] if fallback_cmd else controller
                 return None, f"Provider command not found: {executable}"
+            except PermissionError as exc:
+                executable = fallback_cmd[0] if fallback_cmd else controller
+                return None, f"Provider command is not executable: {executable} ({exc})"
             except subprocess.TimeoutExpired:
                 return None, f"Timeout after {provider_config.timeout}s"
 

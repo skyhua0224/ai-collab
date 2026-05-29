@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from ai_collab.core.config import Config
+from ai_collab.core.environment import resolve_subprocess_command
 from ai_collab.core.workflow_v2 import (
     builtin_session_presets,
     find_session_preset_for_workflow_blueprint,
@@ -529,7 +530,7 @@ class WorkflowManager:
         cli = self._build_phase_cli(agent=agent, profile=str(resolved_phase.get("profile", "")).strip())
         try:
             cli_parts = shlex.split(cli)
-            cmd = cli_parts + [prompt]
+            cmd = resolve_subprocess_command(cli_parts) + [prompt]
         except ValueError as exc:
             return {
                 "success": False,
