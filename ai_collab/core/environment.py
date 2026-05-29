@@ -9,7 +9,7 @@ import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Sequence
 
 from ai_collab.core.config import ProviderConfig
 
@@ -48,13 +48,38 @@ def resolve_executable(cli: str, *, os_name: Optional[str] = None) -> str:
     return parts[0] if parts else ""
 
 
+def resolve_subprocess_command(
+    parts: Sequence[str],
+    *,
+    os_name: Optional[str] = None,
+) -> list[str]:
+    """Resolve command parts into a form that subprocess can execute directly.
+
+    Windows shells resolve npm/provider shims such as ``codex`` to ``codex.cmd``.
+    ``subprocess`` with ``shell=False`` does not reliably make the same choice, so
+    resolve the executable token explicitly before launching.
+    """
+    command = list(parts)
+    if not command:
+        return command
+
+    if detect_os_name(os_name) != "windows":
+        return command
+
+    resolved = shutil.which(command[0])
+    if resolved:
+        command[0] = resolved
+    return command
+
+
 def _read_version(executable: str) -> str:
     """Read provider version with a short timeout."""
     if not executable:
         return ""
     try:
+        command = resolve_subprocess_command([executable])
         result = subprocess.run(
-            [executable, "--version"],
+            command + ["--version"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -86,6 +111,6 @@ def detect_provider_status(
             executable=exe,
             available=available,
             resolved_path=resolved or "",
-            version=_read_version(exe) if available else "",
+            version=_read_version(resolved or exe) if available else "",
         )
     return statuses

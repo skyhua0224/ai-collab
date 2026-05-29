@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -141,7 +142,7 @@ def test_repeated_failure_triggers_codex_takeover(config: Config, monkeypatch: p
     calls = {"gemini": 0, "codex": 0}
 
     def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        binary = cmd[0]
+        binary = Path(cmd[0]).stem.lower()
         if binary == "gemini":
             calls["gemini"] += 1
             return _err("gemini failed")
