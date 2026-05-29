@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
 from typing import Any
 
 from ai_collab.ux_lab_v3 import LabPlanItem, UxLabV3Result
@@ -40,6 +41,29 @@ class ExecutionTargetOption:
     description: str
     enabled: bool
     badge: str = ""
+
+
+def _can_start_tmux_from_result(result: UxLabV3Result | None) -> bool:
+    if shutil.which("tmux") is None:
+        return False
+    if result is None:
+        return False
+
+    controller_plan = result.controller_plan if isinstance(result.controller_plan, dict) else {}
+    if bool(controller_plan.get("requires_multi_agent", False)):
+        steps = controller_plan.get("steps", [])
+        if isinstance(steps, list):
+            owners = {
+                _normalize_owner(item.get("owner"), default="")
+                for item in steps
+                if isinstance(item, dict) and str(item.get("owner", "")).strip()
+            }
+            if len(owners) > 1 and steps:
+                return True
+
+    orchestration_plan = getattr(result, "orchestration_plan", None) or []
+    execution_mode = str(getattr(result, "execution_mode", "single-agent") or "single-agent")
+    return bool(execution_mode == "multi-agent" and orchestration_plan)
 
 
 def _normalize_owner(owner: str | None, *, default: str = "codex") -> str:
@@ -244,15 +268,24 @@ def apply_plan_draft_to_result(draft: PlanDraft, source_result: UxLabV3Result) -
     )
 
 
-def build_execution_targets(state: Any) -> list[ExecutionTargetOption]:
+def build_execution_targets(state: Any, result: UxLabV3Result | None = None) -> list[ExecutionTargetOption]:
     lang = getattr(getattr(state, "config", None), "ui_language", "en-US")
     zh = lang == "zh-CN"
+    tmux_ready = _can_start_tmux_from_result(result)
     return [
         ExecutionTargetOption(
             key="tmux",
             label="tmux runtime",
-            description="使用现有 tmux 编排链立即开始任务。" if zh else "Start the task through the current tmux orchestration chain.",
-            enabled=True,
+            description=(
+                "使用现有 tmux 编排链立即开始任务。"
+                if tmux_ready and zh
+                else "Start the task through the current tmux orchestration chain."
+                if tmux_ready
+                else "当前计划暂不满足 tmux 直接启动条件：需要已安装 tmux，且当前编排是可执行的多 Agent 计划。"
+                if zh
+                else "Current plan is not ready for direct tmux start: tmux must be installed and the orchestration must be a runnable multi-agent plan."
+            ),
+            enabled=tmux_ready,
         ),
         ExecutionTargetOption(
             key="iterm2",

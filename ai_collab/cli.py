@@ -1177,9 +1177,12 @@ def status(ctx: click.Context) -> None:
         local_icon = "🟢" if runtime.get(name) and runtime[name].available else "🔴"
         local_cmd = runtime[name].executable if runtime.get(name) else ""
         version = runtime[name].version if runtime.get(name) else ""
+        detected_model = runtime[name].detected_model if runtime.get(name) else ""
         suffix = f" | local={local_icon} {local_cmd}"
         if version:
             suffix += f" | {version}"
+        if detected_model:
+            suffix += f" | model={detected_model}"
         console.print(f"  {configured_icon} {name}: {provider.cli}{suffix}")
 
 
@@ -3789,6 +3792,65 @@ def _safe_execute(cli: str, task: str, timeout: Optional[int] = None) -> int:
         return 126
 
 
+def _tmux_agent_startup_command(
+    agent: str,
+    *,
+    selected_cli: str = "",
+    model: str = "",
+    profile: str = "",
+) -> str:
+    """Build interactive startup command for tmux panes."""
+    raw_cli = str(selected_cli or "").strip()
+    model_id = str(model or "").strip()
+    profile_key = str(profile or "").strip()
+
+    if raw_cli:
+        try:
+            parts = shlex.split(raw_cli)
+        except ValueError:
+            parts = raw_cli.split()
+        if agent == "codex" and parts:
+            converted: list[str] = []
+            idx = 0
+            while idx < len(parts):
+                part = parts[idx]
+                if idx == 1 and part == "exec":
+                    idx += 1
+                    continue
+                if part == "--thinking" and idx + 1 < len(parts):
+                    converted.extend(["-c", f'model_reasoning_effort="{parts[idx + 1]}"'])
+                    idx += 2
+                    continue
+                if part.startswith("--thinking="):
+                    converted.extend(["-c", f'model_reasoning_effort="{part.split("=", 1)[1]}"'])
+                    idx += 1
+                    continue
+                converted.append(part)
+                idx += 1
+            return " ".join(converted)
+        return raw_cli
+
+    if agent == "codex":
+        parts = ["codex"]
+        if model_id and model_id.lower() != "unknown":
+            parts.extend(["--model", model_id])
+        if profile_key:
+            parts.extend(["-c", f'model_reasoning_effort="{profile_key}"'])
+        return " ".join(parts)
+
+    if agent == "claude":
+        if model_id and model_id.lower() != "unknown":
+            return f"claude --model {shlex.quote(model_id)}"
+        return "claude"
+
+    if agent == "gemini":
+        if model_id and model_id.lower() not in {"unknown", "gemini-cli-auto"}:
+            return f"gemini --model {shlex.quote(model_id)}"
+        return "gemini"
+
+    return agent
+
+
 def _provider_profiles(
     provider: str,
     provider_config,
@@ -4967,6 +5029,21 @@ def _build_controller_planner_command(
     controller_name = str(controller).strip().lower()
 
     if controller_name == "codex":
+        converted_parts: list[str] = []
+        idx = 0
+        while idx < len(parts):
+            part = parts[idx]
+            if part == "--thinking" and idx + 1 < len(parts):
+                converted_parts.extend(["-c", f'model_reasoning_effort="{parts[idx + 1]}"'])
+                idx += 2
+                continue
+            if part.startswith("--thinking="):
+                converted_parts.extend(["-c", f'model_reasoning_effort="{part.split("=", 1)[1]}"'])
+                idx += 1
+                continue
+            converted_parts.append(part)
+            idx += 1
+        parts = converted_parts
         parts = _drop_args(parts, ("--output-schema", "-o", "--output-last-message"), takes_value=True)
         if parts and parts[0] == "codex" and (len(parts) == 1 or parts[1] != "exec"):
             parts.insert(1, "exec")
@@ -5236,9 +5313,15 @@ def _request_controller_plan(
             output_path = str(Path(temp_dir) / "controller-plan-output.json")
             Path(schema_path).write_text(_build_controller_plan_schema_text(), encoding="utf-8")
 
+        provider_cli = provider_config.cli
+        try:
+            provider_cli = ModelSelector(config).select_model(controller, prompt_text, "default").cli
+        except Exception:
+            provider_cli = provider_config.cli
+
         try:
             cmd_parts = _build_controller_planner_command(
-                provider_cli=provider_config.cli,
+                provider_cli=provider_cli,
                 controller=controller,
                 prompt_text=prompt_text,
                 schema_path=schema_path,
@@ -6929,12 +7012,19 @@ def _spawn_subagent_with_prompt(
     roles = ", ".join(step.get("role", "") for step in steps if step.get("role"))
     task_desc = f"roles: {roles}" if roles else "collaboration role"
     step_tickets = _build_step_tickets(steps)
+    primary_step = steps[0] if steps else {}
     pane_id = spawn_subagent_pane(
         session=session,
         controller_pane=controller_pane,
         agent=agent,
         cwd=cwd,
         task_description=task_desc,
+        agent_cmd=_tmux_agent_startup_command(
+            agent,
+            selected_cli=str(primary_step.get("selected_cli", "")).strip(),
+            model=str(primary_step.get("selected_model", "")).strip(),
+            profile=str(primary_step.get("profile", "")).strip(),
+        ),
     )
     if run_store is not None:
         run_store.bind_agent(agent=agent, pane_id=pane_id, step_tickets=step_tickets)
@@ -7176,6 +7266,7 @@ def _launch_tmux_orchestration(
     if not _can_launch_tmux(result):
         return False
 
+    available_agents = list(getattr(result, "available_agents", None) or [])
     cwd = Path.cwd()
     use_inline = tmux_target == "inline"
     if tmux_target == "auto":
@@ -7185,10 +7276,23 @@ def _launch_tmux_orchestration(
 
     if use_inline:
         try:
+            controller_info = next(
+                (
+                    item for item in available_agents
+                    if str(item.get("agent", "")).strip() == controller
+                ),
+                {},
+            )
             resolved_session, controller_pane = create_inline_controller_workspace(
                 cwd=cwd,
                 controller=controller,
                 autorun=True,
+                agent_cmd=_tmux_agent_startup_command(
+                    controller,
+                    selected_cli=str(controller_info.get("selected_cli", "")).strip(),
+                    model=str(controller_info.get("selected_model", "")).strip(),
+                    profile=str(controller_info.get("model_profile", "")).strip(),
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             console.print(f"[red]{_auto_msg(lang, 'tmux_failed')}[/red] {exc}")
@@ -7200,12 +7304,25 @@ def _launch_tmux_orchestration(
                 f"[yellow]{_auto_msg(lang, 'tmux_session_renamed', old=session, new=resolved_session)}[/yellow]"
             )
         try:
+            controller_info = next(
+                (
+                    item for item in available_agents
+                    if str(item.get("agent", "")).strip() == controller
+                ),
+                {},
+            )
             controller_pane = create_controller_workspace(
                 session=resolved_session,
                 cwd=cwd,
                 controller=controller,
                 reset=False,
                 autorun=True,
+                agent_cmd=_tmux_agent_startup_command(
+                    controller,
+                    selected_cli=str(controller_info.get("selected_cli", "")).strip(),
+                    model=str(controller_info.get("selected_model", "")).strip(),
+                    profile=str(controller_info.get("model_profile", "")).strip(),
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             console.print(f"[red]{_auto_msg(lang, 'tmux_failed')}[/red] {exc}")
@@ -8154,7 +8271,12 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
                 f"Auto-trigger skills (apply if available): {', '.join(result.suggested_skills)}\n\n"
                 f"Task: {task}"
             )
-        _safe_execute(provider_config.cli, task_with_context, timeout=provider_config.timeout)
+        selected_cli = provider_config.cli
+        try:
+            selected_cli = ModelSelector(config).select_model(provider, task, "default").cli
+        except Exception:
+            selected_cli = provider_config.cli
+        _safe_execute(selected_cli, task_with_context, timeout=provider_config.timeout)
 
 
 

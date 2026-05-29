@@ -1882,19 +1882,20 @@ def _edit_plan_prompt(
 
 def _execution_target_default_value(state: LaunchPromptState, targets: list[ExecutionTargetOption]) -> str:
     runtime_mode = str(getattr(state.config, "runtime_mode", "tmux") or "tmux").strip().lower()
-    if runtime_mode == "tmux":
+    if runtime_mode == "tmux" and any(target.key == "tmux" and target.enabled for target in targets):
         return "tmux"
     return "save" if any(target.key == "save" and target.enabled for target in targets) else "tmux"
 
 
 def _execution_target_screen_renderable(
     state: LaunchPromptState,
+    result: UxLabV3Result,
     *,
     pointed_value: str,
     error_message: str = "",
 ) -> Group:
     copy = _copy(state.config)
-    targets = build_execution_targets(state)
+    targets = build_execution_targets(state, result)
     parts: list[object] = []
     parts.extend(_banner_parts())
     parts.append(Text())
@@ -1953,18 +1954,20 @@ def _execution_target_screen_renderable(
 def _start_execution_prompt(
     *,
     state: LaunchPromptState,
+    result: UxLabV3Result,
     selector_fn: SelectFn | None,
     console_obj: Console,
     clear_screen: bool,
     error_message: str = "",
 ) -> str:
-    targets = build_execution_targets(state)
+    targets = build_execution_targets(state, result)
     enabled_values = [target.key for target in targets if target.enabled]
     values = [*enabled_values, "b", *(["h"] if state.from_entry else []), "q"]
     default_value = _execution_target_default_value(state, targets)
     return _select_screen(
         lambda pointed: _execution_target_screen_renderable(
             state,
+            result,
             pointed_value=pointed,
             error_message=error_message,
         ),
@@ -2962,6 +2965,7 @@ def run_launch_prompt(
                 while True:
                     start_choice = _start_execution_prompt(
                         state=state,
+                        result=result,
                         selector_fn=selector_fn,
                         console_obj=console_obj,
                         clear_screen=clear_screen,
