@@ -65,6 +65,8 @@ ai-collab "设计并实现一个带鉴权的 REST API，并给出测试与发布
 ### 3. 启用 tmux 可视化协作
 
 ```bash
+ai-collab detect "实现一个包含前端与后端的最小业务功能，并完成审查" --output json
+
 ai-collab \
   --provider codex \
   --execution-mode tmux \
@@ -72,6 +74,9 @@ ai-collab \
   --tmux-prewarm-subagents \
   "实现一个包含前端与后端的最小业务功能，并完成审查"
 ```
+
+说明：当前版本只有在“计划仍然是可执行的多 Agent 编排”时才会直接进入 `tmux`。
+如果计划编辑后变成单 Agent，或所有步骤都落到同一个 Agent，执行目标页会自动禁用 `tmux`，仅保留“保存启动包”。
 
 ## 常用子命令
 

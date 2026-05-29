@@ -4,11 +4,14 @@ Local runtime environment detection for provider CLIs.
 
 from __future__ import annotations
 
+import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping, Optional
 
 from ai_collab.core.config import ProviderConfig
@@ -23,6 +26,7 @@ class ProviderRuntimeStatus:
     available: bool
     resolved_path: str = ""
     version: str = ""
+    detected_model: str = ""
 
 
 def detect_os_name(system_name: Optional[str] = None) -> str:
@@ -69,6 +73,21 @@ def _read_version(executable: str) -> str:
     return text.splitlines()[0].strip()
 
 
+def _read_codex_model() -> str:
+    """Read the configured local Codex model from config.toml."""
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+    config_file = codex_home / "config.toml"
+    try:
+        text = config_file.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    match = re.search(r'(?m)^\s*model\s*=\s*["\']([^"\']+)["\']\s*$', text)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
 def detect_provider_status(
     providers: Mapping[str, ProviderConfig],
     *,
@@ -81,11 +100,13 @@ def detect_provider_status(
         exe = resolve_executable(provider_cfg.cli, os_name=normalized_os)
         resolved = shutil.which(exe) if exe else None
         available = bool(resolved)
+        detected_model = _read_codex_model() if provider_name == "codex" else ""
         statuses[provider_name] = ProviderRuntimeStatus(
             provider=provider_name,
             executable=exe,
             available=available,
             resolved_path=resolved or "",
             version=_read_version(exe) if available else "",
+            detected_model=detected_model,
         )
     return statuses

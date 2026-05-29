@@ -3,6 +3,7 @@ Model selection module.
 Selects the best model for a provider and task.
 """
 
+import shlex
 from typing import Optional
 from pydantic import BaseModel
 
@@ -41,6 +42,42 @@ class ModelSelector:
             if isinstance(value, dict) and value.get("model"):
                 valid[key] = value
         return valid
+
+    def _replace_or_append_codex_flags(self, cli: str, *, model: str, thinking: str) -> str:
+        try:
+            parts = shlex.split(cli)
+        except ValueError:
+            parts = cli.strip().split()
+
+        cleaned: list[str] = []
+        idx = 0
+        while idx < len(parts):
+            part = parts[idx]
+            if part == "--model":
+                idx += 2
+                continue
+            if part.startswith("--model="):
+                idx += 1
+                continue
+            if part == "--thinking":
+                idx += 2
+                continue
+            if part.startswith("--thinking="):
+                idx += 1
+                continue
+            if part in {"-c", "--config"} and idx + 1 < len(parts):
+                config_value = parts[idx + 1]
+                if str(config_value).startswith("model_reasoning_effort="):
+                    idx += 2
+                    continue
+            cleaned.append(part)
+            idx += 1
+
+        if model:
+            cleaned.extend(["--model", model])
+        if thinking:
+            cleaned.extend(["-c", f'model_reasoning_effort="{thinking}"'])
+        return " ".join(shlex.quote(item) for item in cleaned)
 
     def select_model(
         self, provider: str, task: str, complexity: str = "default"
@@ -105,12 +142,19 @@ class ModelSelector:
             thinking = requested
 
         default_model = str(models.get("default_model", "gpt-5.4")).strip() or "gpt-5.4"
+        selected_model = str(level.get("model") or default_model).strip() or default_model
+        cli = self._replace_or_append_codex_flags(
+            base_cli,
+            model=selected_model,
+            thinking=thinking,
+        )
 
         return ModelSelectionResult(
-            cli=base_cli,
-            model=default_model,
+            cli=cli,
+            model=selected_model,
             thinking=thinking,
             description=level.get("description", ""),
+            flag=f'--model {selected_model} -c model_reasoning_effort="{thinking}"',
         )
 
     def _select_claude_model(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from io import StringIO
+import shlex
 import sys
 from typing import Callable, Literal
 
@@ -2617,10 +2618,37 @@ def _update_auto_label(lang: str, enabled: bool) -> str:
     return "Auto-check enabled" if enabled else "Manual checks"
 
 
+def _replace_or_append_cli_flag(cli: str, flag: str, value: str) -> str:
+    try:
+        parts = shlex.split(cli)
+    except ValueError:
+        parts = cli.strip().split()
+
+    cleaned: list[str] = []
+    skip_next = False
+    for part in parts:
+        if skip_next:
+            skip_next = False
+            continue
+        if part == flag:
+            skip_next = True
+            continue
+        if part.startswith(f"{flag}="):
+            continue
+        cleaned.append(part)
+
+    if value:
+        cleaned.extend([flag, value])
+    return " ".join(shlex.quote(item) for item in cleaned)
+
+
 def _provider_model_id(provider: str, provider_config, profile_key: str) -> str:
     models = provider_config.models or {}
     if provider == "codex":
-        return str(models.get("default_model", "gpt-5.4")).strip() or "gpt-5.4"
+        thinking_levels = models.get("thinking_levels", {}) if isinstance(models.get("thinking_levels", {}), dict) else {}
+        level_cfg = thinking_levels.get(profile_key, {}) if isinstance(thinking_levels.get(profile_key, {}), dict) else {}
+        default_model = str(models.get("default_model", "gpt-5.4")).strip() or "gpt-5.4"
+        return str(level_cfg.get("model") or default_model).strip() or default_model
     if provider == "claude":
         if profile_key in {"powerful", "cost_effective"}:
             cfg = models.get(profile_key, {}) if isinstance(models.get(profile_key, {}), dict) else {}
@@ -2711,7 +2739,7 @@ def _provider_profile_options(provider: str, provider_config, *, lang: str) -> l
         order = _provider_profile_keys(provider, provider_config)
         options: list[ChoiceOption] = []
         for index, key in enumerate(order, start=1):
-            desc_parts = [str(models.get("default_model", "gpt-5.4")).strip() or "gpt-5.4"]
+            desc_parts = [_provider_model_id(provider, provider_config, key)]
             level_desc = str((thinking_levels.get(key) or {}).get("description", "")).strip()
             if level_desc:
                 desc_parts.append(level_desc)
@@ -2767,6 +2795,12 @@ def _apply_provider_profile_choice(provider: str, provider_config, profile_key: 
     if provider == "codex":
         provider_config.models["default_model"] = str(provider_config.models.get("default_model", "gpt-5.4") or "gpt-5.4")
         provider_config.models["default_thinking"] = profile_key if profile_key in {"low", "medium", "high", "xhigh"} else "high"
+        thinking_levels = provider_config.models.get("thinking_levels", {})
+        level_cfg = thinking_levels.get(profile_key, {}) if isinstance(thinking_levels, dict) and isinstance(thinking_levels.get(profile_key, {}), dict) else {}
+        selected_model = str(level_cfg.get("model") or provider_config.models["default_model"]).strip()
+        if selected_model:
+            provider_config.models["default_model"] = selected_model
+            provider_config.cli = _replace_or_append_cli_flag(provider_config.cli, "--model", selected_model)
         provider_config.model_selection = "default"
         return
 
@@ -3326,7 +3360,7 @@ def _provider_profile_options(provider: str, provider_config, *, lang: str) -> l
         order = _provider_profile_keys(provider, provider_config)
         options: list[ChoiceOption] = []
         for index, key in enumerate(order, start=1):
-            model_id = str(models.get("default_model", "gpt-5.4")).strip() or "gpt-5.4"
+            model_id = _provider_model_id(provider, provider_config, key)
             description = _localized_profile_description(lang, provider, key, str((thinking_levels.get(key) or {}).get("description", "")).strip())
             options.append(ChoiceOption(str(index), _profile_label(lang, key), f"{model_id} · {description}", provider=provider))
         return options

@@ -305,3 +305,4 @@ def test_create_default_config_includes_app_and_billing_strategy_defaults():
     assert config.economics["cross_provider_fallback"] == "same-provider-first"
     assert "xhigh" in config.providers["codex"].models["enabled_profiles"]
     assert config.providers["codex"].models["default_model"] == "gpt-5.4"
+    assert config.providers["codex"].models["thinking_levels"]["high"]["model"] == "gpt-5.5"

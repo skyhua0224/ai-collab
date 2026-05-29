@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import ai_collab.cli as cli
 from ai_collab.core.config import Config
-from ai_collab.config_prompt import _app_section_screen, _provider_picker_screen, _routing_section_screen, render_choice_screen, render_config_menu_screen, run_config_menu_prompt, ConfigMenuState
+from ai_collab.config_prompt import _app_section_screen, _provider_picker_screen, _provider_profile_screen, _routing_section_screen, render_choice_screen, render_config_menu_screen, run_config_menu_prompt, ConfigMenuState
 from rich.console import Console
 
 
@@ -226,8 +226,11 @@ def test_provider_picker_shows_actual_model_identifier_and_thinking() -> None:
     state = ConfigMenuState.from_config(config)
 
     output = render_choice_screen(_provider_picker_screen(state, config), lang="zh-CN", allow_back=True)
+    codex_profiles = render_choice_screen(_provider_profile_screen(state, config, provider="codex"), lang="zh-CN", allow_back=True)
 
-    assert "gpt-5.4" in output
+    assert "gpt-5.5" in output
+    assert "gpt-5.4" in codex_profiles
+    assert "gpt-5.5" in codex_profiles
     assert "深度开发" in output or "标准开发" in output
     assert "claude-sonnet-4-6" in output
     assert "gemini-3.1-pro-preview" in output

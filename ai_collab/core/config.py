@@ -655,18 +655,22 @@ class Config(BaseModel):
                         "enabled_profiles": ["low", "medium", "high", "xhigh"],
                         "thinking_levels": {
                             "low": {
+                                "model": "gpt-5.4",
                                 "flag": "--thinking low",
                                 "description": "Simple tasks (formatting, small edits)",
                             },
                             "medium": {
+                                "model": "gpt-5.4",
                                 "flag": "--thinking medium",
                                 "description": "Feature implementation and refactoring",
                             },
                             "high": {
+                                "model": "gpt-5.5",
                                 "flag": "--thinking high",
                                 "description": "Complex architecture and multi-module logic",
                             },
                             "xhigh": {
+                                "model": "gpt-5.5",
                                 "flag": "--thinking xhigh",
                                 "description": "Deepest reasoning for hard planning, architecture, and cross-file refactors",
                             },

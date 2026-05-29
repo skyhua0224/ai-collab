@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from ai_collab.core.config import Config
+from ai_collab.core.selector import ModelSelector
 from ai_collab.core.workflow_v2 import (
     builtin_session_presets,
     find_session_preset_for_workflow_blueprint,
@@ -115,6 +116,7 @@ class WorkflowManager:
 
     def __init__(self, config: Config):
         self.config = config
+        self.selector = ModelSelector(config)
 
     def execute_workflow(
         self,
@@ -672,6 +674,10 @@ Expected output: {resolved_phase['output']}
         """Build provider CLI for a phase, applying selected profile when possible."""
         provider_config = self.config.providers[agent]
         cli = provider_config.cli
+        if agent == "codex":
+            complexity = profile or "default"
+            selected = self.selector.select_model(agent, "", complexity)
+            return self._with_codex_repo_flag(agent, selected.cli)
         if not profile:
             return self._with_codex_repo_flag(agent, cli)
 

@@ -127,7 +127,7 @@ def test_plan_draft_prevents_deleting_last_step() -> None:
     assert [step.id for step in draft.steps] == ["S1"]
 
 
-def test_execution_targets_include_disabled_future_modes() -> None:
+def test_execution_targets_include_disabled_future_modes(monkeypatch) -> None:
     from ai_collab.core.config import Config
     from ai_collab.launch_prompt import LaunchPromptState
     from ai_collab.plan_editor_prompt import build_execution_targets
@@ -141,9 +141,49 @@ def test_execution_targets_include_disabled_future_modes() -> None:
         workspace=Path("/Users/skyhua/ai-collab"),
         from_entry=True,
     )
+    monkeypatch.setattr("ai_collab.plan_editor_prompt.shutil.which", lambda _name: "/opt/homebrew/bin/tmux")
 
-    targets = build_execution_targets(state)
+    targets = build_execution_targets(state, _sample_result())
 
     assert [target.key for target in targets] == ["tmux", "iterm2", "console", "gui", "save"]
     assert [target.enabled for target in targets] == [True, False, False, False, True]
     assert all(target.badge == "Coming Soon" for target in targets[1:4])
+
+
+def test_execution_targets_disable_tmux_for_non_multi_agent_plan(monkeypatch) -> None:
+    from ai_collab.core.config import Config
+    from ai_collab.launch_prompt import LaunchPromptState
+    from ai_collab.plan_editor_prompt import build_execution_targets
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    config.runtime_mode = "tmux"
+    state = LaunchPromptState.from_config(
+        config,
+        cwd=Path("/Users/skyhua/ai-collab"),
+        workspace=Path("/Users/skyhua/ai-collab"),
+        from_entry=True,
+    )
+    monkeypatch.setattr("ai_collab.plan_editor_prompt.shutil.which", lambda _name: "/opt/homebrew/bin/tmux")
+
+    result = UxLabV3Result(
+        status="planned",
+        workspace=Path("/tmp/project"),
+        controller="codex",
+        task="单 Agent 计划",
+        lang="zh-CN",
+        planner_mode="live",
+        plan=[LabPlanItem("S1", "只由主控执行", "codex", 5, "返回结果")],
+        controller_plan={
+            "plan_version": "1.0",
+            "controller": "codex",
+            "requires_multi_agent": False,
+            "steps": [{"id": "S1", "owner": "codex", "goal": "只由主控执行", "done_when": "返回结果", "eta_minutes": 5}],
+        },
+    )
+
+    targets = build_execution_targets(state, result)
+
+    assert [target.key for target in targets] == ["tmux", "iterm2", "console", "gui", "save"]
+    assert [target.enabled for target in targets] == [False, False, False, False, True]
+    assert "多 Agent" in targets[0].description

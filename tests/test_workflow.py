@@ -203,6 +203,8 @@ def test_codex_cli_auto_adds_skip_repo_check_outside_git(config: Config, monkeyp
 
     cli = manager._build_phase_cli("codex", "high")
 
+    assert "--model gpt-5.5" in cli
+    assert 'model_reasoning_effort="high"' in cli
     assert "--skip-git-repo-check" in cli
 
 

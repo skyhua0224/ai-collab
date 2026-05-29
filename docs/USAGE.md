@@ -123,6 +123,8 @@ ai-collab -p codex -x direct "Build audit logging and retention policy checks"
 ### tmux execution (inline panes)
 
 ```bash
+ai-collab detect "Deliver a full-stack feature with implementation and review handoff" --output json
+
 ai-collab \
   -p codex \
   -x tmux \
@@ -131,6 +133,9 @@ ai-collab \
   -c \
   "Deliver a full-stack feature with implementation and review handoff"
 ```
+
+`tmux` direct start is only available when the generated or edited plan is still multi-agent.
+In practice, the orchestration must keep at least two different step owners; if every step ends up on the same agent, the execution target screen disables `tmux` and only allows saving the startup bundle.
 
 ### Plan-only mode
 
@@ -209,8 +214,15 @@ ai-collab --dry-run --output json "<task>"
 
 ```bash
 which tmux
+ai-collab detect "<task>" --output json
 ai-collab --execution-mode tmux --tmux-target session "<task>"
 ```
+
+Check the detected or approved plan before assuming `tmux` is broken:
+
+1. `tmux` must exist in `PATH`.
+2. The plan must remain multi-agent.
+3. After plan edits, `steps[].owner` must still contain at least two different agents.
 
 ### Language not applied
 

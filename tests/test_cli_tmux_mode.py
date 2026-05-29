@@ -51,6 +51,81 @@ def test_tmux_launch_defaults_to_controller_only(monkeypatch) -> None:
     assert called["attach"] == 1
 
 
+def test_tmux_agent_startup_command_uses_real_codex_model_and_profile() -> None:
+    command = cli._tmux_agent_startup_command(
+        "codex",
+        model="gpt-5.4",
+        profile="xhigh",
+    )
+
+    assert command == 'codex --model gpt-5.4 -c model_reasoning_effort="xhigh"'
+
+
+def test_tmux_agent_startup_command_preserves_selected_cli_for_claude_and_gemini() -> None:
+    claude_cmd = cli._tmux_agent_startup_command(
+        "claude",
+        selected_cli="claude --model claude-sonnet-4-6",
+    )
+    gemini_cmd = cli._tmux_agent_startup_command(
+        "gemini",
+        selected_cli="gemini -o text --approval-mode yolo --model gemini-3.1-pro-preview",
+    )
+
+    assert claude_cmd == "claude --model claude-sonnet-4-6"
+    assert gemini_cmd == "gemini -o text --approval-mode yolo --model gemini-3.1-pro-preview"
+
+
+def test_tmux_launch_passes_real_startup_commands(monkeypatch) -> None:
+    result = SimpleNamespace(
+        execution_mode="multi-agent",
+        available_agents=[
+            {
+                "agent": "codex",
+                "selected_model": "gpt-5.4",
+                "selected_cli": "codex exec --model gpt-5.4 --thinking xhigh",
+                "model_profile": "xhigh",
+            }
+        ],
+        orchestration_plan=[
+            {
+                "agent": "gemini",
+                "role": "frontend-build",
+                "selected_model": "gemini-3.1-pro-preview",
+                "selected_cli": "gemini -o text --approval-mode yolo --model gemini-3.1-pro-preview",
+                "profile": "powerful",
+            }
+        ],
+    )
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(cli, "_can_launch_tmux", lambda _result: True)
+    monkeypatch.setattr(
+        cli,
+        "create_controller_workspace",
+        lambda **kwargs: (captured.__setitem__("controller_cmd", str(kwargs.get("agent_cmd", ""))), "%1")[1],
+    )
+    monkeypatch.setattr(cli, "_inject_prompt_to_pane", lambda **_kwargs: True)
+    monkeypatch.setattr(cli, "attach_session", lambda **_kwargs: None)
+    monkeypatch.setattr(cli, "pane_logs_dir", lambda **_kwargs: Path("/tmp/pane-logs"))
+    monkeypatch.setattr(cli, "_start_handoff_watcher", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "spawn_subagent_pane",
+        lambda **kwargs: (captured.__setitem__("subagent_cmd", str(kwargs.get("agent_cmd", ""))), "%2")[1],
+    )
+
+    ok = cli._launch_tmux_orchestration(
+        task="build tiny todo",
+        controller="codex",
+        result=result,
+        prewarm_subagents=True,
+    )
+
+    assert ok is True
+    assert captured["controller_cmd"] == 'codex --model gpt-5.4 -c model_reasoning_effort="xhigh"'
+    assert captured["subagent_cmd"] == "gemini -o text --approval-mode yolo --model gemini-3.1-pro-preview"
+
+
 def test_tmux_launch_can_prewarm_subagents(monkeypatch) -> None:
     """Prewarm mode should create panes for non-controller agents."""
     result = _sample_result()
@@ -2505,6 +2580,22 @@ def test_build_controller_planner_command_for_codex_uses_schema_and_output_files
     assert "--skip-git-repo-check" in cmd
     assert cmd[cmd.index("--output-schema") + 1] == "/tmp/schema.json"
     assert cmd[cmd.index("--output-last-message") + 1] == "/tmp/output.json"
+    assert cmd[-1] == "return json only"
+
+
+def test_build_controller_planner_command_for_codex_converts_thinking_flag() -> None:
+    """Codex exec does not accept --thinking; planner should use config override."""
+    cmd = cli._build_controller_planner_command(
+        provider_cli="codex exec --model gpt-5.4 --thinking high",
+        controller="codex",
+        prompt_text="return json only",
+        schema_path="/tmp/schema.json",
+        output_path="/tmp/output.json",
+    )
+
+    assert "--thinking" not in cmd
+    assert "-c" in cmd
+    assert 'model_reasoning_effort="high"' in cmd
     assert cmd[-1] == "return json only"
 
 
