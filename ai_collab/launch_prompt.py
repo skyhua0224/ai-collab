@@ -169,7 +169,7 @@ TEXT = {
         "plan_edit_step_owner_short": "Agent",
         "plan_edit_step_eta_short": "ETA",
         "plan_edit_step_done_short": "Done when",
-        "plan_edit_shortcuts": "↑/↓ select · Enter edit · a insert · d delete · J/K move · t task · s save back · q discard",
+        "plan_edit_shortcuts": "↑/↓ select · Enter edit · a insert · d delete · J/K move · t task · s/b/Esc back to preview · q discard",
         "plan_edit_form_step_title": "Edit step · {step_id}",
         "plan_edit_form_insert_title": "Insert step · after {step_id}",
         "plan_edit_form_task_title": "Rename task",
@@ -335,7 +335,7 @@ TEXT = {
         "plan_edit_step_owner_short": "Agent",
         "plan_edit_step_eta_short": "ETA",
         "plan_edit_step_done_short": "完成条件",
-        "plan_edit_shortcuts": "↑/↓ 选步骤 · Enter 编辑 · a 插入 · d 删除 · J/K 下移/上移 · t 改任务名 · s 返回预览 · q 放弃修改",
+        "plan_edit_shortcuts": "↑/↓ 选步骤 · Enter 编辑 · a 插入 · d 删除 · J/K 下移/上移 · t 改任务名 · s/b/Esc 返回预览 · q 放弃修改",
         "plan_edit_form_step_title": "编辑步骤 · {step_id}",
         "plan_edit_form_insert_title": "插入新步骤 · 接在 {step_id} 后",
         "plan_edit_form_task_title": "修改任务名称",
@@ -1675,7 +1675,7 @@ def _select_plan_editor_action(
     console_obj: Console,
     clear_screen: bool,
 ) -> tuple[str, int]:
-    values = ["up", "down", "edit", "insert", "delete", "move_down", "move_up", "rename_task", "save", "quit"]
+    values = ["up", "down", "edit", "insert", "delete", "move_down", "move_up", "rename_task", "save", "back", "quit"]
     if selector_fn is not None or not sys.stdin.isatty():
         if clear_screen:
             console_obj.clear()
@@ -1758,9 +1758,13 @@ def _select_plan_editor_action(
     def _save(event) -> None:
         event.app.exit(result="save")
 
+    @bindings.add("b", eager=True)
+    @bindings.add(Keys.Escape, eager=True)
+    def _back(event) -> None:
+        event.app.exit(result="back")
+
     @bindings.add("q", eager=True)
     @bindings.add(Keys.ControlC, eager=True)
-    @bindings.add(Keys.Escape, eager=True)
     def _quit(event) -> None:
         event.app.exit(result="quit")
 
@@ -1869,7 +1873,7 @@ def _edit_plan_prompt(
             rename_task(draft, _ask_text_value(copy["plan_edit_task"], default=draft.task or state.task, input_fn=input_fn) or draft.task)
             status_message = copy["plan_edit_status_saved"]
             continue
-        if action == "save":
+        if action in {"save", "back"}:
             updated = apply_plan_draft_to_result(draft, result)
             state.task = updated.task
             return updated
@@ -2926,97 +2930,99 @@ def run_launch_prompt(
         if result.status != "planned":
             return result
 
-        review_values = ["1", "2", "3", "b"] + (["h"] if state.from_entry else []) + ["q"]
-        review_choice = _select_review_screen(
-            state=state,
-            result=result,
-            values=review_values,
-            default_value="1",
-            selector_fn=selector_fn,
-            console_obj=console_obj,
-            clear_screen=clear_screen,
-        )
-        if review_choice == "b":
-            continue
-        if review_choice == "h":
-            return "home" if state.from_entry else None
-        if review_choice == "q":
-            return None
-        if review_choice == "2":
-            result = _edit_plan_prompt(
+        while True:
+            review_values = ["1", "2", "3", "b"] + (["h"] if state.from_entry else []) + ["q"]
+            review_choice = _select_review_screen(
                 state=state,
                 result=result,
+                values=review_values,
+                default_value="1",
                 selector_fn=selector_fn,
-                input_fn=input_fn,
                 console_obj=console_obj,
                 clear_screen=clear_screen,
             )
-            continue
-        if review_choice == "1":
-            execution_error = ""
-            while True:
-                start_choice = _start_execution_prompt(
+            if review_choice == "b":
+                break
+            if review_choice == "h":
+                return "home" if state.from_entry else None
+            if review_choice == "q":
+                return None
+            if review_choice == "2":
+                result = _edit_plan_prompt(
                     state=state,
+                    result=result,
                     selector_fn=selector_fn,
+                    input_fn=input_fn,
                     console_obj=console_obj,
                     clear_screen=clear_screen,
-                    error_message=execution_error,
                 )
-                if start_choice == "b":
-                    break
-                if start_choice == "h":
-                    return "home" if state.from_entry else None
-                if start_choice == "q":
-                    return None
-                if start_choice == "tmux":
-                    launched, execution_error = _start_tmux_execution(state=state, result=result)
-                    if not launched:
-                        continue
-                    started = UxLabV3Result(
-                        status="started",
-                        workspace=state.workspace,
-                        controller=state.controller,
-                        task=state.task,
-                        lang=_lang(state.config),
-                        planner_mode=state.planner_mode,
-                        plan=result.plan,
-                        controller_plan=result.controller_plan,
-                    )
-                    if clear_screen:
-                        console_obj.clear()
-                    console_obj.print(_result_screen_renderable(state, started, runtime_label=_copy(state.config)["execution_tmux"]), end="")
-                    return started
-                if start_choice == "save":
-                    review_choice = "3"
-                    break
-            if review_choice != "3":
                 continue
+            if review_choice == "1":
+                execution_error = ""
+                while True:
+                    start_choice = _start_execution_prompt(
+                        state=state,
+                        selector_fn=selector_fn,
+                        console_obj=console_obj,
+                        clear_screen=clear_screen,
+                        error_message=execution_error,
+                    )
+                    if start_choice == "b":
+                        break
+                    if start_choice == "h":
+                        return "home" if state.from_entry else None
+                    if start_choice == "q":
+                        return None
+                    if start_choice == "tmux":
+                        launched, execution_error = _start_tmux_execution(state=state, result=result)
+                        if not launched:
+                            continue
+                        started = UxLabV3Result(
+                            status="started",
+                            workspace=state.workspace,
+                            controller=state.controller,
+                            task=state.task,
+                            lang=_lang(state.config),
+                            planner_mode=state.planner_mode,
+                            plan=result.plan,
+                            controller_plan=result.controller_plan,
+                        )
+                        if clear_screen:
+                            console_obj.clear()
+                        console_obj.print(_result_screen_renderable(state, started, runtime_label=_copy(state.config)["execution_tmux"]), end="")
+                        return started
+                    if start_choice == "save":
+                        review_choice = "3"
+                        break
+                if review_choice != "3":
+                    continue
 
-        bundle_path = export_launch_bundle_v3(
-            workspace=state.workspace,
-            controller=state.controller,
-            task=state.task,
-            lang=_lang(state.config),
-            planner_mode=state.planner_mode,
-            plan=result.plan,
-            output_path=state.output_bundle,
-            controller_plan=result.controller_plan,
-        )
-        saved = UxLabV3Result(
-            status="saved",
-            workspace=state.workspace,
-            controller=state.controller,
-            task=state.task,
-            lang=_lang(state.config),
-            planner_mode=state.planner_mode,
-            plan=result.plan,
-            bundle_path=bundle_path,
-            controller_plan=result.controller_plan,
-        )
-        if clear_screen:
-            console_obj.clear()
-        console_obj.print(_result_screen_renderable(state, saved, runtime_label=_copy(state.config)["execution_save"]), end="")
-        return saved
+            bundle_path = export_launch_bundle_v3(
+                workspace=state.workspace,
+                controller=state.controller,
+                task=state.task,
+                lang=_lang(state.config),
+                planner_mode=state.planner_mode,
+                plan=result.plan,
+                output_path=state.output_bundle,
+                controller_plan=result.controller_plan,
+            )
+            saved = UxLabV3Result(
+                status="saved",
+                workspace=state.workspace,
+                controller=state.controller,
+                task=state.task,
+                lang=_lang(state.config),
+                planner_mode=state.planner_mode,
+                plan=result.plan,
+                bundle_path=bundle_path,
+                controller_plan=result.controller_plan,
+            )
+            if clear_screen:
+                console_obj.clear()
+            console_obj.print(_result_screen_renderable(state, saved, runtime_label=_copy(state.config)["execution_save"]), end="")
+            return saved
+        continue
 
 
 __all__ = [

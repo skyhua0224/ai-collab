@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import textwrap
@@ -220,6 +220,10 @@ class UxLabV3Result:
     bundle_path: Optional[Path] = None
     error_message: Optional[str] = None
     controller_plan: Optional[dict[str, Any]] = None
+    execution_mode: str = "single-agent"
+    orchestration_plan: list[dict[str, str]] = field(default_factory=list)
+    selected_agents: list[str] = field(default_factory=list)
+    available_agents: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass

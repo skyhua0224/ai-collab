@@ -198,6 +198,94 @@ def test_run_launch_prompt_can_start_tmux_from_execution_targets(monkeypatch, tm
     assert "tmux runtime" in output
 
 
+def test_run_launch_prompt_keeps_review_preview_after_plan_edit(monkeypatch, tmp_path) -> None:
+    from ai_collab.launch_prompt import run_launch_prompt
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    config.current_controller = "codex"
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=120)
+    planning_calls = {"count": 0}
+    review_calls = {"count": 0}
+    confirm_calls = {"count": 0}
+    plan_editor_actions = iter(["delete", "back"])
+
+    planned_result = UxLabV3Result(
+        status="planned",
+        workspace=tmp_path,
+        controller="codex",
+        task="测试编排预览返回",
+        lang="zh-CN",
+        planner_mode="mock",
+        plan=[
+            LabPlanItem("S1", "主控计划", "codex", 8, "返回计划"),
+            LabPlanItem("S2", "补充回归测试", "claude", 6, "验证返回行为"),
+        ],
+        controller_plan={
+            "plan_version": "1.0",
+            "controller": "codex",
+            "requires_multi_agent": True,
+            "agents": [
+                {"name": "codex", "model": "gpt-5.4", "persona": "controller", "why": "负责执行"},
+                {"name": "claude", "model": "claude-sonnet-4-6", "persona": "collaborator", "why": "负责验证"},
+            ],
+            "steps": [
+                {"id": "S1", "owner": "codex", "goal": "主控计划", "done_when": "返回计划", "eta_minutes": 8},
+                {"id": "S2", "owner": "claude", "goal": "补充回归测试", "done_when": "验证返回行为", "eta_minutes": 6},
+            ],
+        },
+    )
+
+    def _run_planning(**_kwargs):
+        planning_calls["count"] += 1
+        return planned_result
+
+    def _selector(**kwargs) -> str:
+        screen = kwargs.get("screen")
+        choices = list(kwargs.get("choices", []))
+        if screen == "plan_editor":
+            return next(plan_editor_actions)
+        if choices == ["1", "2", "3", "b", "h", "q"]:
+            review_calls["count"] += 1
+            return "2" if review_calls["count"] == 1 else "3"
+        if choices == ["1", "b", "h", "q"]:
+            confirm_calls["count"] += 1
+            if confirm_calls["count"] > 1:
+                raise AssertionError("confirm-and-generate screen was shown again after editing the plan")
+            return "1"
+        if choices == ["1", "2", "b", "h", "q"]:
+            return "2"
+        if choices == ["1", "2", "3", "h", "q"]:
+            return "1"
+        raise AssertionError(f"unexpected selector call: screen={screen!r} choices={choices!r}")
+
+    monkeypatch.setattr("ai_collab.launch_prompt._run_planning_with_progress", _run_planning)
+    monkeypatch.setattr("ai_collab.launch_prompt.export_launch_bundle_v3", lambda **kwargs: tmp_path / "bundle.json")
+
+    result = run_launch_prompt(
+        config=config,
+        cwd=tmp_path,
+        workspace=tmp_path,
+        controller=None,
+        task=None,
+        task_file=None,
+        planner_mode="mock",
+        output_bundle=tmp_path / "bundle.json",
+        input_fn=lambda prompt, default="": "测试编排预览返回",
+        selector_fn=_selector,
+        console_obj=console,
+        clear_screen=False,
+        from_entry=True,
+    )
+
+    assert result is not None
+    assert result.status == "saved"
+    assert planning_calls["count"] == 1
+    assert confirm_calls["count"] == 1
+    assert review_calls["count"] == 2
+
+
 def test_run_launch_prompt_keeps_execution_screen_after_tmux_failure(monkeypatch, tmp_path) -> None:
     from ai_collab.launch_prompt import run_launch_prompt
 
@@ -917,6 +1005,57 @@ def test_task_toolbar_copy_explains_slash_commands_need_new_line() -> None:
 
     assert "新起一行" in message or "另起一行" in message
     assert "/done" in message
+
+
+def test_edit_plan_prompt_back_preserves_current_draft(tmp_path) -> None:
+    from ai_collab.launch_prompt import LaunchPromptState, _edit_plan_prompt
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    state = LaunchPromptState.from_config(config, cwd=tmp_path, workspace=tmp_path, from_entry=True)
+    result = UxLabV3Result(
+        status="planned",
+        workspace=tmp_path,
+        controller="codex",
+        task="实现 tmux 修复",
+        lang="zh-CN",
+        planner_mode="live",
+        plan=[
+            LabPlanItem("S1", "修改启动流程", "codex", 8, "能稳定进入执行"),
+            LabPlanItem("S2", "补充回归测试", "claude", 6, "测试覆盖返回行为"),
+        ],
+        controller_plan={
+            "plan_version": "1.0",
+            "controller": "codex",
+            "requires_multi_agent": True,
+            "agents": [
+                {"name": "codex", "model": "gpt-5.4", "persona": "controller", "why": "负责实现"},
+                {"name": "claude", "model": "claude-sonnet-4-6", "persona": "collaborator", "why": "负责审查"},
+            ],
+            "steps": [
+                {"id": "S1", "owner": "codex", "goal": "修改启动流程", "done_when": "能稳定进入执行", "eta_minutes": 8},
+                {"id": "S2", "owner": "claude", "goal": "补充回归测试", "done_when": "测试覆盖返回行为", "eta_minutes": 6},
+            ],
+        },
+    )
+    actions = iter(["delete", "back"])
+
+    def _selector(**_kwargs) -> str:
+        return next(actions)
+
+    updated = _edit_plan_prompt(
+        state=state,
+        result=result,
+        selector_fn=_selector,
+        input_fn=lambda *_args, **_kwargs: "",
+        console_obj=Console(file=StringIO(), force_terminal=False, color_system=None, width=120),
+        clear_screen=False,
+    )
+
+    assert len(updated.plan) == 1
+    assert updated.plan[0].title == "补充回归测试"
+    assert updated.controller_plan is not None
+    assert updated.controller_plan["requires_multi_agent"] is False
 
 
 def test_prompt_task_with_prompt_toolkit_clears_screen_without_fullscreen_flash(monkeypatch) -> None:
