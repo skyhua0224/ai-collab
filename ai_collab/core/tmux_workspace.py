@@ -52,7 +52,9 @@ def _session_exists(session: str) -> bool:
     return result.returncode == 0
 
 
-def _interactive_cmd(agent: str) -> str:
+def _interactive_cmd(agent: str, *, agent_cmd: Optional[str] = None) -> str:
+    if str(agent_cmd or "").strip():
+        return str(agent_cmd).strip()
     return {
         "codex": "codex",
         "claude": "claude",
@@ -141,6 +143,7 @@ def create_controller_workspace(
     session: str,
     cwd: Path,
     controller: str,
+    agent_cmd: Optional[str] = None,
     reset: bool = False,
     autorun: bool = True,
 ) -> str:
@@ -199,6 +202,7 @@ def create_controller_workspace(
                 agent=controller,
                 cwd=cwd,
                 autorun=True,
+                agent_cmd=agent_cmd,
             ),
         )
     return controller_pane
@@ -208,6 +212,7 @@ def create_inline_controller_workspace(
     *,
     cwd: Path,
     controller: str,
+    agent_cmd: Optional[str] = None,
     parent_pane: Optional[str] = None,
     autorun: bool = True,
     split_percent: int = 45,
@@ -258,20 +263,22 @@ def create_inline_controller_workspace(
                 agent=controller,
                 cwd=cwd,
                 autorun=True,
+                agent_cmd=agent_cmd,
             ),
         )
     return session, controller_pane
 
 
-def _controller_script(*, agent: str, cwd: Path, autorun: bool) -> str:
+def _controller_script(*, agent: str, cwd: Path, autorun: bool, agent_cmd: Optional[str] = None) -> str:
     """Generate startup command for controller pane."""
     base = "export AI_COLLAB_ACTIVE=1; export AI_COLLAB_ROLE=controller"
 
     if autorun:
-        cmd = _interactive_cmd(agent)
+        cmd = _interactive_cmd(agent, agent_cmd=agent_cmd)
+        executable = shlex.split(cmd)[0] if cmd.strip() else agent
         return (
             f"{base}; "
-            f"if command -v {shlex.quote(cmd)} >/dev/null 2>&1; then "
+            f"if command -v {shlex.quote(executable)} >/dev/null 2>&1; then "
             f"{cmd}; "
             "else "
             f"echo 'Command not found: {cmd}'; "
@@ -287,6 +294,7 @@ def spawn_subagent_pane(
     agent: str,
     cwd: Path,
     task_description: str = "",
+    agent_cmd: Optional[str] = None,
 ) -> str:
     """
     Spawn a sub-agent pane below the controller.
@@ -353,17 +361,19 @@ def spawn_subagent_pane(
             agent=agent,
             cwd=cwd,
             task_description=task_description,
+            agent_cmd=agent_cmd,
         ),
     )
     return new_pane
 
 
-def _subagent_script(*, agent: str, cwd: Path, task_description: str) -> str:
+def _subagent_script(*, agent: str, cwd: Path, task_description: str, agent_cmd: Optional[str] = None) -> str:
     """Generate startup command for sub-agent pane."""
-    cmd = _interactive_cmd(agent)
+    cmd = _interactive_cmd(agent, agent_cmd=agent_cmd)
+    executable = shlex.split(cmd)[0] if cmd.strip() else agent
     return (
         f"export AI_COLLAB_ACTIVE=1; export AI_COLLAB_ROLE=subagent; export AI_COLLAB_TASK={shlex.quote(task_description)}; "
-        f"if command -v {shlex.quote(cmd)} >/dev/null 2>&1; then "
+        f"if command -v {shlex.quote(executable)} >/dev/null 2>&1; then "
         f"{cmd}; "
         "else "
         f"echo 'Command not found: {cmd}'; "

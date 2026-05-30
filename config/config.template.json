@@ -57,18 +57,22 @@
         ],
         "thinking_levels": {
           "low": {
+            "model": "gpt-5.4",
             "flag": "--thinking low",
             "description": "Quick execution for tiny edits, cleanup, and terminal checks"
           },
           "medium": {
+            "model": "gpt-5.4",
             "flag": "--thinking medium",
             "description": "Standard development for routine features, refactors, and focused fixes"
           },
           "high": {
+            "model": "gpt-5.5",
             "flag": "--thinking high",
             "description": "Deep development for multi-file implementation and integration work"
           },
           "xhigh": {
+            "model": "gpt-5.5",
             "flag": "--thinking xhigh",
             "description": "Max-depth mode for hard planning, architecture tradeoffs, and long-horizon changes"
           }

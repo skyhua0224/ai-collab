@@ -65,6 +65,8 @@ ai-collab "Design and implement an authenticated REST API with test and release 
 ### 3. Force Visual tmux Collaboration
 
 ```bash
+ai-collab detect "Implement a minimal frontend-backend feature and complete review handoff" --output json
+
 ai-collab \
   --provider codex \
   --execution-mode tmux \
@@ -72,6 +74,9 @@ ai-collab \
   --tmux-prewarm-subagents \
   "Implement a minimal frontend-backend feature and complete review handoff"
 ```
+
+Note: the current runtime only starts `tmux` directly when the approved plan is still a runnable multi-agent orchestration.
+If plan edits collapse everything back to a single agent, the execution target screen disables `tmux` and keeps the startup-bundle save path only.
 
 ## Common Subcommands
 

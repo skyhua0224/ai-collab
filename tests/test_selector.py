@@ -15,9 +15,9 @@ def config():
     config.providers["codex"].models = {
         "enabled_profiles": ["low", "medium", "high"],
         "thinking_levels": {
-            "low": {"flag": "--thinking low", "description": "Simple tasks"},
-            "medium": {"flag": "--thinking medium", "description": "Medium tasks"},
-            "high": {"flag": "--thinking high", "description": "Complex tasks"},
+            "low": {"model": "gpt-5.4", "flag": "--thinking low", "description": "Simple tasks"},
+            "medium": {"model": "gpt-5.4", "flag": "--thinking medium", "description": "Medium tasks"},
+            "high": {"model": "gpt-5.5", "flag": "--thinking high", "description": "Complex tasks"},
         },
         "default_thinking": "medium",
     }
@@ -64,7 +64,7 @@ def test_select_codex_default(config):
 
     assert result.model == "gpt-5.4"
     assert result.thinking == "medium"
-    assert result.cli == "codex exec --model gpt-5.4"
+    assert result.cli == "codex exec --model gpt-5.4 -c 'model_reasoning_effort=\"medium\"'"
 
 
 def test_select_codex_low(config):
@@ -74,7 +74,17 @@ def test_select_codex_low(config):
 
     assert result.model == "gpt-5.4"
     assert result.thinking == "low"
-    assert result.cli == "codex exec --model gpt-5.4"
+    assert result.cli == "codex exec --model gpt-5.4 -c 'model_reasoning_effort=\"low\"'"
+
+
+def test_select_codex_high_uses_profile_model(config):
+    """Test selecting Codex high complexity model uses the profile model."""
+    selector = ModelSelector(config)
+    result = selector.select_model("codex", "Implement large feature", "high")
+
+    assert result.model == "gpt-5.5"
+    assert result.thinking == "high"
+    assert result.cli == "codex exec --model gpt-5.5 -c 'model_reasoning_effort=\"high\"'"
 
 
 def test_select_codex_respects_enabled_profiles(config):
@@ -85,7 +95,7 @@ def test_select_codex_respects_enabled_profiles(config):
     result = selector.select_model("codex", "Implement feature", "default")
 
     assert result.thinking == "low"
-    assert result.cli == "codex exec --model gpt-5.4"
+    assert result.cli == "codex exec --model gpt-5.4 -c 'model_reasoning_effort=\"low\"'"
 
 
 def test_select_gemini_powerful(config):
