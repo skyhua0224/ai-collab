@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from io import StringIO
+import json
 import os
 from pathlib import Path
 import re
@@ -22,6 +23,7 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import Prompt
+from rich.table import Table
 from rich.text import Text
 
 from ai_collab.core.config import Config
@@ -158,15 +160,21 @@ TEXT = {
         "plan_edit_status_deleted": "Removed the selected step.",
         "plan_edit_status_moved": "Reordered the selected step.",
         "plan_edit_list_title": "Orchestration editor",
-        "plan_edit_list_hint": "Select a step, then edit, insert, delete, or reorder it from this list.",
+        "plan_edit_list_hint": "Model routing, prompt wording, and step ownership stay visible while you reshape the plan.",
         "plan_edit_summary_task": "Task",
         "plan_edit_summary_controller": "Controller",
         "plan_edit_summary_steps": "Steps",
         "plan_edit_summary_mode": "Routing",
+        "plan_edit_summary_models": "Models",
+        "plan_edit_prompt_panel": "Prompt / Task Input",
+        "plan_edit_routes_panel": "Model Routing",
+        "plan_edit_steps_window": "Showing steps {start}-{end} / {total}",
+        "plan_edit_compact_routes": "Routes",
         "plan_edit_multi_agent": "Multi-agent",
         "plan_edit_single_agent": "Controller-only",
         "plan_edit_current_step": "Current step",
         "plan_edit_step_owner_short": "Agent",
+        "plan_edit_step_model_short": "Model",
         "plan_edit_step_eta_short": "ETA",
         "plan_edit_step_done_short": "Done when",
         "plan_edit_shortcuts": "↑/↓ select · Enter edit · a insert · d delete · J/K move · t task · s/b/Esc back to preview · q discard",
@@ -181,8 +189,9 @@ TEXT = {
         "plan_edit_discarded": "Discarded orchestration edits and returned to preview.",
         "execution_title": "Execution target",
         "execution_hint": "Pick how to continue this approved orchestration.",
-        "execution_note": "Only tmux runtime and startup-bundle save are executable right now.",
+        "execution_note": "direct runtime keeps execution in the current terminal: controller-only plans run as one agent, while multi-agent plans run sequentially without tmux panes.",
         "execution_error_title": "Start failed",
+        "execution_direct": "direct runtime",
         "execution_save": "Save startup bundle only",
         "execution_tmux": "tmux runtime",
         "execution_result_saved_title": "Startup bundle saved",
@@ -324,15 +333,21 @@ TEXT = {
         "plan_edit_status_deleted": "已删除当前步骤。",
         "plan_edit_status_moved": "已调整当前步骤顺序。",
         "plan_edit_list_title": "编排编辑器",
-        "plan_edit_list_hint": "直接在列表里选步骤，再编辑、插入、删除或重排。",
+        "plan_edit_list_hint": "重排计划时持续显示模型路由、Prompt 文案与步骤归属。",
         "plan_edit_summary_task": "任务",
         "plan_edit_summary_controller": "主控",
         "plan_edit_summary_steps": "步骤数",
         "plan_edit_summary_mode": "编排模式",
+        "plan_edit_summary_models": "模型数",
+        "plan_edit_prompt_panel": "Prompt / 任务输入",
+        "plan_edit_routes_panel": "模型路由",
+        "plan_edit_steps_window": "显示步骤 {start}-{end} / {total}",
+        "plan_edit_compact_routes": "路由",
         "plan_edit_multi_agent": "多 Agent",
         "plan_edit_single_agent": "仅主控",
         "plan_edit_current_step": "当前步骤",
         "plan_edit_step_owner_short": "Agent",
+        "plan_edit_step_model_short": "模型",
         "plan_edit_step_eta_short": "ETA",
         "plan_edit_step_done_short": "完成条件",
         "plan_edit_shortcuts": "↑/↓ 选步骤 · Enter 编辑 · a 插入 · d 删除 · J/K 下移/上移 · t 改任务名 · s/b/Esc 返回预览 · q 放弃修改",
@@ -347,8 +362,9 @@ TEXT = {
         "plan_edit_discarded": "已放弃本次编排修改，返回计划预览。",
         "execution_title": "执行方式",
         "execution_hint": "选择这份已确认编排接下来如何执行。",
-        "execution_note": "当前只有 tmux runtime 和仅保存启动包可执行。",
+        "execution_note": "直接执行会留在当前终端执行：单 Agent 计划直接运行，多 Agent 计划按步骤顺序执行且不创建 tmux 窗格。",
         "execution_error_title": "启动失败",
+        "execution_direct": "直接执行",
         "execution_save": "仅保存启动包",
         "execution_tmux": "tmux runtime",
         "execution_result_saved_title": "启动包已保存",
@@ -1127,6 +1143,11 @@ def _ask_text_value(prompt: str, *, default: str, input_fn: TextInputFn | None) 
     return str(ask(prompt, default=default)).strip()
 
 
+def _terminal_shape(*, fallback: tuple[int, int] = (120, 32), min_width: int = 56, max_width: int = 140, min_height: int = 18) -> tuple[int, int]:
+    size = shutil.get_terminal_size(fallback)
+    return max(min_width, min(size.columns, max_width)), max(min_height, size.lines)
+
+
 def _render_ansi(renderable: object, *, width: int = 120) -> str:
     local_buffer = StringIO()
     render_console = Console(
@@ -1151,10 +1172,31 @@ def _plan_step_form_renderable(
     *,
     step_index: int,
     is_insert: bool,
+    compact: bool = False,
+    width: int = 120,
 ) -> Group:
     copy = _copy(state.config)
     step = draft.steps[step_index]
     title_key = "plan_edit_form_insert_title" if is_insert else "plan_edit_form_step_title"
+    if compact:
+        return Group(
+            Text(copy[title_key].format(step_id=step.id), style=f"bold {_accent_color(state)}"),
+            Text.assemble(
+                (f"{copy['plan_edit_step_title']} · ", "#64748B"),
+                (_compact_text(step.title, limit=max(24, width - 14)), "#E2E8F0"),
+            ),
+            Text.assemble(
+                (f"{copy['plan_edit_step_owner']} · ", "#64748B"),
+                (str(CONTROLLER_LABELS.get(step.owner, step.owner.title())), _provider_rich_style(step.owner, bold=True)),
+                ("    ", ""),
+                (f"{copy['plan_edit_step_eta']} · {step.eta_minutes}", "#CBD5E1"),
+            ),
+            Text.assemble(
+                (f"{copy['plan_edit_step_done_when']} · ", "#64748B"),
+                (_compact_text(step.done_when, limit=max(24, width - 14)), "#CBD5E1"),
+            ),
+            Text("Tab · Ctrl+S · Esc", style="dim"),
+        )
     parts: list[object] = [
         Text(copy[title_key].format(step_id=step.id), style=f"bold {_accent_color(state)}"),
         Text(copy["plan_edit_form_step_hint"], style="dim"),
@@ -1173,8 +1215,17 @@ def _plan_step_form_renderable(
     return Group(*parts)
 
 
-def _plan_task_form_renderable(state: LaunchPromptState, task: str) -> Group:
+def _plan_task_form_renderable(state: LaunchPromptState, task: str, *, compact: bool = False, width: int = 120) -> Group:
     copy = _copy(state.config)
+    if compact:
+        return Group(
+            Text(copy["plan_edit_form_task_title"], style=f"bold {_accent_color(state)}"),
+            Text.assemble(
+                (f"{copy['plan_edit_task']} · ", "#64748B"),
+                (_compact_text(task, limit=max(24, width - 12)), "#E2E8F0"),
+            ),
+            Text("Ctrl+S · Esc", style="dim"),
+        )
     return Group(
         Text(copy["plan_edit_form_task_title"], style=f"bold {_accent_color(state)}"),
         Text(copy["plan_edit_form_task_hint"], style="dim"),
@@ -1197,9 +1248,9 @@ def _plan_step_form_header_renderable(
     step = draft.steps[step_index]
     title_key = "plan_edit_form_insert_title" if is_insert else "plan_edit_form_step_title"
     return Group(
-        Text(copy[title_key].format(step_id=step.id), style=f"bold {_accent_color(state)}"),
-        Text(copy["plan_edit_form_step_hint"], style="dim"),
+        Text(f"Task Config: {step.id}", style=f"bold {_accent_color(state)}"),
         Text(
+            f"{copy[title_key].format(step_id=step.id)}    "
             f"{copy['plan_edit_summary_task']} · {draft.task or state.task}    "
             f"{copy['plan_edit_step_owner_short']} · {CONTROLLER_LABELS.get(step.owner, step.owner.title())}",
             style="#94A3B8",
@@ -1221,21 +1272,50 @@ def _plan_form_style():  # noqa: ANN201
 
     return Style.from_dict(
         {
-            "": "bg:#0b1621 #dbe7f5",
-            "frame.border": "#29445d",
+            "": "#dbe7f5",
+            "frame.border": "#35515a",
             "frame.label": "bold #f8fafc",
             "radio": "#dbe7f5",
-            "radio-focused": "bg:#12314a #f8fafc",
-            "radio-selected": "bg:#12314a #f8fafc",
+            "radio-focused": "bg:#334155 #f8fafc",
+            "radio-selected": "bg:#334155 #f8fafc",
             "radio-checked": "bold #7dd3fc",
-            "radio-checked-focused": "bold #7dd3fc bg:#12314a",
-            "text-area": "bg:#0f1b29 #e2e8f0",
+            "radio-checked-focused": "bold #7dd3fc bg:#334155",
+            "text-area": "#e2e8f0",
+            "field-label": "bold #67e8f9",
+            "form-rule": "#3b565f",
+            "form-footer": "#67e8f9",
+            "form-surface": "",
+            "field-box": "",
+            "agent-option": "#94a3b8",
+            "agent-active-marker": "bold #67e8f9",
+            "agent-active-label": "bold #f8fafc",
+            "agent-active-tag": "#94a3b8",
+            "too-small-title": "bold #67e8f9",
+            "too-small-body": "#cbd5e1",
         }
     )
 
 
 def _use_prompt_toolkit_form(*, selector_fn: SelectFn | None, input_fn: TextInputFn | None) -> bool:
     return selector_fn is None and input_fn is None and sys.stdin.isatty()
+
+
+def _plan_form_too_small_window(*, title: str) -> object:
+    from prompt_toolkit.layout import Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+
+    return Window(
+        FormattedTextControl(
+            [
+                ("class:too-small-title", f"{title}\n"),
+                ("class:too-small-body", "Terminal window is too small for this editor.\n"),
+                ("class:too-small-body", "请拉高窗口，或按 Esc 取消后在更大的终端里编辑。"),
+            ],
+            focusable=False,
+            show_cursor=False,
+        ),
+        dont_extend_height=True,
+    )
 
 
 def _prompt_plan_step_form_with_prompt_toolkit(
@@ -1251,13 +1331,23 @@ def _prompt_plan_step_form_with_prompt_toolkit(
     from prompt_toolkit.formatted_text import ANSI, to_formatted_text
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.keys import Keys
-    from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
+    from prompt_toolkit.layout import HSplit, HorizontalAlign, Layout, VSplit, VerticalAlign, Window
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.layout.dimension import D
-    from prompt_toolkit.widgets import Box, Frame, RadioList, TextArea
+    from prompt_toolkit.widgets import Box, Frame, Label, TextArea
 
     copy = _copy(state.config)
     step = draft.steps[step_index]
+    _width, _height, compact = _plan_editor_terminal_shape()
+    too_small_window = _plan_form_too_small_window(title=f"Task Config: {step.id}")
+    done_height = D.exact(4) if compact else D.exact(5)
+    body_padding = 0 if compact else 1
+    owner_options = [
+        ("codex", str(CONTROLLER_LABELS.get("codex", "Codex"))),
+        ("claude", str(CONTROLLER_LABELS.get("claude", "Claude Code"))),
+        ("gemini", str(CONTROLLER_LABELS.get("gemini", "Gemini CLI"))),
+    ]
+    owner_index = next((index for index, (value, _label) in enumerate(owner_options) if value == step.owner), 0)
 
     title_input = TextArea(
         text=step.title,
@@ -1277,23 +1367,19 @@ def _prompt_plan_step_form_with_prompt_toolkit(
         text=step.done_when,
         multiline=True,
         wrap_lines=True,
-        scrollbar=True,
+        scrollbar=False,
         focus_on_click=False,
-        height=4,
+        height=3 if compact else 4,
         style="class:text-area",
     )
-    owner_picker = RadioList(
-        [
-            ("codex", str(CONTROLLER_LABELS.get("codex", "Codex"))),
-            ("claude", str(CONTROLLER_LABELS.get("claude", "Claude Code"))),
-            ("gemini", str(CONTROLLER_LABELS.get("gemini", "Gemini CLI"))),
-        ]
-    )
-    owner_picker.current_value = step.owner
 
     status_message = copy["plan_edit_form_footer"]
 
+    def _section_label(label: str) -> Label:
+        return Label(f"  ■  {label}", style="class:field-label")
+
     def _header_tokens() -> list[tuple[str, str]]:
+        current_width, _current_height, _current_compact = _plan_editor_terminal_shape()
         return list(
             to_formatted_text(
                 ANSI(
@@ -1304,17 +1390,31 @@ def _prompt_plan_step_form_with_prompt_toolkit(
                             step_index=step_index,
                             is_insert=is_insert,
                         ),
-                        width=110,
+                        width=max(56, min(current_width, 110)),
                     )
                 )
             )
         )
 
     def _footer_tokens() -> list[tuple[str, str]]:
-        color = "fg:#FBBF24" if status_message == copy["plan_edit_form_eta_invalid"] else "fg:#64748B"
-        return [(color, status_message)]
+        color = "fg:#FBBF24" if status_message == copy["plan_edit_form_eta_invalid"] else "class:form-footer"
+        prefix = "💡 " if status_message == copy["plan_edit_form_footer"] else ""
+        return [(color, f"{prefix}{status_message}")]
+
+    def _owner_tokens() -> list[tuple[str, str]]:
+        tokens: list[tuple[str, str]] = []
+        for index, (_value, label) in enumerate(owner_options):
+            selected = index == owner_index
+            tokens.append(("class:agent-active-marker" if selected else "class:agent-option", f"     [{'●' if selected else ' '}]  "))
+            tokens.append(("class:agent-active-label" if selected else "class:agent-option", label))
+            if selected:
+                tokens.append(("class:agent-active-tag", "  (Active)"))
+            if index < len(owner_options) - 1:
+                tokens.append(("", "\n"))
+        return tokens
 
     bindings = KeyBindings()
+    owner_bindings = KeyBindings()
 
     @bindings.add("tab", eager=True)
     def _focus_next(event) -> None:
@@ -1323,6 +1423,18 @@ def _prompt_plan_step_form_with_prompt_toolkit(
     @bindings.add("s-tab", eager=True)
     def _focus_previous(event) -> None:
         event.app.layout.focus_previous()
+
+    @owner_bindings.add(Keys.Down, eager=True)
+    def _owner_down(event) -> None:
+        nonlocal owner_index
+        owner_index = (owner_index + 1) % len(owner_options)
+        event.app.invalidate()
+
+    @owner_bindings.add(Keys.Up, eager=True)
+    def _owner_up(event) -> None:
+        nonlocal owner_index
+        owner_index = (owner_index - 1) % len(owner_options)
+        event.app.invalidate()
 
     @bindings.add(Keys.ControlS, eager=True)
     def _save(event) -> None:
@@ -1335,7 +1447,7 @@ def _prompt_plan_step_form_with_prompt_toolkit(
         event.app.exit(
             result=(
                 title_input.text.strip() or step.title,
-                str(owner_picker.current_value or step.owner),
+                owner_options[owner_index][0],
                 int(eta_text),
                 done_input.text.strip() or step.done_when,
             )
@@ -1346,48 +1458,76 @@ def _prompt_plan_step_form_with_prompt_toolkit(
     def _cancel(event) -> None:
         event.app.exit(result=None)
 
-    top_row = VSplit(
+    title_block = HSplit(
         [
-            Frame(
-                Box(title_input, height=D.exact(1)),
-                title=copy["plan_edit_step_title"],
-            ),
+            _section_label(copy["plan_edit_step_title"]),
+            Frame(Box(title_input, height=D.exact(1), padding_left=1, padding_right=1), height=D.exact(3)),
         ],
-        padding=1,
+        padding=0,
+        height=D.exact(5),
+        align=VerticalAlign.TOP,
     )
-    meta_row = VSplit(
+    owner_control = FormattedTextControl(_owner_tokens, focusable=True, show_cursor=False, key_bindings=owner_bindings)
+    owner_block = HSplit(
         [
-            Frame(
-                Box(owner_picker, height=D.exact(3)),
-                title=copy["plan_edit_step_owner"],
-            ),
-            Frame(
-                Box(eta_input, height=D.exact(1)),
-                title=copy["plan_edit_step_eta"],
-                width=D.exact(18),
-            ),
+            _section_label(copy["plan_edit_step_owner"]),
+            Window(owner_control, height=3, dont_extend_height=True),
         ],
-        padding=1,
+        padding=0,
+        width=None if compact else D.exact(40),
+        height=D.exact(5),
+        align=VerticalAlign.TOP,
+    )
+    eta_block = HSplit(
+        [
+            _section_label(f"{copy['plan_edit_step_eta']} (Min)"),
+            Frame(Box(eta_input, height=D.exact(1), padding_left=1, padding_right=1), height=D.exact(3), width=D.exact(13)),
+        ],
+        padding=0,
+        width=D.exact(20),
+        height=D.exact(5),
+        align=VerticalAlign.TOP,
+    )
+    done_block = HSplit(
+        [
+            _section_label(copy["plan_edit_step_done_when"]),
+            Frame(Box(done_input, height=done_height, padding_left=1, padding_right=1), height=D.exact(6) if compact else D.exact(7)),
+        ],
+        padding=0,
+        height=D.exact(8) if compact else D.exact(9),
+        align=VerticalAlign.TOP,
+    )
+    meta_row = (
+        HSplit([owner_block, eta_block], padding=1, height=D.exact(11), align=VerticalAlign.TOP, window_too_small=too_small_window)
+        if compact
+        else VSplit([owner_block, eta_block], padding=4, height=D.exact(5), align=HorizontalAlign.LEFT, window_too_small=too_small_window)
     )
     body = HSplit(
         [
-            Window(FormattedTextControl(_header_tokens), dont_extend_height=True),
-            top_row,
+            Window(FormattedTextControl(_header_tokens), height=D(min=3, preferred=3, max=4), dont_extend_height=True),
+            Window(char="─", height=1, style="class:form-rule"),
+            title_block,
+            Window(height=1),
             meta_row,
-            Frame(
-                Box(done_input, height=D(min=6, preferred=7, max=8)),
-                title=copy["plan_edit_step_done_when"],
-            ),
+            Window(height=1),
+            done_block,
+            Window(char="─", height=1, style="class:form-rule"),
             Window(FormattedTextControl(_footer_tokens), height=1),
         ],
-        padding=1,
+        padding=body_padding,
+        align=VerticalAlign.TOP,
+        style="class:form-surface",
+        window_too_small=too_small_window,
     )
+    use_too_small_fallback = _height < (27 if compact else 30)
+    if use_too_small_fallback:
+        body = too_small_window
 
     if clear_screen:
         console_obj.clear()
 
     app = Application(
-        layout=Layout(body, focused_element=title_input),
+        layout=Layout(body, focused_element=None if use_too_small_fallback else title_input),
         key_bindings=bindings,
         full_screen=False,
         mouse_support=False,
@@ -1407,24 +1547,27 @@ def _prompt_plan_task_form_with_prompt_toolkit(
     from prompt_toolkit.formatted_text import ANSI, to_formatted_text
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.keys import Keys
-    from prompt_toolkit.layout import HSplit, Layout, Window
+    from prompt_toolkit.layout import HSplit, Layout, VerticalAlign, Window
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.layout.dimension import D
-    from prompt_toolkit.widgets import Box, Frame, TextArea
+    from prompt_toolkit.widgets import Box, Label, TextArea
 
     copy = _copy(state.config)
+    _width, _height, compact = _plan_editor_terminal_shape()
+    too_small_window = _plan_form_too_small_window(title=copy["plan_edit_form_task_title"])
     task_input = TextArea(
         text=task,
         multiline=True,
         wrap_lines=True,
         scrollbar=True,
         focus_on_click=False,
-        height=5,
+        height=3 if compact else 5,
         style="class:text-area",
     )
 
     def _header_tokens() -> list[tuple[str, str]]:
-        return list(to_formatted_text(ANSI(_render_ansi(_plan_task_form_header_renderable(state, task), width=110))))
+        current_width, _current_height, _current_compact = _plan_editor_terminal_shape()
+        return list(to_formatted_text(ANSI(_render_ansi(_plan_task_form_header_renderable(state, task), width=max(56, min(current_width, 110))))))
 
     bindings = KeyBindings()
 
@@ -1444,18 +1587,41 @@ def _prompt_plan_task_form_with_prompt_toolkit(
 
     body = HSplit(
         [
-            Window(FormattedTextControl(_header_tokens), dont_extend_height=True),
-            Frame(Box(task_input, height=D(min=5, preferred=7, max=9)), title=copy["plan_edit_task"]),
-            Window(FormattedTextControl(lambda: [("fg:#64748B", copy["plan_edit_form_footer"])]), height=1),
+            Window(FormattedTextControl(_header_tokens), height=D(min=3, preferred=3, max=4), dont_extend_height=True),
+            Window(char="─", height=1, style="class:form-rule"),
+            HSplit(
+                [
+                    Label(copy["plan_edit_task"], style="class:field-label"),
+                    Box(
+                        task_input,
+                        height=D(min=3, preferred=4, max=5) if compact else D(min=6, preferred=8, max=10),
+                        padding_left=1,
+                        padding_right=1,
+                        style="class:field-box",
+                    ),
+                ],
+                padding=0,
+                height=D.exact(6) if compact else D.exact(10),
+                align=VerticalAlign.TOP,
+                window_too_small=too_small_window,
+            ),
+            Window(char="─", height=1, style="class:form-rule"),
+            Window(FormattedTextControl(lambda: [("class:form-footer", copy["plan_edit_form_footer"])]), height=1),
         ],
-        padding=1,
+        padding=0 if compact else 1,
+        align=VerticalAlign.TOP,
+        style="class:form-surface",
+        window_too_small=too_small_window,
     )
+    use_too_small_fallback = _height < (14 if compact else 18)
+    if use_too_small_fallback:
+        body = too_small_window
 
     if clear_screen:
         console_obj.clear()
 
     app = Application(
-        layout=Layout(body, focused_element=task_input),
+        layout=Layout(body, focused_element=None if use_too_small_fallback else task_input),
         key_bindings=bindings,
         full_screen=False,
         mouse_support=False,
@@ -1468,14 +1634,155 @@ def _plan_draft_mode_label(copy: dict[str, str], draft: PlanDraft) -> str:
     return copy["plan_edit_multi_agent"] if len({step.owner for step in draft.steps}) > 1 else copy["plan_edit_single_agent"]
 
 
-def _plan_editor_list_line(state: LaunchPromptState, step, *, selected: bool) -> Text:
+def _plan_draft_model_map(state: LaunchPromptState, draft: PlanDraft) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    controller_plan = draft.source_controller_plan if isinstance(draft.source_controller_plan, dict) else {}
+    agents = controller_plan.get("agents", []) if isinstance(controller_plan, dict) else []
+    if isinstance(agents, list):
+        for item in agents:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip().lower()
+            if name not in {"codex", "claude", "gemini"}:
+                continue
+            mapping[name] = _resolved_plan_model_label(state, name, str(item.get("model", "")).strip())
+
+    for step in draft.steps:
+        if step.owner not in mapping:
+            mapping[step.owner] = _configured_model_label(state.config, step.owner)
+    return mapping
+
+
+def _plan_editor_summary_table(state: LaunchPromptState, draft: PlanDraft, model_map: dict[str, str]) -> Table:
+    copy = _copy(state.config)
+    table = Table.grid(expand=True)
+    table.add_column(ratio=2)
+    table.add_column(ratio=1)
+    table.add_column(ratio=1)
+    table.add_column(ratio=1)
+    table.add_column(ratio=1)
+    table.add_row(
+        Text.assemble((f"{copy['plan_edit_summary_task']}\n", "#64748B"), (draft.task or _task_summary(state), "bold #E2E8F0")),
+        Text.assemble((f"{copy['plan_edit_summary_controller']}\n", "#64748B"), (str(CONTROLLER_LABELS.get(draft.controller, draft.controller.title())), _provider_rich_style(draft.controller, bold=True))),
+        Text.assemble((f"{copy['plan_edit_summary_mode']}\n", "#64748B"), (_plan_draft_mode_label(copy, draft), "bold #CBD5E1")),
+        Text.assemble((f"{copy['plan_edit_summary_steps']}\n", "#64748B"), (str(len(draft.steps)), "bold #CBD5E1")),
+        Text.assemble((f"{copy['plan_edit_summary_models']}\n", "#64748B"), (str(len(model_map)), "bold #CBD5E1")),
+    )
+    return table
+
+
+def _plan_editor_route_table(state: LaunchPromptState, draft: PlanDraft, model_map: dict[str, str]) -> Table:
+    step_suffix = "步" if _lang(state.config) == "zh-CN" else "step"
+    table = Table.grid(expand=True)
+    table.add_column(ratio=1)
+    table.add_column(ratio=2)
+    table.add_column(justify="right", ratio=1)
+    ordered_owners: list[str] = []
+    for step in draft.steps:
+        if step.owner not in ordered_owners:
+            ordered_owners.append(step.owner)
+    for owner in ordered_owners:
+        count = len([step for step in draft.steps if step.owner == owner])
+        table.add_row(
+            Text(str(CONTROLLER_LABELS.get(owner, owner.title())), style=_provider_rich_style(owner, bold=True)),
+            Text(model_map.get(owner, ""), style="#CBD5E1"),
+            Text(f"{count} {step_suffix}", style="#64748B"),
+        )
+    return table
+
+
+def _plan_editor_compact_summary(state: LaunchPromptState, draft: PlanDraft, model_map: dict[str, str], *, width: int) -> Text:
+    copy = _copy(state.config)
+    summary = (
+        f"{copy['plan_edit_summary_task']}: {draft.task or _task_summary(state)}  |  "
+        f"{copy['plan_edit_summary_controller']}: {CONTROLLER_LABELS.get(draft.controller, draft.controller.title())}  |  "
+        f"{copy['plan_edit_summary_steps']}: {len(draft.steps)}  |  "
+        f"{copy['plan_edit_summary_models']}: {len(model_map)}"
+    )
+    return Text(_compact_text(summary, limit=max(32, width - 2)), style="#94A3B8")
+
+
+def _plan_editor_list_line(state: LaunchPromptState, step, *, selected: bool, model: str = "") -> Text:
     prefix = "> " if selected else "  "
     style = f"bold {_accent_color(state)} underline" if selected else "#CBD5E1"
     line = Text.assemble((prefix, ""), (f"{step.id} ", "#64748B"), (step.title, style))
     line.append(" · ", style="#334155")
     line.append(str(CONTROLLER_LABELS.get(step.owner, step.owner.title())), style=_provider_rich_style(step.owner, bold=selected))
+    if model:
+        line.append(" · ", style="#334155")
+        line.append(model, style="#94A3B8")
     line.append(f" · {step.eta_minutes}m", style="#94A3B8")
     return line
+
+
+def _plan_editor_compact_current_step(state: LaunchPromptState, step, *, model: str, width: int) -> Text:
+    copy = _copy(state.config)
+    current = (
+        f"{copy['plan_edit_current_step']} · {step.id} {step.title}  |  "
+        f"{copy['plan_edit_step_owner_short']}: {CONTROLLER_LABELS.get(step.owner, step.owner.title())}  |  "
+        f"{copy['plan_edit_step_model_short']}: {model}  |  "
+        f"{copy['plan_edit_step_eta_short']}: {step.eta_minutes}m"
+    )
+    return Text(_compact_text(current, limit=max(32, width - 2)), style="#CBD5E1")
+
+
+def _plan_editor_step_window(
+    *,
+    total_steps: int,
+    selected_index: int,
+    max_visible_steps: int | None,
+) -> tuple[int, int]:
+    if max_visible_steps is None or total_steps <= max_visible_steps:
+        return 0, total_steps
+    viewport = max(1, min(total_steps, int(max_visible_steps)))
+    selected = max(0, min(selected_index, total_steps - 1))
+    half_window = viewport // 2
+    start = selected - half_window
+    start = max(0, min(start, total_steps - viewport))
+    return start, start + viewport
+
+
+def _plan_editor_visible_step_count() -> int:
+    _width, height, compact = _plan_editor_terminal_shape()
+    return _plan_editor_visible_step_count_for_height(height, compact=compact)
+
+
+def _plan_editor_terminal_shape() -> tuple[int, int, bool]:
+    width, height = _terminal_shape()
+    compact = width < 96 or height < 34
+    return width, height, compact
+
+
+def _plan_editor_visible_step_count_for_height(height: int, *, compact: bool) -> int:
+    reserved_lines = 20 if compact else 28
+    available_step_lines = max(4, height - reserved_lines)
+    minimum = 2 if compact else 3
+    maximum = 6 if compact else 8
+    return max(minimum, min(maximum, available_step_lines // 2))
+
+
+def _compact_text(value: str, *, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _plan_editor_compact_routes(state: LaunchPromptState, draft: PlanDraft, model_map: dict[str, str], *, width: int) -> Text:
+    copy = _copy(state.config)
+    ordered_owners: list[str] = []
+    for step in draft.steps:
+        if step.owner not in ordered_owners:
+            ordered_owners.append(step.owner)
+    fragments = [
+        f"{CONTROLLER_LABELS.get(owner, owner.title())}: {model_map.get(owner, '')}"
+        for owner in ordered_owners
+    ]
+    route_text = "  |  ".join(fragments)
+    return Text.assemble(
+        (f"{copy['plan_edit_compact_routes']} · ", "#64748B"),
+        (_compact_text(route_text, limit=max(24, width - 12)), "#CBD5E1"),
+    )
 
 
 def _plan_editor_screen_renderable(
@@ -1484,52 +1791,110 @@ def _plan_editor_screen_renderable(
     *,
     selected_index: int,
     status_message: str = "",
+    max_visible_steps: int | None = None,
+    compact: bool = False,
+    width: int = 120,
 ) -> Group:
     copy = _copy(state.config)
     selected_step = draft.steps[selected_index]
+    model_map = _plan_draft_model_map(state, draft)
+    selected_model = model_map.get(selected_step.owner, "")
     parts: list[object] = []
-    parts.extend(_banner_parts())
-    parts.append(Text())
+    if not compact:
+        parts.extend(_banner_parts())
+        parts.append(Text())
     parts.append(_step_indicator(state, "review"))
     parts.append(Text())
     parts.append(Text(copy["plan_edit_list_title"], style=f"bold {_accent_color(state)}"))
     parts.append(Text(copy["plan_edit_list_hint"], style="dim"))
     parts.append(Text())
-    parts.append(
-        Text.assemble(
-            (f"{copy['plan_edit_summary_task']} · ", "#64748B"),
-            (draft.task or _task_summary(state), "#E2E8F0"),
-            ("    ", ""),
-            (f"{copy['plan_edit_summary_controller']} · ", "#64748B"),
-            (str(CONTROLLER_LABELS.get(draft.controller, draft.controller.title())), _provider_rich_style(draft.controller, bold=True)),
-            ("    ", ""),
-            (f"{copy['plan_edit_summary_steps']} · {len(draft.steps)}", "#CBD5E1"),
-            ("    ", ""),
-            (f"{copy['plan_edit_summary_mode']} · {_plan_draft_mode_label(copy, draft)}", "#CBD5E1"),
+    if compact:
+        parts.append(_plan_editor_compact_summary(state, draft, model_map, width=width))
+    else:
+        parts.append(
+            Panel(
+                _plan_editor_summary_table(state, draft, model_map),
+                border_style="#1E293B",
+                title=copy["plan_edit_title"],
+                title_align="left",
+                expand=True,
+            )
         )
-    )
     if status_message:
         parts.append(Text(status_message, style="#FBBF24"))
     parts.append(Text())
-    parts.append(Text(copy["plan_review_steps"], style="bold #CBD5E1"))
-    for index, step in enumerate(draft.steps):
-        parts.append(_plan_editor_list_line(state, step, selected=index == selected_index))
-        parts.append(Text(f"    {step.done_when}", style="#64748B italic"))
-    parts.append(Text())
-    parts.append(
-        Panel(
-            Group(
-                Text(selected_step.title, style="bold #E2E8F0"),
-                Text.assemble((f"{copy['plan_edit_step_owner_short']} · ", "#64748B"), (str(CONTROLLER_LABELS.get(selected_step.owner, selected_step.owner.title())), _provider_rich_style(selected_step.owner, bold=True))),
-                Text(f"{copy['plan_edit_step_eta_short']} · {selected_step.eta_minutes}m", style="#CBD5E1"),
-                Text(f"{copy['plan_edit_step_done_short']} · {selected_step.done_when}", style="#CBD5E1"),
-            ),
-            title=copy["plan_edit_current_step"],
-            title_align="left",
-            border_style=_accent_color(state),
-            expand=True,
+    if compact:
+        parts.append(
+            Text.assemble(
+                (f"{copy['plan_edit_prompt_panel']} · ", "#64748B"),
+                (_compact_text(draft.task or _task_summary(state), limit=max(24, width - 22)), "#E2E8F0"),
+            )
         )
+        parts.append(_plan_editor_compact_routes(state, draft, model_map, width=width))
+    else:
+        parts.append(
+            Panel(
+                Text(draft.task or _task_summary(state), style="#E2E8F0"),
+                title=copy["plan_edit_prompt_panel"],
+                title_align="left",
+                border_style="#334155",
+                expand=True,
+            )
+        )
+        parts.append(
+            Panel(
+                _plan_editor_route_table(state, draft, model_map),
+                title=copy["plan_edit_routes_panel"],
+                title_align="left",
+                border_style="#334155",
+                expand=True,
+            )
+        )
+    parts.append(Text())
+    parts.append(Text(copy["plan_review_steps"], style="bold #CBD5E1"))
+    window_start, window_end = _plan_editor_step_window(
+        total_steps=len(draft.steps),
+        selected_index=selected_index,
+        max_visible_steps=max_visible_steps,
     )
+    if window_start > 0:
+        parts.append(Text("  …", style="#64748B"))
+    for index, step in enumerate(draft.steps[window_start:window_end], start=window_start):
+        parts.append(_plan_editor_list_line(state, step, selected=index == selected_index, model=model_map.get(step.owner, "")))
+        if not compact:
+            parts.append(Text(f"    {step.done_when}", style="#64748B italic"))
+    if window_end < len(draft.steps):
+        parts.append(Text("  …", style="#64748B"))
+    if max_visible_steps is not None and len(draft.steps) > max_visible_steps:
+        parts.append(
+            Text(
+                copy["plan_edit_steps_window"].format(
+                    start=window_start + 1,
+                    end=window_end,
+                    total=len(draft.steps),
+                ),
+                style="#64748B",
+            )
+        )
+    parts.append(Text())
+    if compact:
+        parts.append(_plan_editor_compact_current_step(state, selected_step, model=selected_model, width=width))
+    else:
+        parts.append(
+            Panel(
+                Group(
+                    Text(selected_step.title, style="bold #E2E8F0"),
+                    Text.assemble((f"{copy['plan_edit_step_owner_short']} · ", "#64748B"), (str(CONTROLLER_LABELS.get(selected_step.owner, selected_step.owner.title())), _provider_rich_style(selected_step.owner, bold=True))),
+                    Text(f"{copy['plan_edit_step_model_short']} · {selected_model}", style="#CBD5E1"),
+                    Text(f"{copy['plan_edit_step_eta_short']} · {selected_step.eta_minutes}m", style="#CBD5E1"),
+                    Text(f"{copy['plan_edit_step_done_short']} · {selected_step.done_when}", style="#CBD5E1"),
+                ),
+                title=copy["plan_edit_current_step"],
+                title_align="left",
+                border_style=_accent_color(state),
+                expand=True,
+            )
+        )
     parts.append(Text())
     parts.append(Text(copy["plan_edit_shortcuts"], style="dim"))
     return Group(*parts)
@@ -1543,16 +1908,25 @@ def _prompt_step_owner(
     console_obj: Console,
     clear_screen: bool,
 ) -> str:
+    def _owner_renderable(pointed: str) -> Group:
+        width, _height, compact = _plan_editor_terminal_shape()
+        parts: list[object] = []
+        if not compact:
+            parts.extend(_banner_parts())
+            parts.append(Text())
+        parts.extend(
+            [
+                Text(_copy(state.config)["plan_edit_step_owner"], style=f"bold {_accent_color(state)}"),
+                Text(),
+                *[_row_text(row) for row in _controller_rows(state, pointed_value=pointed, include_nav=False)],
+                Text(),
+                Text(_compact_text(_copy(state.config)["footer_basic"], limit=max(32, width - 2)) if compact else _copy(state.config)["footer_basic"], style="dim"),
+            ]
+        )
+        return Group(*parts)
+
     owner_choice = _select_screen(
-        lambda pointed: Group(
-            *_banner_parts(),
-            Text(),
-            Text(_copy(state.config)["plan_edit_step_owner"], style=f"bold {_accent_color(state)}"),
-            Text(),
-            *[_row_text(row) for row in _controller_rows(state, pointed_value=pointed, include_nav=False)],
-            Text(),
-            Text(_copy(state.config)["footer_basic"], style="dim"),
-        ),
+        _owner_renderable,
         values=["1", "2", "3", "q"],
         default_value={"codex": "1", "claude": "2", "gemini": "3"}.get(default_owner, "1"),
         selector_fn=selector_fn,
@@ -1702,13 +2076,17 @@ def _select_plan_editor_action(
 
     def _tokens() -> list[tuple[str, str]]:
         local_buffer = StringIO()
-        render_console = Console(file=local_buffer, force_terminal=True, color_system="truecolor", width=120, no_color=False)
+        width, height, compact = _plan_editor_terminal_shape()
+        render_console = Console(file=local_buffer, force_terminal=True, color_system="truecolor", width=width, no_color=False)
         render_console.print(
             _plan_editor_screen_renderable(
                 state,
                 draft,
                 selected_index=local_selected,
                 status_message=status_message,
+                max_visible_steps=_plan_editor_visible_step_count_for_height(height, compact=compact),
+                compact=compact,
+                width=width,
             ),
             end="",
         )
@@ -1884,6 +2262,10 @@ def _execution_target_default_value(state: LaunchPromptState, targets: list[Exec
     runtime_mode = str(getattr(state.config, "runtime_mode", "tmux") or "tmux").strip().lower()
     if runtime_mode == "tmux" and any(target.key == "tmux" and target.enabled for target in targets):
         return "tmux"
+    if runtime_mode == "direct" and any(target.key == "direct" and target.enabled for target in targets):
+        return "direct"
+    if any(target.key == "direct" and target.enabled for target in targets):
+        return "direct"
     return "save" if any(target.key == "save" and target.enabled for target in targets) else "tmux"
 
 
@@ -1987,6 +2369,46 @@ def _summarize_tmux_launch_error(raw_output: str, *, fallback: str) -> str:
     return fallback
 
 
+def _build_direct_execution_prompt(
+    *,
+    task: str,
+    controller_plan: dict[str, Any],
+    lang: str,
+) -> str:
+    serialized = json.dumps(controller_plan, indent=2, ensure_ascii=False)
+    if lang == "zh-CN":
+        return f"""以下是已获用户确认的单 Agent 执行计划，请在当前 Agent 中直接执行。
+
+用户任务:
+{task}
+
+执行计划 JSON:
+{serialized}
+
+执行要求:
+1. 严格按 steps 顺序执行。
+2. 仅由当前 Agent 执行，不要再派生 tmux 子 Agent。
+3. 每一步都必须满足对应 done_when，再进入下一步。
+4. 若步骤里含有 boundary / responsibility_stage / artifact_type / timebox_minutes，必须把它们视为约束。
+5. 完成后直接给出可检查的最终结果与必要验证说明。
+"""
+    return f"""This approved controller-only execution plan has been confirmed by the user. Execute it directly in the current agent.
+
+User task:
+{task}
+
+Execution plan JSON:
+{serialized}
+
+Execution rules:
+1. Follow the steps in order.
+2. Execute in the current agent only; do not spawn tmux sub-agents.
+3. Satisfy each step's done_when before moving on.
+4. Treat boundary / responsibility_stage / artifact_type / timebox_minutes as binding constraints when present.
+5. Finish with a checkable final result and concise validation notes.
+"""
+
+
 def _start_tmux_execution(
     *,
     state: LaunchPromptState,
@@ -2028,6 +2450,72 @@ def _start_tmux_execution(
         return False, _summarize_tmux_launch_error(
             capture_buffer.getvalue(),
             fallback="tmux runtime did not report a successful start.",
+        )
+    return True, ""
+
+
+def _start_direct_execution(
+    *,
+    state: LaunchPromptState,
+    result: UxLabV3Result,
+) -> tuple[bool, str]:
+    from ai_collab import cli as cli_module
+
+    targets = build_execution_targets(state, result)
+    if not any(target.key == "direct" and target.enabled for target in targets):
+        return False, (
+            "当前计划不能使用直接执行。"
+            if _lang(state.config) == "zh-CN"
+            else "Current plan is not ready for direct execution."
+        )
+
+    controller_plan = result.controller_plan if isinstance(result.controller_plan, dict) else {}
+    owners = {
+        str(item.get("owner", "")).strip().lower()
+        for item in controller_plan.get("steps", [])
+        if isinstance(item, dict) and str(item.get("owner", "")).strip()
+    }
+    single_agent_direct = len(owners) <= 1 and bool(owners)
+    task_payload = (
+        _build_direct_execution_prompt(
+            task=state.task,
+            controller_plan=controller_plan,
+            lang=_lang(state.config),
+        )
+        if single_agent_direct
+        else None
+    )
+    direct_result = None
+    if not single_agent_direct:
+        direct_result = type(
+            "_DirectRuntimeResult",
+            (),
+            {
+                "need_collaboration": True,
+                "project_categories": [],
+                "suggested_skills": [],
+                "intent": "",
+                "workflow_engine": str(controller_plan.get("workflow_engine", "") or "v2"),
+                "session_preset": str(controller_plan.get("session_preset", "") or ""),
+                "workflow_blueprint": str(controller_plan.get("workflow_blueprint", "") or ""),
+            },
+        )()
+
+    exit_code = cli_module._execute_direct_runtime(
+        config=state.config,
+        provider=state.controller,
+        task=state.task,
+        result=direct_result,
+        controller_plan=controller_plan,
+        cwd=state.workspace,
+        interactive=False,
+        task_payload=task_payload,
+    )
+    if exit_code != 0:
+        return False, (
+            f"直接执行退出码: {exit_code}"
+            if _lang(state.config) == "zh-CN"
+            else f"direct runtime exited with status {exit_code}"
         )
     return True, ""
 
@@ -2474,11 +2962,12 @@ def _select_screen(
 
     def _tokens() -> list[tuple[str, str]]:
         local_buffer = StringIO()
+        width, _height = _terminal_shape()
         render_console = Console(
             file=local_buffer,
             force_terminal=True,
             color_system="truecolor",
-            width=120,
+            width=width,
             no_color=False,
         )
         render_console.print(render_fn(_current_value()), end="")
@@ -2490,10 +2979,12 @@ def _select_screen(
     @bindings.add(Keys.Down, eager=True)
     def _down(event) -> None:
         _move(1)
+        event.app.invalidate()
 
     @bindings.add(Keys.Up, eager=True)
     def _up(event) -> None:
         _move(-1)
+        event.app.invalidate()
 
     @bindings.add(Keys.ControlM, eager=True)
     def _enter(event) -> None:
@@ -2994,6 +3485,24 @@ def run_launch_prompt(
                         if clear_screen:
                             console_obj.clear()
                         console_obj.print(_result_screen_renderable(state, started, runtime_label=_copy(state.config)["execution_tmux"]), end="")
+                        return started
+                    if start_choice == "direct":
+                        launched, execution_error = _start_direct_execution(state=state, result=result)
+                        if not launched:
+                            continue
+                        started = UxLabV3Result(
+                            status="started",
+                            workspace=state.workspace,
+                            controller=state.controller,
+                            task=state.task,
+                            lang=_lang(state.config),
+                            planner_mode=state.planner_mode,
+                            plan=result.plan,
+                            controller_plan=result.controller_plan,
+                        )
+                        if clear_screen:
+                            console_obj.clear()
+                        console_obj.print(_result_screen_renderable(state, started, runtime_label=_copy(state.config)["execution_direct"]), end="")
                         return started
                     if start_choice == "save":
                         review_choice = "3"

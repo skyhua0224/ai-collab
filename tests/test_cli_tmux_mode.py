@@ -838,6 +838,7 @@ def test_collect_runner_inputs_accepts_prompt_alias() -> None:
         args=args,
         provider_prefix=None,
         default_provider="codex",
+        default_mode="tmux",
         providers=["claude", "codex", "gemini"],
         lang="en-US",
         decision_ui=None,
@@ -860,6 +861,7 @@ def test_collect_runner_inputs_rejects_prompt_and_positional_mix() -> None:
             args=args,
             provider_prefix=None,
             default_provider="codex",
+            default_mode="auto",
             providers=["codex", "gemini", "claude"],
             lang="en-US",
             decision_ui=None,
@@ -2222,6 +2224,7 @@ def test_collect_runner_inputs_with_interactive_prompt(monkeypatch) -> None:
         args=args,
         provider_prefix=None,
         default_provider="codex",
+        default_mode="tmux",
         providers=["claude", "codex", "gemini"],
         lang="zh-CN",
         decision_ui=_FakeQuestionary(),
@@ -2478,6 +2481,46 @@ def test_runner_forwards_v2_route_metadata_to_workflow_manager(monkeypatch) -> N
     assert "legacy_workflow" not in captured["context"]
 
 
+def test_execute_direct_runtime_enables_live_output_for_multi_agent(monkeypatch) -> None:
+    config = Config.create_default()
+    fake_result = SimpleNamespace(
+        need_collaboration=True,
+        workflow_engine="v2",
+        session_preset="design-first",
+        workflow_blueprint="design-led-loop",
+        suggested_skills=["api-integration"],
+        project_categories=["superapp-fullstack"],
+        intent="implementation",
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeWorkflowManager:
+        def __init__(self, _config):  # noqa: D401, ANN001
+            pass
+
+        def execute_workflow(self, workflow_name, task, context):  # noqa: ANN001
+            captured["workflow_name"] = workflow_name
+            captured["task"] = task
+            captured["context"] = context
+            return {"_summary": {"status": "completed"}}
+
+    monkeypatch.setattr(cli, "WorkflowManager", _FakeWorkflowManager)
+
+    exit_code = cli._execute_direct_runtime(
+        config=config,
+        provider="codex",
+        task="build module",
+        result=fake_result,
+        extra_context={"source": "unit-test"},
+    )
+
+    assert exit_code == 0
+    assert captured["workflow_name"] == "design-led-loop"
+    assert captured["task"] == "build module"
+    assert captured["context"]["live_output"] is True
+    assert captured["context"]["source"] == "unit-test"
+
+
 def test_request_controller_plan_adds_codex_skip_repo_flag(monkeypatch) -> None:
     """Controller planning call for codex should include --skip-git-repo-check."""
     config = Config.create_default()
@@ -2504,6 +2547,95 @@ def test_request_controller_plan_adds_codex_skip_repo_flag(monkeypatch) -> None:
     assert error is None
     assert isinstance(plan, dict)
     assert "--skip-git-repo-check" in captured["cmd"]
+
+
+def test_runner_main_uses_config_runtime_mode_direct_by_default(monkeypatch) -> None:
+    """When execution mode is omitted, runner_main should honor config.runtime_mode."""
+    config = Config.create_default()
+    config.runtime_mode = "direct"
+    config.auto_collaboration["controller_first"] = False
+    fake_result = CollaborationResult(
+        need_collaboration=True,
+        workflow_engine="v2",
+        session_preset="design-first",
+        workflow_blueprint="design-led-loop",
+        responsibility_stages=["collect", "model", "plan", "execute", "validate", "correct", "deliver"],
+        primary="codex",
+        reviewers=["claude", "gemini"],
+        project_categories=["superapp-fullstack"],
+        suggested_skills=["api-integration"],
+        available_agents=[],
+        orchestration_plan=[{"agent": "codex", "role": "backend-build", "selected_model": "gpt-5.4"}],
+        selected_agents=["codex", "claude", "gemini"],
+        execution_mode="multi-agent",
+        model_dump=lambda: {},
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeWorkflowManager:
+        def __init__(self, _config):  # noqa: D401, ANN001
+            pass
+
+        def execute_workflow(self, workflow_name, task, context):  # noqa: ANN001
+            captured["workflow_name"] = workflow_name
+            captured["task"] = task
+            captured["context"] = context
+            return {}
+
+    monkeypatch.setattr(cli.Config, "load", lambda: config)
+    monkeypatch.setattr(cli.sys, "argv", ["ai-collab", "--provider", "codex", "build module"])
+    monkeypatch.setattr(cli.sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr(cli.CollaborationDetector, "detect", lambda *_a, **_k: fake_result)
+    monkeypatch.setattr(cli, "_print_orchestration_plan", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "_print_available_agents", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "WorkflowManager", _FakeWorkflowManager)
+    monkeypatch.setattr(cli, "_result_for_tmux_launch", lambda result, _plan: result)
+    monkeypatch.setattr(cli, "_can_launch_tmux", lambda _result: True)
+    monkeypatch.setattr(
+        cli,
+        "_launch_tmux_orchestration",
+        lambda **_k: (_ for _ in ()).throw(AssertionError("direct runtime default should skip tmux launch")),
+    )
+
+    cli.runner_main()
+
+    assert captured["workflow_name"] == "design-led-loop"
+    assert captured["task"] == "build module"
+
+
+def test_runner_main_single_agent_direct_propagates_exit_code(monkeypatch) -> None:
+    """Single-agent direct execution should return the provider exit code."""
+    config = Config.create_default()
+    fake_result = SimpleNamespace(
+        need_collaboration=False,
+        suggested_skills=[],
+    )
+
+    monkeypatch.setattr(cli.Config, "load", lambda: config)
+    monkeypatch.setattr(cli.sys, "argv", ["ai-collab", "--provider", "codex", "build module"])
+    monkeypatch.setattr(cli.sys, "stdin", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr(cli.CollaborationDetector, "detect", lambda *_a, **_k: fake_result)
+    monkeypatch.setattr(cli, "_resolve_provider_execution", lambda *_a, **_k: ("codex exec --model gpt-5.4", 120))
+    monkeypatch.setattr(cli, "_safe_execute", lambda *_a, **_k: 17)
+
+    try:
+        cli.runner_main()
+        raise AssertionError("runner_main should exit non-zero when direct execution fails")
+    except SystemExit as exc:
+        assert exc.code == 17
+
+
+def test_safe_execute_returns_timeout_exit_code(monkeypatch) -> None:
+    """Timeouts should produce a stable non-zero code for direct execution."""
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *_a, **_k: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd=["codex"], timeout=30)),
+    )
+
+    exit_code = cli._safe_execute("codex exec --model gpt-5.4", "build module", timeout=30)
+
+    assert exit_code == 124
 
 
 def test_list_command_shows_v2_presets_and_hides_built_in_legacy_catalog(monkeypatch) -> None:

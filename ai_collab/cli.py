@@ -55,7 +55,13 @@ from ai_collab.core.tmux_workspace import (
     wait_for_pane_quiet,
 )
 from ai_collab.core.workflow import WorkflowManager
-from ai_collab.core.workflow_v2 import builtin_session_presets, resolve_session_preset
+from ai_collab.core.workflow_v2 import (
+    WorkflowBlueprintV2,
+    WorkflowStageV2,
+    builtin_session_presets,
+    resolve_session_preset,
+    resolve_workflow_blueprint,
+)
 
 console = Console(force_terminal=True, legacy_windows=False)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\].*?\x1b\\")
@@ -3761,7 +3767,126 @@ def relay_smoke(
         raise SystemExit(1)
 
 
-def _safe_execute(cli: str, task: str, timeout: Optional[int] = None) -> int:
+def _resolve_provider_execution(
+    config: Config,
+    provider: str,
+    task: str,
+    *,
+    complexity: str = "default",
+) -> tuple[Optional[str], Optional[int]]:
+    """Resolve provider CLI and timeout with model selection fallback."""
+    provider_config = config.providers.get(provider)
+    if not provider_config:
+        return None, None
+    selected_cli = provider_config.cli
+    try:
+        selected_cli = ModelSelector(config).select_model(provider, task, complexity).cli
+    except Exception:
+        selected_cli = provider_config.cli
+    return selected_cli, provider_config.timeout
+
+
+def _direct_route_context(
+    *,
+    provider: str,
+    result: Any | None,
+    controller_plan: Optional[dict[str, Any]] = None,
+    interactive: bool = False,
+    extra_context: Optional[dict[str, Any]] = None,
+) -> tuple[str, dict[str, Any]]:
+    """Build route key and execution context for unified direct runtime."""
+    controller_plan = controller_plan if isinstance(controller_plan, dict) else None
+    workflow_blueprint = ""
+    session_preset = ""
+    if controller_plan:
+        workflow_blueprint = str(controller_plan.get("workflow_blueprint", "") or "").strip()
+        session_preset = str(controller_plan.get("session_preset", "") or "").strip()
+    if result is not None:
+        if not workflow_blueprint:
+            workflow_blueprint = str(getattr(result, "workflow_blueprint", "") or "").strip()
+        if not session_preset:
+            session_preset = str(getattr(result, "session_preset", "") or "").strip()
+
+    context = {
+        "controller": provider,
+        "project_categories": ", ".join(getattr(result, "project_categories", []) or []),
+        "auto_skills": ", ".join(getattr(result, "suggested_skills", []) or []),
+        "intent": getattr(result, "intent", "") or "",
+        "workflow_engine": getattr(result, "workflow_engine", "") or "",
+        "session_preset": session_preset,
+        "workflow_blueprint": workflow_blueprint,
+        "interactive": interactive,
+    }
+    if controller_plan:
+        context["controller_plan"] = json.dumps(controller_plan, ensure_ascii=False)
+    if extra_context:
+        for key, value in extra_context.items():
+            if value is not None:
+                context[key] = value
+    route_key = workflow_blueprint or session_preset
+    return route_key, context
+
+
+def _execute_direct_runtime(
+    *,
+    config: Config,
+    provider: str,
+    task: str,
+    result: Any | None = None,
+    controller_plan: Optional[dict[str, Any]] = None,
+    cwd: Path | str | None = None,
+    interactive: bool = False,
+    task_payload: Optional[str] = None,
+    extra_context: Optional[dict[str, Any]] = None,
+) -> int:
+    """Unified direct runtime for single-agent and multi-agent execution."""
+    if bool(getattr(result, "need_collaboration", False)):
+        merged_extra_context = dict(extra_context or {})
+        merged_extra_context["live_output"] = True
+        route_key, context = _direct_route_context(
+            provider=provider,
+            result=result,
+            controller_plan=controller_plan,
+            interactive=interactive,
+            extra_context=merged_extra_context,
+        )
+        previous_cwd = Path.cwd()
+        try:
+            if cwd is not None:
+                os.chdir(Path(cwd).expanduser())
+            workflow_manager = WorkflowManager(config)
+            results = workflow_manager.execute_workflow(route_key, task, context)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]direct runtime failed:[/red] {exc}")
+            return 1
+        finally:
+            if cwd is not None:
+                os.chdir(previous_cwd)
+        summary = results.get("_summary", {}) if isinstance(results, dict) else {}
+        status = str(summary.get("status", "completed"))
+        return 0 if status not in {"failed", "aborted_by_user"} else 1
+
+    selected_cli, timeout = _resolve_provider_execution(config, provider, task, complexity="default")
+    if not selected_cli:
+        return 2
+
+    payload = task_payload if task_payload is not None else task
+    auto_skills = getattr(result, "suggested_skills", []) if result is not None else []
+    if task_payload is None and auto_skills:
+        payload = (
+            f"Auto-trigger skills (apply if available): {', '.join(auto_skills)}\n\n"
+            f"Task: {task}"
+        )
+    return _safe_execute(selected_cli, payload, timeout=timeout, cwd=cwd)
+
+
+def _safe_execute(
+    cli: str,
+    task: str,
+    timeout: Optional[int] = None,
+    *,
+    cwd: Path | str | None = None,
+) -> int:
     """Execute provider CLI safely with shell=False."""
     if cli.strip().startswith("codex ") and "--skip-git-repo-check" not in cli:
         cli = f"{cli} --skip-git-repo-check"
@@ -3776,8 +3901,13 @@ def _safe_execute(cli: str, task: str, timeout: Optional[int] = None) -> int:
             cmd_parts + [task],
             shell=False,
             timeout=timeout,
+            cwd=str(cwd) if cwd is not None else None,
         )
         return result.returncode
+    except subprocess.TimeoutExpired:
+        timeout_text = f"{timeout}s" if timeout is not None else "the configured timeout"
+        console.print(f"[red]Provider command timed out after {timeout_text}.[/red]")
+        return 124
     except FileNotFoundError:
         console.print("[red]Provider command not found. Check your PATH and provider CLI installation.[/red]")
         return 127
@@ -4175,6 +4305,7 @@ def _collect_runner_inputs(
     args,
     provider_prefix: Optional[str],
     default_provider: str,
+    default_mode: str,
     providers: list[str],
     lang: str,
     decision_ui,
@@ -4190,7 +4321,7 @@ def _collect_runner_inputs(
         raise SystemExit("Use either positional task or --prompt, not both.")
     raw_task = raw_task_option or raw_task_positional
     provider = provider_prefix or args.provider or default_provider
-    mode = str(getattr(args, "execution_mode", "auto"))
+    mode = str(getattr(args, "execution_mode", "") or default_mode)
 
     if raw_task:
         return provider, mode, raw_task
@@ -4214,7 +4345,7 @@ def _collect_runner_inputs(
             ("direct", "direct"),
         ],
         questionary_module=decision_ui,
-        default_value="tmux",
+        default_value=default_mode if default_mode in {"tmux", "auto", "direct"} else "tmux",
         provider=provider,
     )
     raw_task = _ask_text_input(_auto_msg(lang, "wizard_task"), questionary_module=decision_ui, default_value="")
@@ -4304,6 +4435,49 @@ def _resolve_v2_prompt_defaults(config: Optional[Config]) -> tuple[str, str]:
     return preset, blueprint
 
 
+def _build_v2_steps_json(
+    *,
+    blueprint_key: str,
+    role_leads: dict[str, str],
+    controller: str,
+    lang: str,
+) -> str:
+    """Build a JSON representation of the blueprint stages for the prompt example."""
+    try:
+        blueprint = resolve_workflow_blueprint(blueprint_key)
+    except KeyError:
+        return "[]"
+
+    is_zh = lang == "zh-CN"
+    steps = []
+
+    # Map blueprint agent IDs to actual agent names from role_leads
+    agent_map = {
+        "codex": role_leads.get("implementation", controller),
+        "gemini": role_leads.get("architecture", controller),
+        "claude": role_leads.get("testing", controller),
+    }
+
+    for idx, stage in enumerate(blueprint.stages, 1):
+        owner = agent_map.get(stage.default_agent, controller) if stage.default_agent else controller
+
+        steps.append({
+            "id": f"S{idx}",
+            "owner": owner,
+            "goal": stage.goal,
+            "input": "..." if not is_zh else "...",
+            "output": ", ".join(stage.outputs) if stage.outputs else "...",
+            "done_when": f"Complete {stage.key} with required outputs" if not is_zh else f"完成 {stage.key} 并产出必要输出",
+            "eta_minutes": stage.timebox_minutes or 15,
+            "responsibility_stage": stage.responsibility_stage,
+            "artifact_type": stage.allowed_artifacts[0] if stage.allowed_artifacts else (stage.outputs[0] if stage.outputs else "none"),
+            "boundary": stage.boundary,
+            "timebox_minutes": stage.timebox_minutes or 15,
+        })
+
+    return json.dumps(steps, indent=4, ensure_ascii=False)
+
+
 def _build_controller_prompt_document(
     *,
     task: str,
@@ -4362,6 +4536,14 @@ def _build_controller_prompt_document(
     ]
     policy_text = "\n".join(policy_lines)
 
+    # Generate dynamic steps JSON based on the selected blueprint
+    dynamic_steps_json = _build_v2_steps_json(
+        blueprint_key=workflow_blueprint,
+        role_leads=role_leads,
+        controller=controller,
+        lang=lang,
+    )
+
     if is_zh:
         return f"""# 主控 Agent 执行文档（可编辑）
 
@@ -4402,47 +4584,7 @@ def _build_controller_prompt_document(
     {{"name": "{implementation_lead}", "model": "unknown", "persona": "implementation-lead", "why": "负责主实现与跨文件修改" }},
     {{"name": "{testing_lead}", "model": "unknown", "persona": "quality-reviewer", "why": "负责验收、测试设计与补充修补" }}
   ],
-  "steps": [
-    {{
-      "id": "S1",
-      "owner": "{architecture_lead}",
-      "goal": "收集现状并明确方案方向",
-      "input": "用户任务 + 配置",
-      "output": "现状证据包与可执行方案方向",
-      "done_when": "完成现状收集，明确关键约束，并给出可执行方案方向或是否需要进入 artifact 阶段",
-      "eta_minutes": 15,
-      "responsibility_stage": "collect",
-      "artifact_type": "evidence-pack",
-      "boundary": "只收集现状，不直接改代码或重设方案",
-      "timebox_minutes": 15
-    }},
-    {{
-      "id": "S2",
-      "owner": "{implementation_lead}",
-      "goal": "完成主实现",
-      "input": "已确认的方案与技术骨架",
-      "output": "可运行主功能",
-      "done_when": "核心功能可运行，且关键交互或主流程可手动验证",
-      "eta_minutes": 45,
-      "responsibility_stage": "execute",
-      "artifact_type": "code-change",
-      "boundary": "仅在已批准方向内实现，不擅自扩大范围或改写需求",
-      "timebox_minutes": 45
-    }},
-    {{
-      "id": "S3",
-      "owner": "{testing_lead}",
-      "goal": "执行验收与补充修补",
-      "input": "已实现功能",
-      "output": "验收结论与必要修补",
-      "done_when": "给出明确通过/失败结论，列出检查项；若发现超出边界的问题，明确交回 correct 阶段",
-      "eta_minutes": 20,
-      "responsibility_stage": "validate",
-      "artifact_type": "validation-report",
-      "boundary": "以验收和风险识别为主，不在本阶段擅自重设方案",
-      "timebox_minutes": 20
-    }}
-  ],
+  "steps": {dynamic_steps_json},
   "approval_question": "是否同意该计划？"
 }}
 ```
@@ -4502,47 +4644,7 @@ First, return JSON only (no extra explanation) using this schema:
     {{"name": "{implementation_lead}", "model": "unknown", "persona": "implementation-lead", "why": "Owns the main implementation and cross-file edits"}},
     {{"name": "{testing_lead}", "model": "unknown", "persona": "quality-reviewer", "why": "Owns acceptance, test design, and follow-up fixes"}}
   ],
-  "steps": [
-    {{
-      "id": "S1",
-      "owner": "{architecture_lead}",
-      "goal": "collect context and define the technical direction",
-      "input": "user task + config",
-      "output": "evidence pack and execution direction",
-      "done_when": "Current constraints are collected and the next direction is explicit",
-      "eta_minutes": 15,
-      "responsibility_stage": "collect",
-      "artifact_type": "evidence-pack",
-      "boundary": "Collect current facts only; do not implement or redesign in this step",
-      "timebox_minutes": 15
-    }},
-    {{
-      "id": "S2",
-      "owner": "{implementation_lead}",
-      "goal": "deliver the main implementation",
-      "input": "selected approach and skeleton",
-      "output": "working core feature",
-      "done_when": "The primary workflow runs and the main interaction can be checked manually",
-      "eta_minutes": 45,
-      "responsibility_stage": "execute",
-      "artifact_type": "code-change",
-      "boundary": "Implement only within the approved direction; do not expand scope",
-      "timebox_minutes": 45
-    }},
-    {{
-      "id": "S3",
-      "owner": "{testing_lead}",
-      "goal": "run acceptance and follow-up fixes",
-      "input": "implemented feature",
-      "output": "acceptance result and necessary follow-up fixes",
-      "done_when": "Acceptance verdict is explicit, checks are listed, and out-of-bound issues are handed back for correction",
-      "eta_minutes": 20,
-      "responsibility_stage": "validate",
-      "artifact_type": "validation-report",
-      "boundary": "Validate and identify risk; do not silently reset the solution direction here",
-      "timebox_minutes": 20
-    }}
-  ],
+  "steps": {dynamic_steps_json},
   "approval_question": "Do you approve this plan?"
 }}
 ```
@@ -7867,7 +7969,7 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
         "-x",
         "--execution-mode",
         choices=["auto", "direct", "tmux"],
-        default="auto",
+        default=None,
         help="Execution mode for collaboration workflow",
     )
     parser.add_argument(
@@ -7927,6 +8029,8 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
     )
 
     args = parser.parse_args(raw_args)
+    configured_mode = str(getattr(config, "runtime_mode", "auto") or "auto").strip().lower()
+    default_mode = configured_mode if configured_mode in {"direct", "tmux"} else "auto"
 
     if os.environ.get("AI_COLLAB_ACTIVE") == "1" and not bool(args.allow_nested):
         role = os.environ.get("AI_COLLAB_ROLE", "agent")
@@ -7938,6 +8042,7 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
 
     provider = provider_prefix or args.provider or config.current_controller
     lang = _resolve_runtime_language(cli_lang=args.lang, config_lang=config.ui_language)
+    mode_requested_via_args = bool(getattr(args, "execution_mode", None))
     decision_ui = None
     if args.interactive_decisions and sys.stdin.isatty():
         decision_ui = _pick_ui_backend(
@@ -7951,11 +8056,13 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
         args=args,
         provider_prefix=provider_prefix,
         default_provider=provider,
+        default_mode=default_mode,
         providers=sorted(providers),
         lang=lang,
         decision_ui=decision_ui,
     )
     args.execution_mode = mode
+    mode_selected_explicitly = mode_requested_via_args or prompted_for_inputs
 
     detector = CollaborationDetector(config)
     result = detector.detect(task, provider)
@@ -7981,7 +8088,7 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
         interactive_session = bool(args.interactive_decisions and sys.stdin.isatty())
         auto_cfg = config.auto_collaboration or {}
         default_controller_first = bool(auto_cfg.get("controller_first", True))
-        if args.controller_first is None and args.execution_mode == "tmux":
+        if args.controller_first is None and mode_selected_explicitly and args.execution_mode == "tmux":
             default_controller_first = False
         controller_first_enabled = (
             default_controller_first if args.controller_first is None else bool(args.controller_first)
@@ -8208,24 +8315,16 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
             console.print(f"[red]{_auto_msg(lang, 'tmux_required_unavailable')}[/red]")
             return
 
-        context = {
-            "controller": provider,
-            "project_categories": ", ".join(result.project_categories),
-            "auto_skills": ", ".join(result.suggested_skills),
-            "intent": getattr(result, "intent", "") or "",
-            "workflow_engine": getattr(result, "workflow_engine", "") or "",
-            "session_preset": getattr(result, "session_preset", "") or "",
-            "workflow_blueprint": getattr(result, "workflow_blueprint", "") or "",
-            "interactive": bool(args.interactive_decisions and sys.stdin.isatty()),
-        }
-        if controller_plan:
-            context["controller_plan"] = json.dumps(controller_plan, ensure_ascii=False)
-        workflow_manager = WorkflowManager(config)
-        workflow_manager.execute_workflow(
-            getattr(result, "workflow_blueprint", "") or "",
-            task,
-            context,
+        exit_code = _execute_direct_runtime(
+            config=config,
+            provider=provider,
+            task=task,
+            result=result,
+            controller_plan=controller_plan,
+            interactive=bool(args.interactive_decisions and sys.stdin.isatty()),
         )
+        if exit_code != 0:
+            raise SystemExit(exit_code)
         return
 
     console.print(f"\n[yellow]{_auto_msg(lang, 'single_mode', provider=provider)}[/yellow]")
@@ -8247,20 +8346,15 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
         if action != "execute":
             return
 
-    provider_config = config.providers.get(provider)
-    if provider_config:
-        task_with_context = task
-        if result.suggested_skills:
-            task_with_context = (
-                f"Auto-trigger skills (apply if available): {', '.join(result.suggested_skills)}\n\n"
-                f"Task: {task}"
-            )
-        selected_cli = provider_config.cli
-        try:
-            selected_cli = ModelSelector(config).select_model(provider, task, "default").cli
-        except Exception:
-            selected_cli = provider_config.cli
-        _safe_execute(selected_cli, task_with_context, timeout=provider_config.timeout)
+    exit_code = _execute_direct_runtime(
+        config=config,
+        provider=provider,
+        task=task,
+        result=result,
+        interactive=bool(args.interactive_decisions and sys.stdin.isatty()),
+    )
+    if exit_code != 0:
+        raise SystemExit(exit_code)
 
 
 
@@ -8348,7 +8442,9 @@ def model_select_main() -> None:
 
     if should_execute:
         console.print(f"\n[dim]Executing via selected CLI...[/dim]")
-        _safe_execute(result.cli, task)
+        exit_code = _safe_execute(result.cli, task)
+        if exit_code != 0:
+            raise SystemExit(exit_code)
 
 
 def _print_project_help() -> None:
@@ -8374,7 +8470,7 @@ def _print_project_help() -> None:
         "  ai-collab detect \"design API contract\" --output json\n"
         "  ai-collab ux-lab\n"
         "  ai-collab ux-lab-v3\n"
-    , markup=False)
+    , markup=False, highlight=False)
 
 
 def _should_offer_startup_update(args: list[str]) -> bool:
@@ -8571,8 +8667,11 @@ def project_main() -> None:
         if not sys.stdin.isatty():
             _print_project_help()
             console.print(
-                "\n[dim]Non-interactive shell detected. Use `ai-collab run <task>` "
-                "or start `ai-collab` from an interactive terminal.[/dim]"
+                "\nNon-interactive shell detected. Use `ai-collab run <task>` "
+                "or start `ai-collab` from an interactive terminal.",
+                style="dim",
+                markup=False,
+                highlight=False,
             )
             return
         config_obj = Config.load()

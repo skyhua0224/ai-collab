@@ -141,7 +141,7 @@ Enter confirm · b back · Esc cancel
 
 1. `tmux`（推荐）
 2. `console`（未来实验/新交互 backend）
-3. `direct`（高级/轻量模式）
+3. `direct`（单终端执行 backend）
 
 注意：
 
@@ -156,7 +156,7 @@ Choose how ai-collab should execute multi-agent runs.
 
 ❯ 1. tmux (stable, recommended)
   2. console (new runtime path)
-  3. direct (lightweight, advanced)
+  3. direct (single-terminal backend)
 
 Enter confirm · b back · Esc cancel
 ```

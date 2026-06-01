@@ -679,7 +679,7 @@ def _entry_label(lang: str, entry_surface: str) -> str:
 def _runtime_label(lang: str, runtime_mode: str) -> str:
     mapping = {
         "tmux": "tmux (stable, recommended)" if lang == "en-US" else "tmux（稳定，推荐）",
-        "direct": "direct (lightweight, advanced)" if lang == "en-US" else "direct（轻量，进阶）",
+        "direct": "direct (single-terminal backend)" if lang == "en-US" else "直接执行（单终端）",
     }
     return mapping.get(runtime_mode, runtime_mode)
 

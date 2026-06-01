@@ -15,7 +15,7 @@ This framework orchestrates planning, implementation, review, and delivery acros
 
 1. **Controller-first flow** – Plan before execution
 2. **Config-driven routing** – Roles and models are not hardcoded
-3. **Visible collaboration** – tmux panes and logs for real-time and post-run review
+3. **Dual execution backends** – `direct` for single-terminal execution, `tmux` for visible collaboration, logs, and replay
 4. **Explicit fallback** – Predictable behavior on provider or permission failures
 
 ## Single-Command Interface
@@ -62,6 +62,11 @@ ai-collab status
 ai-collab "Design and implement an authenticated REST API with test and release notes"
 ```
 
+Note: `direct` now means a single-terminal execution backend.
+
+- Controller-only plans run directly in the current terminal
+- Multi-agent plans also stay in the current terminal, but execute sequentially by workflow stage without creating `tmux` panes
+
 ### 3. Force Visual tmux Collaboration
 
 ```bash
@@ -75,8 +80,8 @@ ai-collab \
   "Implement a minimal frontend-backend feature and complete review handoff"
 ```
 
-Note: the current runtime only starts `tmux` directly when the approved plan is still a runnable multi-agent orchestration.
-If plan edits collapse everything back to a single agent, the execution target screen disables `tmux` and keeps the startup-bundle save path only.
+Note: `tmux` is only used for runnable multi-agent visual orchestration.
+If plan edits collapse everything back to a single agent, or all steps end up on one owner, the execution target screen disables `tmux`; `direct runtime` remains available in the current terminal.
 
 ## Common Subcommands
 
