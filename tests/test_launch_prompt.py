@@ -198,6 +198,138 @@ def test_run_launch_prompt_can_start_tmux_from_execution_targets(monkeypatch, tm
     assert "tmux runtime" in output
 
 
+def test_run_launch_prompt_can_start_direct_from_execution_targets(monkeypatch, tmp_path) -> None:
+    from ai_collab.launch_prompt import run_launch_prompt
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    config.current_controller = "codex"
+    config.runtime_mode = "direct"
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=120)
+    answers = iter(["测试启动 direct"])
+    menu_choices = iter(["1", "2", "1", "1", "direct"])
+
+    monkeypatch.setattr(
+        "ai_collab.launch_prompt.run_launcher_flow",
+        lambda **kwargs: UxLabV3Result(
+            status="planned",
+            workspace=kwargs["workspace"] or kwargs["cwd"],
+            controller=kwargs["controller"] or "codex",
+            task=kwargs["task"] or "",
+            lang="zh-CN",
+            planner_mode=kwargs["planner_mode"],
+            plan=[LabPlanItem("S1", "主控直接执行", "codex", 8, "返回可检查结果")],
+            controller_plan={
+                "plan_version": "1.0",
+                "controller": "codex",
+                "requires_multi_agent": False,
+                "agents": [{"name": "codex", "model": "gpt-5.4", "persona": "controller", "why": "负责执行"}],
+                "steps": [{"id": "S1", "owner": "codex", "goal": "主控直接执行", "done_when": "返回可检查结果", "eta_minutes": 8}],
+            },
+            bundle_path=None,
+        ),
+    )
+    monkeypatch.setattr("ai_collab.cli._execute_direct_runtime", lambda **_k: 0)
+
+    def _input(prompt: str, *, default: str = "") -> str:
+        return next(answers)
+
+    result = run_launch_prompt(
+        config=config,
+        cwd=tmp_path,
+        workspace=tmp_path,
+        controller=None,
+        task=None,
+        task_file=None,
+        planner_mode="mock",
+        output_bundle=None,
+        input_fn=_input,
+        selector_fn=lambda **_: next(menu_choices),
+        console_obj=console,
+        clear_screen=False,
+        from_entry=True,
+    )
+
+    assert result is not None
+    assert result.status == "started"
+    output = buffer.getvalue()
+    assert "任务已启动" in output
+    assert "直接执行" in output
+
+
+def test_run_launch_prompt_can_start_multi_agent_direct_from_execution_targets(monkeypatch, tmp_path) -> None:
+    from ai_collab.launch_prompt import run_launch_prompt
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    config.current_controller = "codex"
+    config.runtime_mode = "direct"
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=120)
+    answers = iter(["测试启动 multi-agent direct"])
+    menu_choices = iter(["1", "2", "1", "1", "direct"])
+
+    monkeypatch.setattr(
+        "ai_collab.launch_prompt.run_launcher_flow",
+        lambda **kwargs: UxLabV3Result(
+            status="planned",
+            workspace=kwargs["workspace"] or kwargs["cwd"],
+            controller=kwargs["controller"] or "codex",
+            task=kwargs["task"] or "",
+            lang="zh-CN",
+            planner_mode=kwargs["planner_mode"],
+            plan=[
+                LabPlanItem("S1", "主控规划", "codex", 5, "返回规划"),
+                LabPlanItem("S2", "协作验证", "claude", 7, "返回验证结果"),
+            ],
+            controller_plan={
+                "plan_version": "1.0",
+                "controller": "codex",
+                "workflow_engine": "v2",
+                "session_preset": "design-first",
+                "workflow_blueprint": "design-led-loop",
+                "requires_multi_agent": True,
+                "agents": [
+                    {"name": "codex", "model": "gpt-5.4", "persona": "controller", "why": "负责规划"},
+                    {"name": "claude", "model": "claude-sonnet-4-6", "persona": "collaborator", "why": "负责验证"},
+                ],
+                "steps": [
+                    {"id": "S1", "owner": "codex", "goal": "主控规划", "done_when": "返回规划", "eta_minutes": 5},
+                    {"id": "S2", "owner": "claude", "goal": "协作验证", "done_when": "返回验证结果", "eta_minutes": 7},
+                ],
+            },
+            bundle_path=None,
+        ),
+    )
+    monkeypatch.setattr("ai_collab.cli._execute_direct_runtime", lambda **_k: 0)
+
+    def _input(prompt: str, *, default: str = "") -> str:
+        return next(answers)
+
+    result = run_launch_prompt(
+        config=config,
+        cwd=tmp_path,
+        workspace=tmp_path,
+        controller=None,
+        task=None,
+        task_file=None,
+        planner_mode="mock",
+        output_bundle=None,
+        input_fn=_input,
+        selector_fn=lambda **_: next(menu_choices),
+        console_obj=console,
+        clear_screen=False,
+        from_entry=True,
+    )
+
+    assert result is not None
+    assert result.status == "started"
+    output = buffer.getvalue()
+    assert "任务已启动" in output
+    assert "直接执行" in output
+
+
 def test_run_launch_prompt_keeps_review_preview_after_plan_edit(monkeypatch, tmp_path) -> None:
     from ai_collab.launch_prompt import run_launch_prompt
 
@@ -564,7 +696,7 @@ def test_review_screen_renderable_falls_back_to_configured_model_labels_for_unkn
     console.print(_review_screen_renderable(state, result))
     output = buffer.getvalue()
 
-    assert "gpt-5.4" in output
+    assert "gpt-5.5" in output
     assert "claude-sonnet-4-6" in output
 
 
@@ -904,6 +1036,47 @@ def test_plan_step_form_renderable_shows_prefilled_values() -> None:
     assert "明确至少 1 条主测试路径和 2 类边界条件" in output
 
 
+def test_plan_step_form_renderable_uses_compact_layout_for_small_terminal() -> None:
+    from ai_collab.launch_prompt import LaunchPromptState, _plan_step_form_renderable
+    from ai_collab.plan_editor_prompt import PlanDraft, PlanDraftStep
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    state = LaunchPromptState.from_config(
+        config,
+        cwd=Path("/Users/skyhua/ai-collab"),
+        workspace=Path("/Users/skyhua/test_game"),
+        from_entry=True,
+    )
+    draft = PlanDraft(
+        workspace=state.workspace,
+        controller="codex",
+        task="制作一个贪吃蛇小游戏",
+        lang="zh-CN",
+        planner_mode="live",
+        steps=[
+            PlanDraftStep(
+                id="S1",
+                title="收敛测试范围并定义通过标准",
+                owner="claude",
+                eta_minutes=10,
+                done_when="明确至少 1 条主测试路径和 2 类边界条件",
+            )
+        ],
+    )
+
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=64)
+    console.print(_plan_step_form_renderable(state, draft, step_index=0, is_insert=False, compact=True, width=64))
+    output = buffer.getvalue()
+
+    assert "编辑步骤 · S1" in output
+    assert "步骤标题 ·" in output
+    assert "分配 Agent · Claude Code" in output
+    assert "╭─ 步骤标题" not in output
+    assert len(output.splitlines()) <= 8
+
+
 def test_plan_task_form_renderable_shows_prefilled_task_name() -> None:
     from ai_collab.launch_prompt import LaunchPromptState, _plan_task_form_renderable
 
@@ -925,6 +1098,31 @@ def test_plan_task_form_renderable_shows_prefilled_task_name() -> None:
     assert "修改任务名称" in output
     assert "任务名称" in output
     assert "完成 ProjectPrinting 的 Widget 设计与落地" in output
+
+
+def test_plan_task_form_renderable_uses_compact_layout_for_small_terminal() -> None:
+    from ai_collab.launch_prompt import LaunchPromptState, _plan_task_form_renderable
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    state = LaunchPromptState.from_config(
+        config,
+        cwd=Path("/Users/skyhua/ai-collab"),
+        workspace=Path("/Users/skyhua/test_game"),
+        from_entry=True,
+    )
+    task = "完成 ProjectPrinting 的 Widget 设计与落地并补齐回归验证"
+
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=64)
+    console.print(_plan_task_form_renderable(state, task, compact=True, width=64))
+    output = buffer.getvalue()
+
+    assert "修改任务名称" in output
+    assert "任务名称 ·" in output
+    assert "ProjectPrinting" in output
+    assert "╭─ 任务名称" not in output
+    assert len(output.splitlines()) <= 6
 
 
 def test_step_screen_renderable_emits_ansi_colors_for_planner_options(tmp_path) -> None:
@@ -1056,6 +1254,160 @@ def test_edit_plan_prompt_back_preserves_current_draft(tmp_path) -> None:
     assert updated.plan[0].title == "补充回归测试"
     assert updated.controller_plan is not None
     assert updated.controller_plan["requires_multi_agent"] is False
+
+
+def test_plan_editor_screen_renderable_highlights_model_routes_and_prompt(tmp_path) -> None:
+    from ai_collab.launch_prompt import LaunchPromptState, _plan_editor_screen_renderable
+    from ai_collab.plan_editor_prompt import PlanDraft, PlanDraftStep
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    state = LaunchPromptState.from_config(config, cwd=tmp_path, workspace=tmp_path, from_entry=True)
+    draft = PlanDraft(
+        workspace=tmp_path,
+        controller="codex",
+        task="重新编排登录模块修复",
+        lang="zh-CN",
+        planner_mode="live",
+        steps=[
+            PlanDraftStep("S1", "确认登录修复边界", "claude", 8, "列出鉴权入口和回归范围"),
+            PlanDraftStep("S2", "实现登录修复", "codex", 20, "登录流程通过本地验证"),
+        ],
+        source_controller_plan={
+            "agents": [
+                {"name": "claude", "model": "claude-sonnet-4-6"},
+                {"name": "codex", "model": "gpt-5.4"},
+            ]
+        },
+    )
+
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=120)
+    console.print(_plan_editor_screen_renderable(state, draft, selected_index=1))
+    output = buffer.getvalue()
+
+    assert "Prompt / 任务输入" in output
+    assert "模型路由" in output
+    assert "重新编排登录模块修复" in output
+    assert "gpt-5.4" in output
+    assert "claude-sonnet-4-6" in output
+
+
+def test_plan_editor_screen_renderable_keeps_selected_step_visible_in_viewport(tmp_path) -> None:
+    from ai_collab.launch_prompt import LaunchPromptState, _plan_editor_screen_renderable
+    from ai_collab.plan_editor_prompt import PlanDraft, PlanDraftStep
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    state = LaunchPromptState.from_config(config, cwd=tmp_path, workspace=tmp_path, from_entry=True)
+    draft = PlanDraft(
+        workspace=tmp_path,
+        controller="codex",
+        task="检查长编排滚动",
+        lang="zh-CN",
+        planner_mode="live",
+        steps=[
+            PlanDraftStep(f"S{index}", f"长编排步骤 {index}", "codex", 5, f"完成长编排步骤 {index}")
+            for index in range(1, 10)
+        ],
+    )
+
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=120)
+    console.print(_plan_editor_screen_renderable(state, draft, selected_index=7, max_visible_steps=4))
+    output = buffer.getvalue()
+
+    assert "长编排步骤 8" in output
+    assert "长编排步骤 1" not in output
+    assert "显示步骤" in output
+
+
+def test_plan_editor_screen_renderable_uses_compact_layout_for_small_terminal(tmp_path) -> None:
+    from ai_collab.launch_prompt import LaunchPromptState, _plan_editor_screen_renderable
+    from ai_collab.plan_editor_prompt import PlanDraft, PlanDraftStep
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    state = LaunchPromptState.from_config(config, cwd=tmp_path, workspace=tmp_path, from_entry=True)
+    draft = PlanDraft(
+        workspace=tmp_path,
+        controller="codex",
+        task="小窗口重新编排登录和支付修复",
+        lang="zh-CN",
+        planner_mode="live",
+        steps=[
+            PlanDraftStep(f"S{index}", f"小窗口步骤 {index}", "codex", 5, f"完成小窗口步骤 {index}")
+            for index in range(1, 10)
+        ],
+    )
+
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=70)
+    console.print(
+        _plan_editor_screen_renderable(
+            state,
+            draft,
+            selected_index=7,
+            max_visible_steps=3,
+            compact=True,
+            width=70,
+        )
+    )
+    output = buffer.getvalue()
+
+    assert "Prompt / 任务输入 ·" in output
+    assert "路由 ·" in output
+    assert "╭─ 模型路由" not in output
+    assert "小窗口步骤 8" in output
+    assert "小窗口步骤 1" not in output
+    assert len(output.splitlines()) <= 24
+
+
+def test_plan_step_form_uses_window_too_small_fallback(monkeypatch, tmp_path) -> None:
+    import os
+    from prompt_toolkit.layout.containers import Window
+
+    from ai_collab.launch_prompt import LaunchPromptState, _prompt_plan_step_form_with_prompt_toolkit
+    from ai_collab.plan_editor_prompt import PlanDraft, PlanDraftStep
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    state = LaunchPromptState.from_config(config, cwd=tmp_path, workspace=tmp_path, from_entry=True)
+    draft = PlanDraft(
+        workspace=tmp_path,
+        controller="codex",
+        task="检查极小窗口表单",
+        lang="zh-CN",
+        planner_mode="live",
+        steps=[
+            PlanDraftStep("S1", "确认窗口太小时的降级提示", "claude", 5, "显示可理解的窗口太小提示")
+        ],
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeApplication:
+        def __init__(self, *args, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr("prompt_toolkit.application.Application", _FakeApplication)
+    monkeypatch.setattr(
+        "ai_collab.launch_prompt.shutil.get_terminal_size",
+        lambda *_args, **_kwargs: os.terminal_size((80, 12)),
+    )
+
+    _prompt_plan_step_form_with_prompt_toolkit(
+        state=state,
+        draft=draft,
+        step_index=0,
+        is_insert=False,
+        console_obj=Console(file=StringIO(), force_terminal=False, color_system=None, width=80),
+        clear_screen=False,
+    )
+
+    assert isinstance(captured["layout"].container, Window)
 
 
 def test_prompt_task_with_prompt_toolkit_clears_screen_without_fullscreen_flash(monkeypatch) -> None:

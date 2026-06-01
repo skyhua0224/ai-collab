@@ -120,6 +120,11 @@ ai-collab
 ai-collab -p codex -x direct "Build audit logging and retention policy checks"
 ```
 
+`direct` means the single-terminal backend.
+
+1. If the approved plan is controller-only, the current agent executes it directly.
+2. If the approved plan is still multi-agent, ai-collab keeps execution in the current terminal and runs the workflow stages sequentially without creating `tmux` panes.
+
 ### tmux execution (inline panes)
 
 ```bash
@@ -134,8 +139,8 @@ ai-collab \
   "Deliver a full-stack feature with implementation and review handoff"
 ```
 
-`tmux` direct start is only available when the generated or edited plan is still multi-agent.
-In practice, the orchestration must keep at least two different step owners; if every step ends up on the same agent, the execution target screen disables `tmux` and only allows saving the startup bundle.
+`tmux` start is only available when the generated or edited plan is still multi-agent.
+In practice, the orchestration must keep at least two different step owners; if every step ends up on the same agent, the execution target screen disables `tmux` and `direct runtime` becomes the current-terminal fallback.
 
 ### Plan-only mode
 
@@ -223,6 +228,7 @@ Check the detected or approved plan before assuming `tmux` is broken:
 1. `tmux` must exist in `PATH`.
 2. The plan must remain multi-agent.
 3. After plan edits, `steps[].owner` must still contain at least two different agents.
+4. If the plan is no longer multi-agent, use `--execution-mode direct` instead of treating that as a tmux failure.
 
 ### Language not applied
 

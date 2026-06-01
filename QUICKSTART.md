@@ -49,6 +49,12 @@ ai-collab
 ai-collab --provider codex --execution-mode direct "实现一个用户登录与权限校验模块"
 ```
 
+说明：
+
+- `direct` 是单终端执行后端，不会创建 `tmux` pane
+- 如果计划是单 Agent，就由当前 Agent 直接执行
+- 如果计划是多 Agent，就在当前终端按步骤顺序调用不同 Agent 执行
+
 ### tmux 模式
 
 ```bash
@@ -59,6 +65,11 @@ ai-collab \
   --tmux-prewarm-subagents \
   "实现一个前后端联动功能并完成审查交接"
 ```
+
+说明：
+
+- `tmux` 只适用于可执行的多 Agent 可视化协作
+- 如果计划后续被编辑成单 Agent，建议改用 `direct`
 
 ## 5) 仅生成计划（不执行）
 

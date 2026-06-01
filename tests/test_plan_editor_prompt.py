@@ -145,9 +145,10 @@ def test_execution_targets_include_disabled_future_modes(monkeypatch) -> None:
 
     targets = build_execution_targets(state, _sample_result())
 
-    assert [target.key for target in targets] == ["tmux", "iterm2", "console", "gui", "save"]
-    assert [target.enabled for target in targets] == [True, False, False, False, True]
-    assert all(target.badge == "Coming Soon" for target in targets[1:4])
+    assert [target.key for target in targets] == ["tmux", "direct", "iterm2", "console", "gui", "save"]
+    assert [target.enabled for target in targets] == [True, True, False, False, False, True]
+    assert all(target.badge == "Coming Soon" for target in targets[2:5])
+    assert "多 Agent" in targets[1].description
 
 
 def test_execution_targets_disable_tmux_for_non_multi_agent_plan(monkeypatch) -> None:
@@ -184,6 +185,7 @@ def test_execution_targets_disable_tmux_for_non_multi_agent_plan(monkeypatch) ->
 
     targets = build_execution_targets(state, result)
 
-    assert [target.key for target in targets] == ["tmux", "iterm2", "console", "gui", "save"]
-    assert [target.enabled for target in targets] == [False, False, False, False, True]
+    assert [target.key for target in targets] == ["tmux", "direct", "iterm2", "console", "gui", "save"]
+    assert [target.enabled for target in targets] == [False, True, False, False, False, True]
     assert "多 Agent" in targets[0].description
+    assert "单 Agent" in targets[1].description

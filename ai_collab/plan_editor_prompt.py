@@ -43,6 +43,45 @@ class ExecutionTargetOption:
     badge: str = ""
 
 
+def _can_start_direct_from_result(result: UxLabV3Result | None) -> bool:
+    if result is None:
+        return False
+    controller_plan = result.controller_plan if isinstance(result.controller_plan, dict) else {}
+    steps = controller_plan.get("steps", [])
+    if isinstance(steps, list) and steps:
+        owners = {
+            _normalize_owner(item.get("owner"), default="")
+            for item in steps
+            if isinstance(item, dict) and str(item.get("owner", "")).strip()
+        }
+        return bool(owners)
+    orchestration_plan = getattr(result, "orchestration_plan", None) or []
+    execution_mode = str(getattr(result, "execution_mode", "single-agent") or "single-agent")
+    return bool(execution_mode == "multi-agent" and orchestration_plan)
+
+
+def _direct_execution_shape(result: UxLabV3Result | None) -> str:
+    if result is None:
+        return "unavailable"
+    controller_plan = result.controller_plan if isinstance(result.controller_plan, dict) else {}
+    steps = controller_plan.get("steps", [])
+    if isinstance(steps, list) and steps:
+        owners = {
+            _normalize_owner(item.get("owner"), default="")
+            for item in steps
+            if isinstance(item, dict) and str(item.get("owner", "")).strip()
+        }
+        if len(owners) > 1:
+            return "multi-agent"
+        if len(owners) == 1:
+            return "single-agent"
+    orchestration_plan = getattr(result, "orchestration_plan", None) or []
+    execution_mode = str(getattr(result, "execution_mode", "single-agent") or "single-agent")
+    if execution_mode == "multi-agent" and orchestration_plan:
+        return "multi-agent"
+    return "unavailable"
+
+
 def _can_start_tmux_from_result(result: UxLabV3Result | None) -> bool:
     if shutil.which("tmux") is None:
         return False
@@ -272,6 +311,8 @@ def build_execution_targets(state: Any, result: UxLabV3Result | None = None) -> 
     lang = getattr(getattr(state, "config", None), "ui_language", "en-US")
     zh = lang == "zh-CN"
     tmux_ready = _can_start_tmux_from_result(result)
+    direct_ready = _can_start_direct_from_result(result)
+    direct_shape = _direct_execution_shape(result)
     return [
         ExecutionTargetOption(
             key="tmux",
@@ -286,6 +327,24 @@ def build_execution_targets(state: Any, result: UxLabV3Result | None = None) -> 
                 else "Current plan is not ready for direct tmux start: tmux must be installed and the orchestration must be a runnable multi-agent plan."
             ),
             enabled=tmux_ready,
+        ),
+        ExecutionTargetOption(
+            key="direct",
+            label="直接执行" if zh else "direct runtime",
+            description=(
+                "在当前终端直接以单 Agent 方式执行批准后的计划。"
+                if direct_ready and zh and direct_shape == "single-agent"
+                else "在当前终端直接顺序执行批准后的多 Agent 计划，不创建 tmux 窗格。"
+                if direct_ready and zh and direct_shape == "multi-agent"
+                else "Execute the approved controller-only plan directly in the current terminal."
+                if direct_ready and direct_shape == "single-agent"
+                else "Execute the approved multi-agent plan sequentially in the current terminal without tmux panes."
+                if direct_ready and direct_shape == "multi-agent"
+                else "当前计划暂不满足直接执行条件：需要已有可运行的单终端执行计划。"
+                if zh
+                else "Current plan is not ready for direct start: direct execution requires a runnable single-terminal plan."
+            ),
+            enabled=direct_ready,
         ),
         ExecutionTargetOption(
             key="iterm2",

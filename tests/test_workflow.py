@@ -289,3 +289,81 @@ def test_execute_workflow_rejects_unknown_route(config: Config) -> None:
 
     with pytest.raises(ValueError, match="Unknown workflow route: code-review"):
         manager.execute_workflow("code-review", "实现一个新功能", {})
+
+
+def test_execute_phase_once_uses_live_runner_when_live_output_enabled(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live-output context should route phase execution through the streaming runner."""
+    manager = WorkflowManager(config)
+    resolved = manager._resolve_phase_plan(
+        WorkflowPhase(
+            agent="codex",
+            action="execute:ship-change",
+            output="implementation result",
+            responsibility_stage="execute",
+        ),
+        {},
+    )
+    captured: dict[str, object] = {}
+
+    def fake_live(cmd: list[str], *, timeout: int | None, line_prefix: str = "") -> subprocess.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        captured["timeout"] = timeout
+        captured["line_prefix"] = line_prefix
+        return _ok("Live provider output with stable implementation notes and validation breadcrumbs.")
+
+    monkeypatch.setattr("ai_collab.core.workflow._run_command_live", fake_live)
+    monkeypatch.setattr(
+        "ai_collab.core.workflow.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("buffered runner should not be used")),
+    )
+
+    result = manager._execute_phase_once(
+        resolved_phase=resolved,
+        task="实现 direct 模式输出流",
+        context={"live_output": True},
+        previous_results={},
+        attempt=1,
+    )
+
+    assert result["success"] is True
+    assert result["output"].startswith("Live provider output")
+    assert captured["cmd"]
+    assert captured["timeout"] == config.providers["codex"].timeout
+    assert captured["line_prefix"] == "│ "
+
+
+def test_execute_phase_once_live_runner_timeout_maps_to_timeout_failure(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming runner timeouts should preserve the workflow timeout failure contract."""
+    manager = WorkflowManager(config)
+    resolved = manager._resolve_phase_plan(
+        WorkflowPhase(
+            agent="gemini",
+            action="collect:collect-context",
+            output="research notes",
+            responsibility_stage="collect",
+        ),
+        {},
+    )
+
+    monkeypatch.setattr(
+        "ai_collab.core.workflow._run_command_live",
+        lambda cmd, *, timeout, line_prefix="": (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd=cmd, timeout=timeout or 0)),
+    )
+
+    result = manager._execute_phase_once(
+        resolved_phase=resolved,
+        task="分析 direct 多 Agent 实时输出",
+        context={"live_output": True},
+        previous_results={},
+        attempt=1,
+    )
+
+    assert result["success"] is False
+    assert result["failure_type"] == "timeout"
+    assert result["error"] == f"Timeout after {config.providers['gemini'].timeout}s"
