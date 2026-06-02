@@ -59,7 +59,7 @@ from ai_collab.core.tmux_workspace import (
     type_pane_text,
     wait_for_pane_quiet,
 )
-from ai_collab.core.workflow import WorkflowManager
+from ai_collab.core.workflow import WorkflowManager, _run_command_live_pipe
 from ai_collab.core.workflow_v2 import (
     WorkflowBlueprintV2,
     WorkflowStageV2,
@@ -67,10 +67,13 @@ from ai_collab.core.workflow_v2 import (
     resolve_session_preset,
     resolve_workflow_blueprint,
 )
+from ai_collab.terminal_ui import build_live_output_prefix, render_tmux_block
 
 console = Console(force_terminal=True, legacy_windows=False)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\].*?\x1b\\")
 COMPLETION_MARKER_LINE_RE = re.compile(r"(?mi)^\s*===\s*(?:SUBAGENT_COMPLETE|TASK_COMPLETE)\s*===\s*$")
+LIVE_PREFIX_RE = re.compile(r"^\s*│\s[^│]+\s│\s?")
+_LAST_DIRECT_RUNTIME_ERROR = ""
 
 
 I18N = {
@@ -3845,6 +3848,8 @@ def _execute_direct_runtime(
     extra_context: Optional[dict[str, Any]] = None,
 ) -> int:
     """Unified direct runtime for single-agent and multi-agent execution."""
+    _set_last_direct_runtime_error("")
+    runtime_lang = _resolve_runtime_language(cli_lang=None, config_lang=config.ui_language)
     if bool(getattr(result, "need_collaboration", False)):
         merged_extra_context = dict(extra_context or {})
         merged_extra_context["live_output"] = True
@@ -3855,6 +3860,15 @@ def _execute_direct_runtime(
             interactive=interactive,
             extra_context=merged_extra_context,
         )
+        _print_runtime_overview(
+            title=_auto_msg(runtime_lang, "direct_runtime_title"),
+            lang=runtime_lang,
+            mode="direct",
+            provider=provider,
+            task=task,
+            result=result,
+            controller_plan=controller_plan,
+        )
         previous_cwd = Path.cwd()
         try:
             if cwd is not None:
@@ -3863,12 +3877,25 @@ def _execute_direct_runtime(
             results = workflow_manager.execute_workflow(route_key, task, context)
         except Exception as exc:  # noqa: BLE001
             console.print(f"[red]direct runtime failed:[/red] {exc}")
+            _print_direct_result_summary(
+                lang=runtime_lang,
+                status="failed",
+                provider=provider,
+                exit_code=1,
+                reason=str(exc),
+            )
             return 1
         finally:
             if cwd is not None:
                 os.chdir(previous_cwd)
         summary = results.get("_summary", {}) if isinstance(results, dict) else {}
         status = str(summary.get("status", "completed"))
+        _print_direct_result_summary(
+            lang=runtime_lang,
+            status=status,
+            provider=provider,
+            summary=summary if isinstance(summary, dict) else None,
+        )
         return 0 if status not in {"failed", "aborted_by_user"} else 1
 
     selected_cli, timeout = _resolve_provider_execution(config, provider, task, complexity="default")
@@ -3882,7 +3909,22 @@ def _execute_direct_runtime(
             f"Auto-trigger skills (apply if available): {', '.join(auto_skills)}\n\n"
             f"Task: {task}"
         )
-    return _safe_execute(selected_cli, payload, timeout=timeout, cwd=cwd)
+    _print_runtime_overview(
+        title=_auto_msg(runtime_lang, "direct_runtime_title"),
+        lang=runtime_lang,
+        mode="direct",
+        provider=provider,
+        task=task,
+        result=result,
+    )
+    return _safe_execute(
+        selected_cli,
+        payload,
+        timeout=timeout,
+        cwd=cwd,
+        provider=provider,
+        lang=runtime_lang,
+    )
 
 
 def _safe_execute(
@@ -3891,6 +3933,8 @@ def _safe_execute(
     timeout: Optional[int] = None,
     *,
     cwd: Path | str | None = None,
+    provider: str = "",
+    lang: str = "en-US",
 ) -> int:
     """Execute provider CLI safely with shell=False."""
     if cli.strip().startswith("codex ") and "--skip-git-repo-check" not in cli:
@@ -3901,25 +3945,75 @@ def _safe_execute(
         console.print(f"[red]Invalid provider CLI: {exc}[/red]")
         return 2
     cmd_parts = resolve_subprocess_command(cmd_parts)
+    line_prefix = build_live_output_prefix(provider or (cmd_parts[0] if cmd_parts else "agent"), "direct")
 
+    previous_cwd = Path.cwd()
     try:
-        result = subprocess.run(
-            cmd_parts + [task],
-            shell=False,
-            timeout=timeout,
-            cwd=str(cwd) if cwd is not None else None,
+        _set_last_direct_runtime_error("")
+        if cwd is not None:
+            os.chdir(Path(cwd).expanduser())
+        try:
+            result = _run_command_live_pipe(
+                cmd_parts + [task],
+                timeout=timeout,
+                line_prefix=line_prefix,
+            )
+        except (OSError, ValueError) as exc:
+            console.print(f"[dim]live direct stream unavailable, falling back to buffered execution: {exc}[/dim]")
+            result = subprocess.run(
+                cmd_parts + [task],
+                shell=False,
+                timeout=timeout,
+            )
+        status = "completed" if result.returncode == 0 else "failed"
+        reason = ""
+        if result.returncode != 0:
+            reason = _summarize_runtime_failure_text(getattr(result, "stderr", "") or getattr(result, "stdout", ""))
+            if not reason:
+                reason = f"provider exited with code {result.returncode}"
+        _set_last_direct_runtime_error(reason)
+        _print_direct_result_summary(
+            lang=lang,
+            status=status,
+            provider=provider or (cmd_parts[0] if cmd_parts else "agent"),
+            exit_code=result.returncode,
+            reason=reason,
         )
         return result.returncode
     except subprocess.TimeoutExpired:
         timeout_text = f"{timeout}s" if timeout is not None else "the configured timeout"
         console.print(f"[red]Provider command timed out after {timeout_text}.[/red]")
+        _print_direct_result_summary(
+            lang=lang,
+            status="timeout",
+            provider=provider or (cmd_parts[0] if cmd_parts else "agent"),
+            exit_code=124,
+            reason=timeout_text,
+        )
         return 124
     except FileNotFoundError:
         console.print("[red]Provider command not found. Check your PATH and provider CLI installation.[/red]")
+        _print_direct_result_summary(
+            lang=lang,
+            status="failed",
+            provider=provider or (cmd_parts[0] if cmd_parts else "agent"),
+            exit_code=127,
+            reason="provider command not found",
+        )
         return 127
     except PermissionError as exc:
         console.print(f"[red]Provider command is not executable: {exc}[/red]")
+        _print_direct_result_summary(
+            lang=lang,
+            status="failed",
+            provider=provider or (cmd_parts[0] if cmd_parts else "agent"),
+            exit_code=126,
+            reason=str(exc),
+        )
         return 126
+    finally:
+        if cwd is not None:
+            os.chdir(previous_cwd)
 
 
 def _tmux_agent_startup_command(
@@ -4174,6 +4268,21 @@ AUTO_COLLAB_I18N = {
         "opt_cancel": "Cancel",
         "opt_tmux": "Launch visual tmux collaboration",
         "single_mode": "Single AI mode - executing with {provider}",
+        "direct_runtime_title": "Direct Runtime",
+        "direct_result_title": "Direct Result",
+        "single_runtime_title": "Single Runtime",
+        "status_label": "Status",
+        "workflow_label": "Workflow",
+        "provider_label": "Provider",
+        "phases_label": "Phases",
+        "skipped_label": "Skipped",
+        "exit_code_label": "Exit Code",
+        "reason_label": "Reason",
+        "result_completed": "completed",
+        "result_completed_with_skips": "completed with skips",
+        "result_failed": "failed",
+        "result_aborted_by_user": "aborted by user",
+        "result_timeout": "timed out",
         "suggested_skills": "Suggested Skills",
         "single_continue": "Single-provider execution. Continue?",
         "controller_title": "Controller task briefing:",
@@ -4239,6 +4348,21 @@ AUTO_COLLAB_I18N = {
         "opt_cancel": "取消",
         "opt_tmux": "启动 tmux 可视化协作",
         "single_mode": "单 Agent 模式 - 使用 {provider} 执行",
+        "direct_runtime_title": "Direct 运行",
+        "direct_result_title": "Direct 结果",
+        "single_runtime_title": "单 Agent 运行",
+        "status_label": "状态",
+        "workflow_label": "工作流",
+        "provider_label": "Provider",
+        "phases_label": "阶段",
+        "skipped_label": "跳过",
+        "exit_code_label": "退出码",
+        "reason_label": "原因",
+        "result_completed": "已完成",
+        "result_completed_with_skips": "已完成（含跳过）",
+        "result_failed": "失败",
+        "result_aborted_by_user": "用户中止",
+        "result_timeout": "超时",
         "suggested_skills": "建议技能",
         "single_continue": "单 Agent 执行，是否继续？",
         "controller_title": "主控任务简报：",
@@ -4297,6 +4421,119 @@ def _result_workflow_label(result: Any) -> str:
     if blueprint:
         return blueprint
     return session_preset
+
+
+def _set_last_direct_runtime_error(message: str) -> None:
+    global _LAST_DIRECT_RUNTIME_ERROR
+    _LAST_DIRECT_RUNTIME_ERROR = str(message or "").strip()
+
+
+def _last_direct_runtime_error() -> str:
+    return _LAST_DIRECT_RUNTIME_ERROR
+
+
+def _summarize_runtime_failure_text(text: str, *, limit: int = 280) -> str:
+    cleaned_lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = ANSI_ESCAPE_RE.sub("", raw_line).strip()
+        line = LIVE_PREFIX_RE.sub("", line).strip()
+        if line:
+            cleaned_lines.append(line)
+    if not cleaned_lines:
+        return ""
+    summary = " | ".join(cleaned_lines[-3:])
+    if len(summary) <= limit:
+        return summary
+    return summary[: limit - 1].rstrip() + "…"
+
+
+def _print_runtime_overview(
+    *,
+    title: str,
+    lang: str,
+    mode: str,
+    provider: str,
+    task: str,
+    result: Any | None = None,
+    controller_plan: Optional[dict[str, Any]] = None,
+) -> None:
+    """Print a tmux-aligned runtime summary before execution starts."""
+    rows = [
+        (_auto_msg(lang, "mode"), mode),
+        (_auto_msg(lang, "primary"), provider),
+    ]
+    if result is not None:
+        workflow_label = _result_workflow_label(result)
+        if workflow_label:
+            rows.append((_auto_msg(lang, "workflow"), workflow_label))
+        reviewers = getattr(result, "reviewers", None) or []
+        if reviewers:
+            rows.append((_auto_msg(lang, "reviewers"), ", ".join(reviewers)))
+        categories = getattr(result, "project_categories", None) or []
+        if categories:
+            rows.append((_auto_msg(lang, "project_categories"), ", ".join(categories)))
+        skills = getattr(result, "suggested_skills", None) or []
+        if skills:
+            rows.append((_auto_msg(lang, "auto_skills"), ", ".join(skills)))
+
+    lines = [f"task: {task}"]
+    if controller_plan:
+        steps = controller_plan.get("steps", [])
+        if isinstance(steps, list) and steps:
+            lines.append(f"approved_steps: {len(steps)}")
+    console.print()
+    console.print(render_tmux_block(title, rows=rows, lines=lines))
+
+
+def _runtime_result_text(lang: str, status: str) -> str:
+    normalized = str(status or "").strip().lower() or "completed"
+    return _auto_msg(lang, f"result_{normalized}")
+
+
+def _print_direct_result_summary(
+    *,
+    lang: str,
+    status: str,
+    provider: str,
+    summary: Optional[dict[str, Any]] = None,
+    exit_code: Optional[int] = None,
+    reason: str = "",
+) -> None:
+    """Print a tmux-style completion block for direct runtime."""
+    rows = [
+        (_auto_msg(lang, "status_label"), _runtime_result_text(lang, status)),
+        (_auto_msg(lang, "provider_label"), provider),
+    ]
+    lines: list[str] = []
+    if summary:
+        workflow = str(summary.get("workflow", "")).strip()
+        if workflow:
+            rows.append((_auto_msg(lang, "workflow_label"), workflow))
+        total = int(summary.get("total_phases", 0) or 0)
+        completed = int(summary.get("completed_phases", 0) or 0)
+        if total > 0:
+            rows.append((_auto_msg(lang, "phases_label"), f"{completed}/{total}"))
+        skipped = int(summary.get("skipped_phases", 0) or 0)
+        if skipped > 0:
+            rows.append((_auto_msg(lang, "skipped_label"), str(skipped)))
+        for key in ("workflow_engine", "session_preset", "workflow_blueprint"):
+            value = str(summary.get(key, "")).strip()
+            if value:
+                lines.append(f"{key}: {value}")
+        if not reason:
+            failure_phase = str(summary.get("failure_phase", "")).strip()
+            failure_reason = _summarize_runtime_failure_text(summary.get("failure_reason", ""))
+            if failure_phase and failure_reason:
+                reason = f"{failure_phase}: {failure_reason}"
+            elif failure_reason:
+                reason = failure_reason
+    if exit_code is not None:
+        rows.append((_auto_msg(lang, "exit_code_label"), str(exit_code)))
+    if reason:
+        rows.append((_auto_msg(lang, "reason_label"), reason))
+    _set_last_direct_runtime_error(reason)
+    console.print()
+    console.print(render_tmux_block(_auto_msg(lang, "direct_result_title"), rows=rows, lines=lines))
 
 
 def _ask_text_input(prompt: str, *, questionary_module, default_value: str = "") -> str:
@@ -5818,8 +6055,13 @@ def _write_orchestration_adjustment_file(*, cwd: Path, controller: str, text: st
 
 def _show_controller_plan(plan: dict[str, Any], *, lang: str) -> None:
     """Render controller JSON plan for user review."""
-    console.print(f"\n[bold cyan]{_auto_msg(lang, 'controller_plan_title')}[/bold cyan]")
-    console.print(_render_controller_plan(plan, lang=lang))
+    console.print()
+    console.print(
+        render_tmux_block(
+            _auto_msg(lang, "controller_plan_title"),
+            lines=_render_controller_plan(plan, lang=lang).splitlines(),
+        )
+    )
 
 
 def _controller_plan_to_tmux_payload(plan: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -7282,29 +7524,34 @@ def _print_orchestration_plan(result, *, lang: str) -> None:
     if not available and not plan:
         return
 
-    console.print(f"\n[bold cyan]{_auto_msg(lang, 'plan_title')}[/bold cyan]")
-    console.print(f"{_auto_msg(lang, 'mode')}: {getattr(result, 'execution_mode', 'single-agent')}")
+    rows = [
+        (_auto_msg(lang, "mode"), str(getattr(result, "execution_mode", "single-agent"))),
+    ]
     selected_agents = getattr(result, "selected_agents", None) or []
     if selected_agents:
-        console.print(f"{_auto_msg(lang, 'selected_agents')}: {', '.join(selected_agents)}")
+        rows.append((_auto_msg(lang, "selected_agents"), ", ".join(selected_agents)))
 
+    lines: list[str] = []
     if available:
-        console.print(f"{_auto_msg(lang, 'available_agents')}:")
+        lines.append(f"{_auto_msg(lang, 'available_agents')}:")
         for item in available:
             agent = item.get("agent", "")
             model = item.get("selected_model", "")
             profile = item.get("model_profile", "")
             strengths = item.get("strengths", "")
-            console.print(f"  - {agent}: model={model} profile={profile} strengths={strengths}")
+            lines.append(f"- {agent}: model={model} profile={profile} strengths={strengths}")
 
     if plan:
-        console.print(f"{_auto_msg(lang, 'role_assignment')}:")
+        lines.append(f"{_auto_msg(lang, 'role_assignment')}:")
         for step in plan:
             role = step.get("role", "")
             agent = step.get("agent", "")
             model = step.get("selected_model", "")
             reason = step.get("reason", "")
-            console.print(f"  - {role} -> {agent} ({model}) [{reason}]")
+            lines.append(f"- {role} -> {agent} ({model}) [{reason}]")
+
+    console.print()
+    console.print(render_tmux_block(_auto_msg(lang, "plan_title"), rows=rows, lines=lines))
 
 
 def _print_available_agents(result, *, lang: str) -> None:
@@ -7312,13 +7559,15 @@ def _print_available_agents(result, *, lang: str) -> None:
     available = result.available_agents or []
     if not available:
         return
-    console.print(f"\n[bold cyan]{_auto_msg(lang, 'available_agents_only')}[/bold cyan]")
+    lines: list[str] = []
     for item in available:
         agent = item.get("agent", "")
         model = item.get("selected_model", "")
         profile = item.get("model_profile", "")
         strengths = item.get("strengths", "")
-        console.print(f"  - {agent}: model={model} profile={profile} strengths={strengths}")
+        lines.append(f"- {agent}: model={model} profile={profile} strengths={strengths}")
+    console.print()
+    console.print(render_tmux_block(_auto_msg(lang, "available_agents_only"), lines=lines))
 
 
 def _can_launch_tmux(result) -> bool:
@@ -7514,7 +7763,14 @@ def _launch_tmux_orchestration(
         session=resolved_session,
         reason="run_started",
     )
-    console.print(f"[dim]run_id: {run_store.run_id}[/dim]")
+    console.print()
+    console.print(
+        render_tmux_block(
+            _auto_msg(lang, "tmux_ready"),
+            rows=[("session", resolved_session), ("run_id", run_store.run_id)],
+            lines=[_auto_msg(lang, "tmux_logs", path=str(pane_logs_dir(cwd=cwd, session=resolved_session)))],
+        )
+    )
 
     agent_roles: dict[str, list[dict]] = {}
     for step in plan:
@@ -7551,9 +7807,6 @@ def _launch_tmux_orchestration(
         else:
             console.print(f"[yellow]{_auto_msg(lang, 'watcher_skipped')}[/yellow]")
 
-    log_dir = pane_logs_dir(cwd=cwd, session=resolved_session)
-    console.print(f"[green]{_auto_msg(lang, 'tmux_ready')}:[/green] {resolved_session}")
-    console.print(f"[dim]{_auto_msg(lang, 'tmux_logs', path=str(log_dir))}[/dim]")
     if not use_inline:
         attach_session(session=resolved_session)
     return True
@@ -8092,14 +8345,14 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
         console.print(json.dumps(payload, indent=2, ensure_ascii=False))
 
     if result.need_collaboration:
-        console.print(f"\n[bold green]{_auto_msg(lang, 'start')}[/bold green]")
-        console.print(f"{_auto_msg(lang, 'workflow')}: {_result_workflow_label(result)}")
-        console.print(f"{_auto_msg(lang, 'primary')}: {result.primary}")
-        console.print(f"{_auto_msg(lang, 'reviewers')}: {', '.join(result.reviewers)}")
-        if result.project_categories:
-            console.print(f"{_auto_msg(lang, 'project_categories')}: {', '.join(result.project_categories)}")
-        if result.suggested_skills:
-            console.print(f"{_auto_msg(lang, 'auto_skills')}: {', '.join(result.suggested_skills)}")
+        _print_runtime_overview(
+            title=_auto_msg(lang, "start"),
+            lang=lang,
+            mode=str(args.execution_mode or "auto"),
+            provider=result.primary or provider,
+            task=task,
+            result=result,
+        )
 
         interactive_session = bool(args.interactive_decisions and sys.stdin.isatty())
         auto_cfg = config.auto_collaboration or {}
@@ -8343,9 +8596,12 @@ def runner_main(argv: Optional[list[str]] = None, *, prog_name: str = "ai-collab
             raise SystemExit(exit_code)
         return
 
-    console.print(f"\n[yellow]{_auto_msg(lang, 'single_mode', provider=provider)}[/yellow]")
+    rows = [(_auto_msg(lang, "primary"), provider)]
+    lines = [_auto_msg(lang, "single_mode", provider=provider)]
     if result.suggested_skills:
-        console.print(f"{_auto_msg(lang, 'suggested_skills')}: {', '.join(result.suggested_skills)}")
+        rows.append((_auto_msg(lang, "suggested_skills"), ", ".join(result.suggested_skills)))
+    console.print()
+    console.print(render_tmux_block(_auto_msg(lang, "single_runtime_title"), rows=rows, lines=lines))
 
     if args.dry_run:
         return
@@ -8458,7 +8714,7 @@ def model_select_main() -> None:
 
     if should_execute:
         console.print(f"\n[dim]Executing via selected CLI...[/dim]")
-        exit_code = _safe_execute(result.cli, task)
+        exit_code = _safe_execute(result.cli, task, provider=args.provider, lang=config.ui_language)
         if exit_code != 0:
             raise SystemExit(exit_code)
 

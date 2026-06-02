@@ -8,6 +8,7 @@ import errno
 import os
 import pty
 import queue
+import re
 import select
 import shlex
 import subprocess
@@ -27,6 +28,7 @@ from ai_collab.core.workflow_v2 import (
     resolve_session_preset,
     resolve_workflow_blueprint,
 )
+from ai_collab.terminal_ui import build_live_output_prefix, render_tmux_block
 
 
 DEFAULT_PERSONA_PHASE_MAP = {
@@ -156,6 +158,131 @@ def _run_command_live(
     return _run_command_live_pty(cmd, timeout=timeout, line_prefix=line_prefix)
 
 
+def _compact_live_output_enabled() -> bool:
+    """Whether direct live stream should suppress verbose code/tool dump lines."""
+    value = os.environ.get("AI_COLLAB_COMPACT_LIVE_OUTPUT", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _looks_like_verbose_code_line(line: str) -> bool:
+    """Heuristics for code/search/tool output that should not flood direct runtime."""
+    stripped = str(line or "").strip()
+    if not stripped:
+        return False
+    patterns = (
+        r"^[\w./-]+\.(?:py|md|json|toml|yaml|yml|rs|ts|tsx|js|jsx|java|kt|go|c|cc|cpp|h):\d+:",
+        r'^\s*(?:def |class |from [\w.]+ import |import [\w.]+|return |if __name__ == "__main__":)',
+        r"^\s*@(?:pytest|click)\.",
+        r'^\s*(?:"""|\'\'\')',
+        r"^\s*(?:exec|succeeded in \d+ms:|failed in \d+ms:)$",
+        r"^\s*/bin/(?:zsh|bash)\s+-lc\b",
+        r"^\s*(?:assert |raise |except |try:|with |for |while )",
+        r"^\s*[A-Za-z_][\w.]*\s*=\s*.+$",
+        r'^\s*["\'][^"\']+["\']\s*:\s*.+$',
+    )
+    if any(re.match(pattern, stripped) for pattern in patterns):
+        return True
+    if len(stripped) >= 150 and any(token in stripped for token in ("{", "}", "=>", "::", "lambda", "monkeypatch", "json.dumps")):
+        return True
+    return False
+
+
+def _looks_like_verbose_code_continuation(line: str) -> bool:
+    """Continuation detector for multi-line code/test dumps once a code block has started."""
+    raw_line = str(line or "")
+    stripped = raw_line.strip()
+    if not stripped:
+        return True
+    if _looks_like_verbose_code_line(raw_line):
+        return True
+    leading_spaces = len(raw_line) - len(raw_line.lstrip(" "))
+    if stripped[:1] in {'"', "'", "{", "}", "[", "]", "(", ")", "@", "#"}:
+        return True
+    if re.match(r"^[A-Za-z_][\w.]*\s*[:=].+$", stripped):
+        return True
+    if re.match(r"^[A-Za-z_][\w.]*\($", stripped):
+        return True
+    if re.match(r"^[)\]}\[,]+$", stripped):
+        return True
+    if leading_spaces >= 4 and any(token in stripped for token in ("=", ":", "(", ")", "{", "}", "[", "]", ",", "lambda", "monkeypatch")):
+        return True
+    return False
+
+
+class _LiveStreamRenderer:
+    """Render live provider output with optional suppression for noisy code dumps."""
+
+    def __init__(self, *, target: Any, line_prefix: str) -> None:
+        self.target = target
+        self.line_prefix = line_prefix
+        self.at_line_start = True
+        self.buffer = ""
+        self.suppressed_lines = 0
+        self.compact = bool(line_prefix) and _compact_live_output_enabled()
+        self.in_verbose_block = False
+
+    def _write_line(self, text: str, *, newline: bool) -> None:
+        if self.at_line_start and self.line_prefix:
+            self.target.write(self.line_prefix)
+        self.target.write(text)
+        if newline:
+            self.target.write("\n")
+        self.at_line_start = newline
+
+    def _flush_suppressed_summary(self) -> None:
+        if self.suppressed_lines <= 0:
+            return
+        summary = f"[verbose code/search output suppressed: {self.suppressed_lines} lines]"
+        self._write_line(summary, newline=True)
+        self.suppressed_lines = 0
+
+    def feed(self, text: str) -> bool:
+        """Render streamed text while preserving compact, readable direct-mode output."""
+        if not text:
+            return self.at_line_start
+        self.buffer += text
+        while True:
+            newline_index = self.buffer.find("\n")
+            if newline_index < 0:
+                break
+            raw_line = self.buffer[:newline_index]
+            self.buffer = self.buffer[newline_index + 1 :]
+            if self.compact:
+                if _looks_like_verbose_code_line(raw_line):
+                    self.suppressed_lines += 1
+                    self.at_line_start = True
+                    self.in_verbose_block = True
+                    continue
+                if self.in_verbose_block and _looks_like_verbose_code_continuation(raw_line):
+                    self.suppressed_lines += 1
+                    self.at_line_start = True
+                    continue
+                self.in_verbose_block = False
+            self._flush_suppressed_summary()
+            self._write_line(raw_line, newline=True)
+        self.target.flush()
+        return self.at_line_start
+
+    def finish(self) -> bool:
+        """Flush trailing text and any pending suppression summary."""
+        if self.buffer:
+            trailing = self.buffer
+            self.buffer = ""
+            if self.compact and (
+                _looks_like_verbose_code_line(trailing)
+                or (self.in_verbose_block and _looks_like_verbose_code_continuation(trailing))
+            ):
+                self.suppressed_lines += 1
+            else:
+                self.in_verbose_block = False
+                self._flush_suppressed_summary()
+                self._write_line(trailing, newline=False)
+        if self.suppressed_lines:
+            self._flush_suppressed_summary()
+        self.target.flush()
+        return self.at_line_start
+
+
 def _emit_stream_text(text: str, *, target: Any, line_prefix: str, at_line_start: bool) -> bool:
     """Render provider output with a stable prefix so system status and model output stay separated."""
     if not text:
@@ -206,8 +333,8 @@ def _run_command_live_pipe(
     stdout_thread.start()
     stderr_thread.start()
     start_time = time.time()
-    stdout_line_start = True
-    stderr_line_start = True
+    stdout_renderer = _LiveStreamRenderer(target=sys.stdout, line_prefix=line_prefix)
+    stderr_renderer = _LiveStreamRenderer(target=sys.stderr, line_prefix=line_prefix)
 
     while True:
         while True:
@@ -217,24 +344,15 @@ def _run_command_live_pipe(
                 break
             if line is None:
                 continue
-            target = sys.stderr if stream_name == "stderr" else sys.stdout
             if stream_name == "stderr":
-                stderr_line_start = _emit_stream_text(
-                    line,
-                    target=target,
-                    line_prefix=line_prefix,
-                    at_line_start=stderr_line_start,
-                )
+                stderr_renderer.feed(line)
             else:
-                stdout_line_start = _emit_stream_text(
-                    line,
-                    target=target,
-                    line_prefix=line_prefix,
-                    at_line_start=stdout_line_start,
-                )
+                stdout_renderer.feed(line)
         if process.poll() is not None:
             stdout_thread.join(timeout=1)
             stderr_thread.join(timeout=1)
+            stdout_line_start = stdout_renderer.finish()
+            stderr_line_start = stderr_renderer.finish()
             if not stdout_line_start:
                 sys.stdout.write("\n")
                 sys.stdout.flush()
@@ -256,6 +374,8 @@ def _run_command_live_pipe(
                 process.wait(timeout=2)
             stdout_thread.join(timeout=1)
             stderr_thread.join(timeout=1)
+            stdout_line_start = stdout_renderer.finish()
+            stderr_line_start = stderr_renderer.finish()
             if not stdout_line_start:
                 sys.stdout.write("\n")
                 sys.stdout.flush()
@@ -283,7 +403,7 @@ def _run_command_live_pty(
     output_chunks: list[bytes] = []
     decoder = codecs.getincrementaldecoder(getattr(sys.stdout, "encoding", None) or "utf-8")("replace")
     start_time = time.time()
-    line_start = True
+    renderer = _LiveStreamRenderer(target=sys.stdout, line_prefix=line_prefix)
     try:
         process = subprocess.Popen(
             cmd,
@@ -321,23 +441,14 @@ def _run_command_live_pty(
                     output_chunks.append(chunk)
                     rendered = decoder.decode(chunk)
                     if rendered:
-                        line_start = _emit_stream_text(
-                            rendered,
-                            target=sys.stdout,
-                            line_prefix=line_prefix,
-                            at_line_start=line_start,
-                        )
+                        renderer.feed(rendered)
             if process.poll() is not None and not ready:
                 break
 
         trailing = decoder.decode(b"", final=True)
         if trailing:
-            line_start = _emit_stream_text(
-                trailing,
-                target=sys.stdout,
-                line_prefix=line_prefix,
-                at_line_start=line_start,
-            )
+            renderer.feed(trailing)
+        line_start = renderer.finish()
         if not line_start:
             sys.stdout.write("\n")
             sys.stdout.flush()
@@ -396,12 +507,34 @@ class WorkflowManager:
 
     def _print_phase_banner(self, *, index: int, total: int, resolved_phase: Dict[str, Any]) -> None:
         """Render a compact phase banner before provider output starts."""
-        print()
-        print(f"┌─ {self._wf_msg('phase_title', index=index, total=total, action=resolved_phase['action'])}")
-        print(f"│ {self._wf_msg('phase_agent', agent=resolved_phase['agent'], persona=resolved_phase['persona'])}")
+        lines = [self._wf_msg("phase_agent", agent=resolved_phase["agent"], persona=resolved_phase["persona"])]
         if resolved_phase["active_skills"]:
-            print(f"│ {self._wf_msg('phase_skills', skills=', '.join(resolved_phase['active_skills']))}")
-        print(f"└─ {self._wf_msg('phase_start')}")
+            lines.append(self._wf_msg("phase_skills", skills=", ".join(resolved_phase["active_skills"])))
+        goal = str(resolved_phase.get("goal", "")).strip()
+        if goal:
+            goal_label = "目标" if self._ui_language() == "zh-CN" else "Goal"
+            lines.append(f"{goal_label}: {goal}")
+        stage = str(resolved_phase.get("responsibility_stage", "")).strip()
+        artifact = str(resolved_phase.get("artifact_type", "")).strip()
+        timebox = resolved_phase.get("timebox_minutes")
+        meta: list[str] = []
+        if stage:
+            meta.append(f"stage={stage}")
+        if artifact:
+            meta.append(f"artifact={artifact}")
+        if isinstance(timebox, int) and timebox > 0:
+            meta.append(f"timebox={timebox}m")
+        if meta:
+            lines.append(" · ".join(meta))
+        print()
+        print(
+            render_tmux_block(
+                self._wf_msg("phase_title", index=index, total=total, action=resolved_phase["action"]),
+                lines=lines,
+                close=False,
+            )
+        )
+        print(f"├─ {self._wf_msg('phase_start')}")
 
     def _print_status_line(self, message: str, *, marker: str = "├─") -> None:
         """Print a compact workflow status line."""
@@ -458,10 +591,14 @@ class WorkflowManager:
 
             if phase_result.get("status") == "aborted_by_user":
                 summary["status"] = "aborted_by_user"
+                summary["failure_phase"] = str(resolved_phase.get("phase_key", "")).strip()
+                summary["failure_reason"] = str(phase_result.get("error", "")).strip()
                 break
 
             if self._escalation_policy().get("stop_on_failure", True):
                 summary["status"] = "failed"
+                summary["failure_phase"] = str(resolved_phase.get("phase_key", "")).strip()
+                summary["failure_reason"] = str(phase_result.get("error", "")).strip()
                 break
 
         if summary["status"] == "completed" and summary["skipped_phases"] > 0:
@@ -849,7 +986,11 @@ class WorkflowManager:
         try:
             live_output = bool(context.get("live_output", False))
             if bool(context.get("live_output", False)):
-                result = _run_command_live(cmd, timeout=timeout, line_prefix="│ ")
+                result = _run_command_live(
+                    cmd,
+                    timeout=timeout,
+                    line_prefix=build_live_output_prefix(agent, str(resolved_phase.get("phase_key", ""))),
+                )
             else:
                 result = subprocess.run(
                     cmd,

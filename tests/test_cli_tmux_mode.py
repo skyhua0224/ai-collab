@@ -2521,6 +2521,170 @@ def test_execute_direct_runtime_enables_live_output_for_multi_agent(monkeypatch)
     assert captured["context"]["source"] == "unit-test"
 
 
+def test_execute_direct_runtime_prints_direct_result_summary_for_workflow(monkeypatch) -> None:
+    config = Config.create_default()
+    fake_result = SimpleNamespace(
+        need_collaboration=True,
+        workflow_engine="v2",
+        session_preset="design-first",
+        workflow_blueprint="design-led-loop",
+        suggested_skills=[],
+        project_categories=[],
+        intent="implementation",
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeWorkflowManager:
+        def __init__(self, _config):  # noqa: D401, ANN001
+            pass
+
+        def execute_workflow(self, workflow_name, task, context):  # noqa: ANN001
+            return {
+                "_summary": {
+                    "status": "completed_with_skips",
+                    "workflow": workflow_name,
+                    "total_phases": 5,
+                    "completed_phases": 4,
+                    "skipped_phases": 1,
+                    "workflow_engine": "v2",
+                    "session_preset": "design-first",
+                    "workflow_blueprint": "design-led-loop",
+                }
+            }
+
+    monkeypatch.setattr(cli, "WorkflowManager", _FakeWorkflowManager)
+    monkeypatch.setattr(
+        cli,
+        "_print_direct_result_summary",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    exit_code = cli._execute_direct_runtime(
+        config=config,
+        provider="codex",
+        task="build module",
+        result=fake_result,
+    )
+
+    assert exit_code == 0
+    assert captured["status"] == "completed_with_skips"
+    assert captured["provider"] == "codex"
+    assert captured["summary"]["workflow"] == "design-led-loop"
+
+
+def test_safe_execute_uses_live_runner_with_tmux_aligned_prefix(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_live(cmd, *, timeout=None, line_prefix=""):  # noqa: ANN001
+        captured["cmd"] = list(cmd)
+        captured["timeout"] = timeout
+        captured["line_prefix"] = line_prefix
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(cli, "_run_command_live_pipe", _fake_live)
+
+    exit_code = cli._safe_execute(
+        "codex exec --model gpt-5.4",
+        "ship direct runtime stream",
+        timeout=45,
+        provider="codex",
+    )
+
+    assert exit_code == 0
+    assert captured["cmd"][-1] == "ship direct runtime stream"
+    assert captured["timeout"] == 45
+    assert captured["line_prefix"] == "│ codex/direct │ "
+
+
+def test_safe_execute_prints_direct_result_summary(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "_run_command_live_pipe",
+        lambda cmd, *, timeout=None, line_prefix="": subprocess.CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr=""),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_print_direct_result_summary",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    exit_code = cli._safe_execute(
+        "codex exec --model gpt-5.4",
+        "ship direct runtime stream",
+        timeout=45,
+        provider="codex",
+        lang="zh-CN",
+    )
+
+    assert exit_code == 0
+    assert captured["status"] == "completed"
+    assert captured["provider"] == "codex"
+    assert captured["exit_code"] == 0
+
+
+def test_safe_execute_surfaces_failure_reason_from_stream_output(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "_run_command_live_pipe",
+        lambda cmd, *, timeout=None, line_prefix="": subprocess.CompletedProcess(
+            args=cmd,
+            returncode=1,
+            stdout="│ codex/direct │ fatal: not a trusted repository\n",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_print_direct_result_summary",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    exit_code = cli._safe_execute(
+        "codex exec --model gpt-5.4",
+        "ship direct runtime stream",
+        timeout=45,
+        provider="codex",
+    )
+
+    assert exit_code == 1
+    assert captured["status"] == "failed"
+    assert captured["reason"] == "fatal: not a trusted repository"
+    assert cli._last_direct_runtime_error() == "fatal: not a trusted repository"
+
+
+def test_safe_execute_falls_back_to_buffered_execution(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "_run_command_live_pipe",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("stream init failed")),
+    )
+
+    def _fake_run(cmd, **kwargs):  # noqa: ANN001
+        captured["cmd"] = list(cmd)
+        captured["kwargs"] = dict(kwargs)
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=None, stderr=None)
+
+    monkeypatch.setattr(cli.subprocess, "run", _fake_run)
+
+    exit_code = cli._safe_execute(
+        "codex exec --model gpt-5.4",
+        "recover direct startup",
+        timeout=45,
+        provider="codex",
+    )
+
+    assert exit_code == 0
+    assert captured["cmd"][-1] == "recover direct startup"
+    assert captured["kwargs"]["timeout"] == 45
+    assert captured["kwargs"]["shell"] is False
+
+
 def test_request_controller_plan_adds_codex_skip_repo_flag(monkeypatch) -> None:
     """Controller planning call for codex should include --skip-git-repo-check."""
     config = Config.create_default()
@@ -2628,14 +2792,53 @@ def test_runner_main_single_agent_direct_propagates_exit_code(monkeypatch) -> No
 def test_safe_execute_returns_timeout_exit_code(monkeypatch) -> None:
     """Timeouts should produce a stable non-zero code for direct execution."""
     monkeypatch.setattr(
-        cli.subprocess,
-        "run",
+        cli,
+        "_run_command_live_pipe",
         lambda *_a, **_k: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd=["codex"], timeout=30)),
     )
 
     exit_code = cli._safe_execute("codex exec --model gpt-5.4", "build module", timeout=30)
 
     assert exit_code == 124
+
+
+def test_execute_direct_runtime_reports_workflow_exception_reason(monkeypatch) -> None:
+    config = Config.create_default()
+    fake_result = SimpleNamespace(
+        need_collaboration=True,
+        workflow_engine="v2",
+        session_preset="design-first",
+        workflow_blueprint="design-led-loop",
+        suggested_skills=[],
+        project_categories=[],
+        intent="implementation",
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeWorkflowManager:
+        def __init__(self, _config):  # noqa: D401, ANN001
+            pass
+
+        def execute_workflow(self, workflow_name, task, context):  # noqa: ANN001
+            raise RuntimeError("provider bootstrap failed")
+
+    monkeypatch.setattr(cli, "WorkflowManager", _FakeWorkflowManager)
+    monkeypatch.setattr(
+        cli,
+        "_print_direct_result_summary",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    exit_code = cli._execute_direct_runtime(
+        config=config,
+        provider="codex",
+        task="build module",
+        result=fake_result,
+    )
+
+    assert exit_code == 1
+    assert captured["status"] == "failed"
+    assert captured["reason"] == "provider bootstrap failed"
 
 
 def test_list_command_shows_v2_presets_and_hides_built_in_legacy_catalog(monkeypatch) -> None:

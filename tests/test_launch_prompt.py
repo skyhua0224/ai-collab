@@ -208,7 +208,7 @@ def test_run_launch_prompt_can_start_direct_from_execution_targets(monkeypatch, 
     buffer = StringIO()
     console = Console(file=buffer, force_terminal=False, color_system=None, width=120)
     answers = iter(["测试启动 direct"])
-    menu_choices = iter(["1", "2", "1", "1", "direct"])
+    menu_choices = iter(["1", "2", "1", "1", "direct", "q"])
 
     monkeypatch.setattr(
         "ai_collab.launch_prompt.run_launcher_flow",
@@ -268,7 +268,7 @@ def test_run_launch_prompt_can_start_multi_agent_direct_from_execution_targets(m
     buffer = StringIO()
     console = Console(file=buffer, force_terminal=False, color_system=None, width=120)
     answers = iter(["测试启动 multi-agent direct"])
-    menu_choices = iter(["1", "2", "1", "1", "direct"])
+    menu_choices = iter(["1", "2", "1", "1", "direct", "q"])
 
     monkeypatch.setattr(
         "ai_collab.launch_prompt.run_launcher_flow",
@@ -328,6 +328,70 @@ def test_run_launch_prompt_can_start_multi_agent_direct_from_execution_targets(m
     output = buffer.getvalue()
     assert "任务已启动" in output
     assert "直接执行" in output
+
+
+def test_run_launch_prompt_shows_direct_failure_reason(monkeypatch, tmp_path) -> None:
+    from ai_collab.launch_prompt import run_launch_prompt
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    config.current_controller = "codex"
+    config.runtime_mode = "direct"
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None, width=120)
+    answers = iter(["测试 direct 失败原因"])
+    menu_choices = iter(["1", "2", "1", "1", "direct", "q"])
+
+    monkeypatch.setattr(
+        "ai_collab.launch_prompt.run_launcher_flow",
+        lambda **kwargs: UxLabV3Result(
+            status="planned",
+            workspace=kwargs["workspace"] or kwargs["cwd"],
+            controller=kwargs["controller"] or "codex",
+            task=kwargs["task"] or "",
+            lang="zh-CN",
+            planner_mode=kwargs["planner_mode"],
+            plan=[LabPlanItem("S1", "主控直接执行", "codex", 8, "返回可检查结果")],
+            controller_plan={
+                "plan_version": "1.0",
+                "controller": "codex",
+                "requires_multi_agent": False,
+                "agents": [{"name": "codex", "model": "gpt-5.4", "persona": "controller", "why": "负责执行"}],
+                "steps": [{"id": "S1", "owner": "codex", "goal": "主控直接执行", "done_when": "返回可检查结果", "eta_minutes": 8}],
+            },
+            bundle_path=None,
+        ),
+    )
+
+    def _fake_execute(**_kwargs):
+        import ai_collab.cli as cli
+
+        cli._set_last_direct_runtime_error("fatal: not a trusted repository")
+        return 1
+
+    monkeypatch.setattr("ai_collab.cli._execute_direct_runtime", _fake_execute)
+
+    def _input(prompt: str, *, default: str = "") -> str:
+        return next(answers)
+
+    result = run_launch_prompt(
+        config=config,
+        cwd=tmp_path,
+        workspace=tmp_path,
+        controller=None,
+        task=None,
+        task_file=None,
+        planner_mode="mock",
+        output_bundle=None,
+        input_fn=_input,
+        selector_fn=lambda **_: next(menu_choices),
+        console_obj=console,
+        clear_screen=False,
+        from_entry=True,
+    )
+
+    assert result is None
+    assert "直接执行退出码: 1 · fatal: not a trusted repository" in buffer.getvalue()
 
 
 def test_run_launch_prompt_keeps_review_preview_after_plan_edit(monkeypatch, tmp_path) -> None:
@@ -1363,9 +1427,9 @@ def test_plan_editor_screen_renderable_uses_compact_layout_for_small_terminal(tm
     assert len(output.splitlines()) <= 24
 
 
-def test_plan_step_form_uses_window_too_small_fallback(monkeypatch, tmp_path) -> None:
+def test_plan_step_form_scales_layout_in_small_terminal(monkeypatch, tmp_path) -> None:
     import os
-    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.layout.containers import HSplit
 
     from ai_collab.launch_prompt import LaunchPromptState, _prompt_plan_step_form_with_prompt_toolkit
     from ai_collab.plan_editor_prompt import PlanDraft, PlanDraftStep
@@ -1404,6 +1468,53 @@ def test_plan_step_form_uses_window_too_small_fallback(monkeypatch, tmp_path) ->
         step_index=0,
         is_insert=False,
         console_obj=Console(file=StringIO(), force_terminal=False, color_system=None, width=80),
+        clear_screen=False,
+    )
+
+    assert isinstance(captured["layout"].container, HSplit)
+
+
+def test_plan_step_form_uses_window_too_small_fallback_only_for_tiny_terminal(monkeypatch, tmp_path) -> None:
+    import os
+    from prompt_toolkit.layout.containers import Window
+
+    from ai_collab.launch_prompt import LaunchPromptState, _prompt_plan_step_form_with_prompt_toolkit
+    from ai_collab.plan_editor_prompt import PlanDraft, PlanDraftStep
+
+    config = Config.create_default()
+    config.ui_language = "zh-CN"
+    state = LaunchPromptState.from_config(config, cwd=tmp_path, workspace=tmp_path, from_entry=True)
+    draft = PlanDraft(
+        workspace=tmp_path,
+        controller="codex",
+        task="检查极小窗口表单",
+        lang="zh-CN",
+        planner_mode="live",
+        steps=[
+            PlanDraftStep("S1", "确认极小窗口时仍有兜底提示", "claude", 5, "显示可理解的窗口太小提示")
+        ],
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeApplication:
+        def __init__(self, *args, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr("prompt_toolkit.application.Application", _FakeApplication)
+    monkeypatch.setattr(
+        "ai_collab.launch_prompt.shutil.get_terminal_size",
+        lambda *_args, **_kwargs: os.terminal_size((40, 7)),
+    )
+
+    _prompt_plan_step_form_with_prompt_toolkit(
+        state=state,
+        draft=draft,
+        step_index=0,
+        is_insert=False,
+        console_obj=Console(file=StringIO(), force_terminal=False, color_system=None, width=40),
         clear_screen=False,
     )
 
