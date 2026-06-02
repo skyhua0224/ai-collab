@@ -1,6 +1,6 @@
 """AI Collaboration System - Multi-AI orchestration and workflow management."""
 
-__version__ = "0.1.5.dev0"
+__version__ = "0.1.6"
 __author__ = "Sky Hua"
 __email__ = "dev@sky-hua.xyz"
 

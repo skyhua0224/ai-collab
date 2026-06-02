@@ -6,7 +6,6 @@ import codecs
 import copy
 import errno
 import os
-import pty
 import queue
 import re
 import select
@@ -151,8 +150,16 @@ def _run_command_live(
     *,
     timeout: int | None,
     line_prefix: str = "",
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run provider command with a PTY when possible so output streams live like tmux."""
+    if input_text is not None:
+        return _run_command_live_pipe(
+            cmd,
+            timeout=timeout,
+            line_prefix=line_prefix,
+            input_text=input_text,
+        )
     if os.name != "posix":
         return _run_command_live_pipe(cmd, timeout=timeout, line_prefix=line_prefix)
     return _run_command_live_pty(cmd, timeout=timeout, line_prefix=line_prefix)
@@ -302,11 +309,13 @@ def _run_command_live_pipe(
     *,
     timeout: int | None,
     line_prefix: str = "",
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Fallback live runner for non-POSIX environments."""
     process = subprocess.Popen(
         cmd,
         shell=False,
+        stdin=subprocess.PIPE if input_text is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -332,6 +341,11 @@ def _run_command_live_pipe(
     stderr_thread = threading.Thread(target=_reader, args=(process.stderr, "stderr", stderr_chunks), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
+    if input_text is not None and process.stdin is not None:
+        process.stdin.write(input_text)
+        if not input_text.endswith("\n"):
+            process.stdin.write("\n")
+        process.stdin.close()
     start_time = time.time()
     stdout_renderer = _LiveStreamRenderer(target=sys.stdout, line_prefix=line_prefix)
     stderr_renderer = _LiveStreamRenderer(target=sys.stderr, line_prefix=line_prefix)
@@ -398,6 +412,8 @@ def _run_command_live_pty(
     line_prefix: str = "",
 ) -> subprocess.CompletedProcess[str]:
     """POSIX live runner using PTY so provider CLIs behave like interactive panes."""
+    import pty
+
     master_fd, slave_fd = pty.openpty()
     process = None
     output_chunks: list[bytes] = []
@@ -635,12 +651,12 @@ class WorkflowManager:
         route_key: str,
         context: Dict[str, Any],
     ) -> Dict[str, str]:
-        workflow_blueprint = str(context.get("workflow_blueprint", "")).strip()
+        requested_workflow_blueprint = str(context.get("workflow_blueprint", "")).strip()
+        workflow_blueprint = self._valid_v2_blueprint(requested_workflow_blueprint)
         if not workflow_blueprint and route_key and self._is_v2_blueprint(route_key):
             workflow_blueprint = route_key
         if workflow_blueprint:
-            requested_preset = str(context.get("session_preset", "")).strip()
-            resolve_workflow_blueprint(workflow_blueprint)
+            requested_preset = self._valid_session_preset(str(context.get("session_preset", "")).strip())
             preset = find_session_preset_for_workflow_blueprint(
                 workflow_blueprint,
                 preferred=requested_preset,
@@ -651,7 +667,8 @@ class WorkflowManager:
                 "compatibility_mode": "direct-v2-blueprint",
             }
 
-        session_preset = str(context.get("session_preset", "")).strip()
+        requested_session_preset = str(context.get("session_preset", "")).strip()
+        session_preset = self._valid_session_preset(requested_session_preset)
         if not session_preset and route_key:
             try:
                 resolve_session_preset(route_key)
@@ -666,7 +683,7 @@ class WorkflowManager:
                 "compatibility_mode": "direct-v2-preset",
             }
 
-        if route_key:
+        if route_key and route_key not in {requested_workflow_blueprint, requested_session_preset}:
             raise ValueError(f"Unknown workflow route: {route_key}")
 
         intent = str(context.get("intent", "")).strip().lower()
@@ -677,6 +694,26 @@ class WorkflowManager:
             "workflow_blueprint": workflow_blueprint,
             "compatibility_mode": "intent-routed-v2",
         }
+
+    def _valid_v2_blueprint(self, key: str) -> str:
+        candidate = str(key or "").strip()
+        if not candidate:
+            return ""
+        try:
+            resolve_workflow_blueprint(candidate)
+            return candidate
+        except KeyError:
+            return ""
+
+    def _valid_session_preset(self, key: str) -> str:
+        candidate = str(key or "").strip()
+        if not candidate:
+            return ""
+        try:
+            resolve_session_preset(candidate)
+            return candidate
+        except KeyError:
+            return ""
 
     def _default_session_preset(self) -> str:
         auto_cfg = self.config.auto_collaboration or {}
@@ -967,7 +1004,12 @@ class WorkflowManager:
         cli = self._build_phase_cli(agent=agent, profile=str(resolved_phase.get("profile", "")).strip())
         try:
             cli_parts = shlex.split(cli)
-            cmd = resolve_subprocess_command(cli_parts) + [prompt]
+            cmd = resolve_subprocess_command(cli_parts)
+            input_text: str | None = None
+            if self._uses_stdin_prompt(agent):
+                input_text = prompt
+            else:
+                cmd = cmd + [prompt]
         except ValueError as exc:
             return {
                 "success": False,
@@ -990,6 +1032,7 @@ class WorkflowManager:
                     cmd,
                     timeout=timeout,
                     line_prefix=build_live_output_prefix(agent, str(resolved_phase.get("phase_key", ""))),
+                    input_text=input_text,
                 )
             else:
                 result = subprocess.run(
@@ -998,6 +1041,7 @@ class WorkflowManager:
                     capture_output=True,
                     text=True,
                     timeout=timeout,
+                    input=input_text,
                 )
             if result.returncode == 0:
                 self._print_status_line(self._wf_msg("success", agent=agent), marker="╰─")
@@ -1045,6 +1089,10 @@ class WorkflowManager:
                 "active_skills": resolved_phase["active_skills"],
                 "failure_type": "missing_executable",
             }
+
+    def _uses_stdin_prompt(self, agent: str) -> bool:
+        """Whether this provider expects non-interactive prompt text through stdin."""
+        return str(agent or "").strip().lower() == "claude"
 
     def _build_phase_prompt(
         self,
