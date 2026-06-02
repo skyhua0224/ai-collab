@@ -290,6 +290,68 @@ def test_session_preset_context_resolves_v2_route(
     assert results["_summary"]["compatibility_mode"] == "direct-v2-preset"
 
 
+def test_invalid_context_workflow_blueprint_falls_back_to_session_preset(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planner prose in workflow_blueprint should not crash direct V2 execution."""
+    monkeypatch.setattr(
+        "ai_collab.core.workflow.subprocess.run",
+        lambda *_args, **_kwargs: _ok(
+            "Collected context, planned bounded execution, implemented the task, validated behavior, and delivered notes."
+        ),
+    )
+
+    invalid_blueprint = (
+        "Codex 先本地确认任务与仓库状态；仅在用户明确需要多 Agent/并行工作时，"
+        "按只读侦察、实现、审查、验证分层派发。"
+    )
+
+    manager = WorkflowManager(config)
+    results = manager.execute_workflow(
+        invalid_blueprint,
+        "hello",
+        {
+            "workflow_engine": "v2",
+            "session_preset": "auto",
+            "workflow_blueprint": invalid_blueprint,
+        },
+    )
+
+    assert results["_summary"]["workflow_engine"] == "v2"
+    assert results["_summary"]["workflow_blueprint"] == "delivery-loop"
+    assert results["_summary"]["session_preset"] == "auto"
+    assert results["_summary"]["compatibility_mode"] == "direct-v2-preset"
+
+
+def test_invalid_context_session_preset_falls_back_to_default_route(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planner-only session preset names should not crash direct V2 execution."""
+    monkeypatch.setattr(
+        "ai_collab.core.workflow.subprocess.run",
+        lambda *_args, **_kwargs: _ok(
+            "Collected facts, planned a practical path, executed the change, validated output, and summarized results."
+        ),
+    )
+
+    manager = WorkflowManager(config)
+    results = manager.execute_workflow(
+        "frontend-polish",
+        "hello",
+        {
+            "workflow_engine": "v2",
+            "session_preset": "frontend-polish",
+        },
+    )
+
+    assert results["_summary"]["workflow_engine"] == "v2"
+    assert results["_summary"]["workflow_blueprint"] == "delivery-loop"
+    assert results["_summary"]["session_preset"] == "auto"
+    assert results["_summary"]["compatibility_mode"] == "intent-routed-v2"
+
+
 def test_execute_workflow_rejects_unknown_route(config: Config) -> None:
     manager = WorkflowManager(config)
 
@@ -314,10 +376,17 @@ def test_execute_phase_once_uses_live_runner_when_live_output_enabled(
     )
     captured: dict[str, object] = {}
 
-    def fake_live(cmd: list[str], *, timeout: int | None, line_prefix: str = "") -> subprocess.CompletedProcess[str]:
+    def fake_live(
+        cmd: list[str],
+        *,
+        timeout: int | None,
+        line_prefix: str = "",
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         captured["cmd"] = cmd
         captured["timeout"] = timeout
         captured["line_prefix"] = line_prefix
+        captured["input_text"] = input_text
         return _ok("Live provider output with stable implementation notes and validation breadcrumbs.")
 
     monkeypatch.setattr("ai_collab.core.workflow._run_command_live", fake_live)
@@ -339,6 +408,44 @@ def test_execute_phase_once_uses_live_runner_when_live_output_enabled(
     assert captured["cmd"]
     assert captured["timeout"] == config.providers["codex"].timeout
     assert captured["line_prefix"] == "│ codex/execute │ "
+    assert captured["input_text"] is None
+
+
+def test_execute_phase_once_sends_claude_prompt_on_stdin(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude --print style execution should receive prompt text through stdin."""
+    manager = WorkflowManager(config)
+    resolved = manager._resolve_phase_plan(
+        WorkflowPhase(
+            agent="claude",
+            action="validate:validate-result",
+            output="validation result",
+            responsibility_stage="validate",
+        ),
+        {},
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return _ok("Claude validation completed with clear checks, risks, and acceptance notes.")
+
+    monkeypatch.setattr("ai_collab.core.workflow.subprocess.run", fake_run)
+
+    result = manager._execute_phase_once(
+        resolved_phase=resolved,
+        task="验证 direct 执行结果",
+        context={},
+        previous_results={},
+        attempt=1,
+    )
+
+    assert result["success"] is True
+    assert Path(str(captured["cmd"][0])).stem.lower() == "claude"
+    assert "Task: 验证 direct 执行结果" in str(captured["input"])
 
 
 def test_execute_phase_once_live_runner_timeout_maps_to_timeout_failure(
@@ -359,7 +466,9 @@ def test_execute_phase_once_live_runner_timeout_maps_to_timeout_failure(
 
     monkeypatch.setattr(
         "ai_collab.core.workflow._run_command_live",
-        lambda cmd, *, timeout, line_prefix="": (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd=cmd, timeout=timeout or 0)),
+        lambda cmd, *, timeout, line_prefix="", input_text=None: (
+            _ for _ in ()
+        ).throw(subprocess.TimeoutExpired(cmd=cmd, timeout=timeout or 0)),
     )
 
     result = manager._execute_phase_once(
