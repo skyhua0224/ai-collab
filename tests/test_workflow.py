@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+from io import StringIO
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from ai_collab.core.config import Config
-from ai_collab.core.workflow import WorkflowManager, WorkflowPhase
+from ai_collab.core.workflow import (
+    WorkflowManager,
+    WorkflowPhase,
+    _LiveStreamRenderer,
+    _looks_like_verbose_code_line,
+)
 
 
 @pytest.fixture
@@ -332,7 +338,7 @@ def test_execute_phase_once_uses_live_runner_when_live_output_enabled(
     assert result["output"].startswith("Live provider output")
     assert captured["cmd"]
     assert captured["timeout"] == config.providers["codex"].timeout
-    assert captured["line_prefix"] == "│ "
+    assert captured["line_prefix"] == "│ codex/execute │ "
 
 
 def test_execute_phase_once_live_runner_timeout_maps_to_timeout_failure(
@@ -367,3 +373,35 @@ def test_execute_phase_once_live_runner_timeout_maps_to_timeout_failure(
     assert result["success"] is False
     assert result["failure_type"] == "timeout"
     assert result["error"] == f"Timeout after {config.providers['gemini'].timeout}s"
+
+
+def test_verbose_code_line_filter_detects_source_dump_patterns() -> None:
+    assert _looks_like_verbose_code_line("ai_collab/cli.py:5301:def _build_controller_planner_command(") is True
+    assert _looks_like_verbose_code_line("from ai_collab.core.config import Config") is True
+    assert _looks_like_verbose_code_line('/bin/zsh -lc "sed -n \'1,260p\' ai_collab/core/orchestrator.py"') is True
+    assert _looks_like_verbose_code_line("cfg.auto_collaboration = {") is True
+    assert _looks_like_verbose_code_line('    "enabled": True,') is True
+
+
+def test_verbose_code_line_filter_keeps_normal_progress_updates() -> None:
+    assert _looks_like_verbose_code_line("Collecting controller plan constraints from the current repo.") is False
+    assert _looks_like_verbose_code_line("Validated route metadata and moving to the next phase.") is False
+
+
+def test_live_stream_renderer_collapses_multiline_code_dump() -> None:
+    buffer = StringIO()
+    renderer = _LiveStreamRenderer(target=buffer, line_prefix="│ codex/collect │ ")
+
+    renderer.feed("cfg.auto_collaboration = {\n")
+    renderer.feed('    "enabled": True,\n')
+    renderer.feed("    manager = WorkflowManager(config)\n")
+    renderer.feed("\n")
+    renderer.feed("Collecting only the final progress update.\n")
+    renderer.finish()
+
+    output = buffer.getvalue()
+
+    assert "cfg.auto_collaboration" not in output
+    assert "manager = WorkflowManager(config)" not in output
+    assert "[verbose code/search output suppressed: 4 lines]" in output
+    assert "Collecting only the final progress update." in output

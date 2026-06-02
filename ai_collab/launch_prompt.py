@@ -1143,9 +1143,17 @@ def _ask_text_value(prompt: str, *, default: str, input_fn: TextInputFn | None) 
     return str(ask(prompt, default=default)).strip()
 
 
-def _terminal_shape(*, fallback: tuple[int, int] = (120, 32), min_width: int = 56, max_width: int = 140, min_height: int = 18) -> tuple[int, int]:
+def _terminal_shape(
+    *,
+    fallback: tuple[int, int] = (120, 32),
+    min_width: int = 20,
+    max_width: int = 140,
+    min_height: int = 8,
+) -> tuple[int, int]:
     size = shutil.get_terminal_size(fallback)
-    return max(min_width, min(size.columns, max_width)), max(min_height, size.lines)
+    width = size.columns or fallback[0]
+    height = size.lines or fallback[1]
+    return max(min_width, min(width, max_width)), max(min_height, height)
 
 
 def _render_ansi(renderable: object, *, width: int = 120) -> str:
@@ -1318,6 +1326,34 @@ def _plan_form_too_small_window(*, title: str) -> object:
     )
 
 
+def _plan_form_density(width: int, height: int, *, compact: bool) -> dict[str, int | bool]:
+    """Scale editor blocks to fit the current terminal instead of requiring fullscreen."""
+    tight = height < 24
+    ultra_tight = height < 18
+    stack_meta = width < 96
+    body_padding = 0 if compact or tight else 1
+    section_gap = 0 if tight else 1
+    header_preferred = 2 if ultra_tight else 3
+    done_input_rows = 2 if tight else (3 if compact else 4)
+    done_frame_height = 4 if ultra_tight else (5 if tight else (6 if compact else 7))
+    done_block_height = done_frame_height + 2
+    meta_row_height = 9 if stack_meta and ultra_tight else (10 if stack_meta and tight else (11 if stack_meta else 5))
+    min_render_height = 12 if stack_meta else 10
+    return {
+        "stack_meta": stack_meta,
+        "tight": tight,
+        "ultra_tight": ultra_tight,
+        "body_padding": body_padding,
+        "section_gap": section_gap,
+        "header_preferred": header_preferred,
+        "done_input_rows": done_input_rows,
+        "done_frame_height": done_frame_height,
+        "done_block_height": done_block_height,
+        "meta_row_height": meta_row_height,
+        "min_render_height": min_render_height,
+    }
+
+
 def _prompt_plan_step_form_with_prompt_toolkit(
     *,
     state: LaunchPromptState,
@@ -1339,9 +1375,10 @@ def _prompt_plan_step_form_with_prompt_toolkit(
     copy = _copy(state.config)
     step = draft.steps[step_index]
     _width, _height, compact = _plan_editor_terminal_shape()
+    density = _plan_form_density(_width, _height, compact=compact)
     too_small_window = _plan_form_too_small_window(title=f"Task Config: {step.id}")
-    done_height = D.exact(4) if compact else D.exact(5)
-    body_padding = 0 if compact else 1
+    done_height = D.exact(int(density["done_input_rows"]))
+    body_padding = int(density["body_padding"])
     owner_options = [
         ("codex", str(CONTROLLER_LABELS.get("codex", "Codex"))),
         ("claude", str(CONTROLLER_LABELS.get("claude", "Claude Code"))),
@@ -1464,7 +1501,7 @@ def _prompt_plan_step_form_with_prompt_toolkit(
             Frame(Box(title_input, height=D.exact(1), padding_left=1, padding_right=1), height=D.exact(3)),
         ],
         padding=0,
-        height=D.exact(5),
+        height=D.exact(4),
         align=VerticalAlign.TOP,
     )
     owner_control = FormattedTextControl(_owner_tokens, focusable=True, show_cursor=False, key_bindings=owner_bindings)
@@ -1474,8 +1511,8 @@ def _prompt_plan_step_form_with_prompt_toolkit(
             Window(owner_control, height=3, dont_extend_height=True),
         ],
         padding=0,
-        width=None if compact else D.exact(40),
-        height=D.exact(5),
+        width=None if bool(density["stack_meta"]) else D.exact(40),
+        height=D.exact(4),
         align=VerticalAlign.TOP,
     )
     eta_block = HSplit(
@@ -1485,31 +1522,50 @@ def _prompt_plan_step_form_with_prompt_toolkit(
         ],
         padding=0,
         width=D.exact(20),
-        height=D.exact(5),
+        height=D.exact(4),
         align=VerticalAlign.TOP,
     )
     done_block = HSplit(
         [
             _section_label(copy["plan_edit_step_done_when"]),
-            Frame(Box(done_input, height=done_height, padding_left=1, padding_right=1), height=D.exact(6) if compact else D.exact(7)),
+            Frame(
+                Box(done_input, height=done_height, padding_left=1, padding_right=1),
+                height=D.exact(int(density["done_frame_height"])),
+            ),
         ],
         padding=0,
-        height=D.exact(8) if compact else D.exact(9),
+        height=D.exact(int(density["done_block_height"])),
         align=VerticalAlign.TOP,
     )
     meta_row = (
-        HSplit([owner_block, eta_block], padding=1, height=D.exact(11), align=VerticalAlign.TOP, window_too_small=too_small_window)
-        if compact
-        else VSplit([owner_block, eta_block], padding=4, height=D.exact(5), align=HorizontalAlign.LEFT, window_too_small=too_small_window)
+        HSplit(
+            [owner_block, eta_block],
+            padding=1,
+            height=D.exact(int(density["meta_row_height"])),
+            align=VerticalAlign.TOP,
+            window_too_small=too_small_window,
+        )
+        if bool(density["stack_meta"])
+        else VSplit(
+            [owner_block, eta_block],
+            padding=4,
+            height=D.exact(int(density["meta_row_height"])),
+            align=HorizontalAlign.LEFT,
+            window_too_small=too_small_window,
+        )
     )
     body = HSplit(
         [
-            Window(FormattedTextControl(_header_tokens), height=D(min=3, preferred=3, max=4), dont_extend_height=True),
+            Window(
+                FormattedTextControl(_header_tokens),
+                height=D(min=2, preferred=int(density["header_preferred"]), max=4),
+                dont_extend_height=True,
+            ),
             Window(char="─", height=1, style="class:form-rule"),
             title_block,
-            Window(height=1),
+            Window(height=int(density["section_gap"])),
             meta_row,
-            Window(height=1),
+            Window(height=int(density["section_gap"])),
             done_block,
             Window(char="─", height=1, style="class:form-rule"),
             Window(FormattedTextControl(_footer_tokens), height=1),
@@ -1519,7 +1575,7 @@ def _prompt_plan_step_form_with_prompt_toolkit(
         style="class:form-surface",
         window_too_small=too_small_window,
     )
-    use_too_small_fallback = _height < (27 if compact else 30)
+    use_too_small_fallback = _height < int(density["min_render_height"]) or _width < 48
     if use_too_small_fallback:
         body = too_small_window
 
@@ -1554,6 +1610,7 @@ def _prompt_plan_task_form_with_prompt_toolkit(
 
     copy = _copy(state.config)
     _width, _height, compact = _plan_editor_terminal_shape()
+    density = _plan_form_density(_width, _height, compact=compact)
     too_small_window = _plan_form_too_small_window(title=copy["plan_edit_form_task_title"])
     task_input = TextArea(
         text=task,
@@ -1561,7 +1618,7 @@ def _prompt_plan_task_form_with_prompt_toolkit(
         wrap_lines=True,
         scrollbar=True,
         focus_on_click=False,
-        height=3 if compact else 5,
+        height=int(density["done_input_rows"]),
         style="class:text-area",
     )
 
@@ -1594,26 +1651,30 @@ def _prompt_plan_task_form_with_prompt_toolkit(
                     Label(copy["plan_edit_task"], style="class:field-label"),
                     Box(
                         task_input,
-                        height=D(min=3, preferred=4, max=5) if compact else D(min=6, preferred=8, max=10),
+                        height=(
+                            D(min=2, preferred=3, max=4)
+                            if bool(density["tight"])
+                            else (D(min=3, preferred=4, max=5) if compact else D(min=6, preferred=8, max=10))
+                        ),
                         padding_left=1,
                         padding_right=1,
                         style="class:field-box",
                     ),
                 ],
                 padding=0,
-                height=D.exact(6) if compact else D.exact(10),
+                height=D.exact(5 if bool(density["tight"]) else (6 if compact else 10)),
                 align=VerticalAlign.TOP,
                 window_too_small=too_small_window,
             ),
             Window(char="─", height=1, style="class:form-rule"),
             Window(FormattedTextControl(lambda: [("class:form-footer", copy["plan_edit_form_footer"])]), height=1),
         ],
-        padding=0 if compact else 1,
+        padding=int(density["body_padding"]),
         align=VerticalAlign.TOP,
         style="class:form-surface",
         window_too_small=too_small_window,
     )
-    use_too_small_fallback = _height < (14 if compact else 18)
+    use_too_small_fallback = _height < 8 or _width < 42
     if use_too_small_fallback:
         body = too_small_window
 
@@ -2512,6 +2573,13 @@ def _start_direct_execution(
         task_payload=task_payload,
     )
     if exit_code != 0:
+        detail = str(getattr(cli_module, "_last_direct_runtime_error", lambda: "")()).strip()
+        if detail:
+            return False, (
+                f"直接执行退出码: {exit_code} · {detail}"
+                if _lang(state.config) == "zh-CN"
+                else f"direct runtime exited with status {exit_code} · {detail}"
+            )
         return False, (
             f"直接执行退出码: {exit_code}"
             if _lang(state.config) == "zh-CN"
