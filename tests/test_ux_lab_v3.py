@@ -1,8 +1,10 @@
 import asyncio
+import importlib
 import json
 from pathlib import Path
 
 import ai_collab.cli as cli
+import pytest
 from ai_collab.core.config import Config
 from ai_collab.ux_lab_v3 import (
     build_brand_banner,
@@ -496,6 +498,36 @@ def test_request_live_plan_returns_error_without_mock_fallback() -> None:
 
     assert items is None
     assert error == "controller failed"
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ["ai_collab.launcher_service", "ai_collab.tui.launcher_service"],
+)
+def test_run_launcher_flow_short_circuits_low_signal_task(monkeypatch, tmp_path, module_name: str) -> None:
+    module = importlib.import_module(module_name)
+    config = Config.create_default()
+
+    def _fail_request_live_plan_details(**kwargs):  # noqa: ANN003, ARG001
+        raise AssertionError("live planner should not be called for low-signal tasks")
+
+    monkeypatch.setattr(module, "request_live_plan_details", _fail_request_live_plan_details)
+
+    result = module.run_launcher_flow(
+        config=config,
+        cwd=tmp_path,
+        workspace=tmp_path,
+        controller="codex",
+        task="hello",
+        planner_mode="live",
+    )
+
+    assert result.status == "planned"
+    assert len(result.plan) == 1
+    assert result.controller_plan is not None
+    assert result.controller_plan["requires_multi_agent"] is False
+    assert result.controller_plan["steps"][0]["id"] == "S1"
+    assert "hello" in result.controller_plan["approval_question"].lower()
 
 
 def test_export_launch_bundle_v3_keeps_controller_plan_payload(tmp_path) -> None:
