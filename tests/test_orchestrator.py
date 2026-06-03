@@ -47,3 +47,18 @@ def test_orchestrator_can_override_session_preset_per_run() -> None:
 
     assert plan["session_preset"] == "design-first"
     assert plan["workflow_blueprint"] == "design-led-loop"
+
+
+def test_orchestrator_keeps_small_bounded_task_single_agent() -> None:
+    config = Config.create_default()
+    planner = OrchestrationPlanner(config)
+
+    plan = planner.build_plan(
+        task="fix typo in README",
+        current_provider="codex",
+        intent="implementation",
+    )
+
+    roles = {step["role"] for step in plan["orchestration_plan"]}
+    assert roles == {"implementation"}
+    assert plan["mode"] == "single-agent"

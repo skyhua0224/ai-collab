@@ -5,6 +5,7 @@ Detects if a task needs multi-AI collaboration.
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
@@ -97,6 +98,24 @@ TRIGGER_SESSION_PRESET_MAP = {
     "docs-writing": "document-first",
 }
 
+LOW_SIGNAL_TASK_LITERALS = {
+    "1",
+    "1.",
+    "1。",  # noqa: RUF001
+    "hello",
+    "hi",
+    "hey",
+    "ok",
+    "okay",
+    "test",
+    "sb",
+    "?",
+    "？",  # noqa: RUF001
+    ".",
+    "..",
+    "...",
+}
+
 
 class CollaborationResult(BaseModel):
     """Result of collaboration detection."""
@@ -142,6 +161,8 @@ class CollaborationDetector:
         """
         auto_cfg = self.config.auto_collaboration or {}
         if not self._is_auto_collaboration_enabled(auto_cfg):
+            return CollaborationResult(need_collaboration=False)
+        if self._is_low_signal_task(task):
             return CollaborationResult(need_collaboration=False)
 
         profile = ProjectProfiler().detect()
@@ -392,6 +413,28 @@ class CollaborationDetector:
         if "auto_orchestration_enabled" in auto_cfg:
             return bool(auto_cfg.get("auto_orchestration_enabled"))
         return True
+
+    def _is_low_signal_task(self, task: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(task or "").strip())
+        if not normalized:
+            return False
+
+        lower = normalized.lower()
+        if lower in LOW_SIGNAL_TASK_LITERALS:
+            return True
+        if re.fullmatch(r"[\W_]+", lower):
+            return True
+        if re.fullmatch(r"\d+(?:[.,]\d+)?", lower):
+            return True
+
+        ascii_tokens = re.findall(r"[a-z0-9]+", lower)
+        cjk_chars = re.findall(r"[\u4e00-\u9fff]", normalized)
+        token_count = len(ascii_tokens) + len(cjk_chars)
+        if token_count > 1:
+            return False
+
+        token = ascii_tokens[0] if ascii_tokens else "".join(cjk_chars)
+        return bool(token) and len(token) <= 3
 
     def _is_planner_multi_agent(self, plan: Dict[str, object]) -> bool:
         mode = str(plan.get("mode", "single-agent"))

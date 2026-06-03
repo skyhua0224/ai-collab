@@ -7,6 +7,7 @@ import re
 from typing import Any, Callable, Optional, Sequence
 
 from ai_collab.core.config import Config
+from ai_collab.core.detector import CollaborationDetector, CollaborationResult
 from ai_collab.core.selector import ModelSelector
 from ai_collab.ux_lab_v3 import (
     DEFAULT_AGENTS,
@@ -181,6 +182,77 @@ def hydrate_controller_plan_models(*, config: Config, task: str, controller_plan
     return controller_plan
 
 
+def _single_agent_step_goal(*, task: str, lang: str) -> str:
+    normalized = _normalize_text(task)
+    lower = normalized.lower()
+    if lower in {"1", "1.", "1。", "hello", "hi", "hey", "ok", "okay", "test", "sb"}:
+        return "直接响应用户输入" if lang == "zh-CN" else "Respond directly to the user's prompt"
+    return normalized or ("完成当前任务" if lang == "zh-CN" else "Complete the task")
+
+
+def _single_agent_done_when(*, task: str, lang: str) -> str:
+    normalized = _normalize_text(task)
+    if lang == "zh-CN":
+        if normalized:
+            return f"直接完成“{normalized}”并给出可检查结果。"
+        return "直接完成当前任务并给出可检查结果。"
+    if normalized:
+        return f"Directly complete '{normalized}' and provide a checkable result."
+    return "Directly complete the task and provide a checkable result."
+
+
+def _single_agent_approval_question(*, task: str, lang: str) -> str:
+    normalized = _normalize_text(task)
+    if lang == "zh-CN":
+        return f"是否按单 Agent 方式直接执行“{normalized or '当前任务'}”？"
+    return f"Execute '{normalized or 'this task'}' as a single-agent task?"
+
+
+def _single_agent_controller_plan(
+    *,
+    config: Config,
+    controller: str,
+    task: str,
+    lang: str,
+    detection: Optional[CollaborationResult] = None,
+) -> dict[str, Any]:
+    selector = ModelSelector(config)
+    model = "unknown"
+    try:
+        model = str(selector.select_model(controller, task, "default").model or "unknown")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {
+        "plan_version": "1.0",
+        "controller": controller,
+        "requires_multi_agent": False,
+        "workflow_engine": str(getattr(detection, "workflow_engine", "") or "v2"),
+        "session_preset": str(getattr(detection, "session_preset", "") or "auto"),
+        "workflow_blueprint": str(getattr(detection, "workflow_blueprint", "") or "delivery-loop"),
+        "agents": [
+            {
+                "name": controller,
+                "model": model,
+                "persona": "implementation-engineer",
+                "why": "single-agent task",
+            }
+        ],
+        "steps": [
+            {
+                "id": "S1",
+                "owner": controller,
+                "goal": _single_agent_step_goal(task=task, lang=lang),
+                "input": _normalize_text(task),
+                "output": "direct-response",
+                "done_when": _single_agent_done_when(task=task, lang=lang),
+                "eta_minutes": 8,
+            }
+        ],
+        "approval_question": _single_agent_approval_question(task=task, lang=lang),
+    }
+
+
 def resolve_task_text(*, task: Optional[str], task_file: Optional[Path]) -> str:
     if task_file is not None:
         return Path(task_file).expanduser().read_text(encoding="utf-8").strip()
@@ -351,8 +423,23 @@ def run_launcher_flow(
     available = enabled_agents(config)
     resolved_controller = resolve_controller(controller, config.current_controller, available)
     mode = planner_mode if planner_mode in {"live", "mock"} else "live"
+    detection: Optional[CollaborationResult] = None
+    try:
+        detection = CollaborationDetector(config).detect(resolved_task, resolved_controller)
+    except Exception:  # noqa: BLE001
+        detection = None
 
-    if mode == "mock":
+    if detection is not None and not detection.need_collaboration:
+        controller_plan = _single_agent_controller_plan(
+            config=config,
+            controller=resolved_controller,
+            task=resolved_task,
+            lang=lang,
+            detection=detection,
+        )
+        plan = map_controller_plan_to_items(controller_plan, lang=lang)
+        error = None
+    elif mode == "mock":
         plan = build_mock_plan_v3(resolved_task, resolved_controller, lang, available_agents=available)
         controller_plan = None
         error = None

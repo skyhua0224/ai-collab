@@ -143,6 +143,17 @@ def test_detect_implementation(config, monkeypatch):
     assert result.responsibility_stages == ["collect", "model", "plan", "execute", "validate", "correct", "deliver"]
 
 
+@pytest.mark.parametrize("task", ["hello", "1", "sb"])
+def test_detector_skips_low_signal_tasks(config, monkeypatch, task):
+    _mock_profile(monkeypatch, categories=["systems-tooling"])
+    detector = CollaborationDetector(config)
+
+    result = detector.detect(task, "codex")
+
+    assert result.need_collaboration is False
+    assert result.execution_mode == "single-agent"
+
+
 def test_no_collaboration_when_only_one_provider_enabled(config, monkeypatch):
     """Collaboration should be disabled when planner can only select a single enabled provider."""
     _mock_profile(monkeypatch, categories=["systems-tooling"])

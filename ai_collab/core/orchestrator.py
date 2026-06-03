@@ -4,6 +4,7 @@ Orchestration planning for controller-first multi-agent execution.
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Set
 
 from ai_collab.core.config import Config, resolve_collaboration_role_leads
@@ -55,6 +56,29 @@ PHASE_ROLE_MAP: Dict[str, str] = {
     "develop": "implementation",
     "deliver": "quality-review",
 }
+
+SMALL_BOUNDED_TASK_CUES = (
+    "hello",
+    "demo",
+    "example",
+    "sample",
+    "print",
+    "typo",
+    "rename",
+    "format",
+    "lint",
+    "comment",
+    "小改",
+    "微调",
+    "一行",
+    "一句",
+    "示例",
+    "错别字",
+    "改名",
+    "重命名",
+    "格式",
+    "注释",
+)
 
 
 class OrchestrationPlanner:
@@ -176,6 +200,7 @@ class OrchestrationPlanner:
         available_agents: List[Dict[str, str]],
     ) -> List[str]:
         roles: List[str] = []
+        small_bounded_task = self._is_small_bounded_task(task)
         enabled_agents = {item.get("agent", "") for item in available_agents if item.get("agent")}
         configured_defaults = self._configured_default_roles(enabled_agents=enabled_agents)
 
@@ -198,7 +223,7 @@ class OrchestrationPlanner:
             if intent == "architecture":
                 roles.append("tech-selection")
             roles.append("implementation")
-            if intent in {"implementation", "debug", "testing", "security"}:
+            if intent in {"implementation", "debug", "testing", "security"} and not small_bounded_task:
                 roles.append("quality-review")
 
         if not roles:
@@ -206,12 +231,13 @@ class OrchestrationPlanner:
 
         if not roles:
             roles.append("implementation")
-            if len(enabled_agents) > 1:
+            if len(enabled_agents) > 1 and not small_bounded_task:
                 roles.append("quality-review")
         elif (
             "implementation" in roles
             and "quality-review" not in roles
             and len(enabled_agents) > 1
+            and not small_bounded_task
         ):
             roles.append("quality-review")
 
@@ -223,6 +249,24 @@ class OrchestrationPlanner:
             deduped.append(role)
             seen.add(role)
         return deduped
+
+    def _is_small_bounded_task(self, task: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(task or "").strip())
+        if not normalized:
+            return False
+
+        lower = normalized.lower()
+        if re.fullmatch(r"[\W_]+", lower):
+            return True
+        if re.fullmatch(r"\d+(?:[.,]\d+)?", lower):
+            return True
+        if any(cue in lower for cue in SMALL_BOUNDED_TASK_CUES):
+            return True
+
+        ascii_tokens = re.findall(r"[a-z0-9]+", lower)
+        if ascii_tokens and len(ascii_tokens) <= 2 and len(lower) <= 12:
+            return True
+        return False
 
     def _configured_default_roles(self, *, enabled_agents: Set[str]) -> List[str]:
         auto_cfg = self.config.auto_collaboration or {}
