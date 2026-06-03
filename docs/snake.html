@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Snake Grid</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #09111d;
+      --panel: rgba(10, 21, 35, 0.88);
+      --panel-border: rgba(122, 162, 255, 0.2);
+      --text: #e8edf7;
+      --muted: #8290a8;
+      --accent: #59d0ff;
+      --accent-2: #7cffb0;
+      --danger: #ff6b6b;
+      --warning: #ffd166;
+      --grid: rgba(121, 158, 225, 0.08);
+      --cell: #9bd2ff;
+      --head: #ffffff;
+      --food: #ff875f;
+      --shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
+      font-family: "SF Mono", "Menlo", "Monaco", "Consolas", monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at top left, rgba(89, 208, 255, 0.18), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(124, 255, 176, 0.14), transparent 24%),
+        linear-gradient(135deg, #04080f 0%, #09111d 44%, #0a1322 100%);
+      color: var(--text);
+    }
+
+    .shell {
+      width: min(1080px, calc(100vw - 32px));
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.8fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .panel {
+      position: relative;
+      border: 1px solid var(--panel-border);
+      background: var(--panel);
+      backdrop-filter: blur(16px);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(transparent 0 calc(100% - 1px), rgba(255, 255, 255, 0.02) calc(100% - 1px)),
+        linear-gradient(90deg, transparent 0 calc(100% - 1px), rgba(255, 255, 255, 0.02) calc(100% - 1px));
+      background-size: 100% 28px, 28px 100%;
+      pointer-events: none;
+      opacity: 0.45;
+    }
+
+    .board-panel {
+      padding: 20px;
+      display: grid;
+      gap: 18px;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: end;
+    }
+
+    .title {
+      margin: 0;
+      font-size: clamp(28px, 4vw, 42px);
+      line-height: 0.95;
+      letter-spacing: -0.04em;
+      text-transform: uppercase;
+    }
+
+    .subtitle {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      max-width: 42ch;
+      line-height: 1.55;
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.03);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--warning);
+      box-shadow: 0 0 18px rgba(255, 209, 102, 0.45);
+    }
+
+    .board-shell {
+      position: relative;
+      aspect-ratio: 1;
+      padding: 14px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.01)),
+        #050c16;
+    }
+
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      background:
+        linear-gradient(180deg, rgba(10, 22, 36, 0.8), rgba(5, 10, 18, 0.95));
+      border: 1px solid rgba(121, 158, 225, 0.12);
+    }
+
+    .overlay {
+      position: absolute;
+      inset: 14px;
+      display: grid;
+      place-items: center;
+      background: rgba(4, 8, 15, 0.55);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 160ms ease;
+    }
+
+    .overlay.visible {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .overlay-card {
+      width: min(86%, 420px);
+      padding: 26px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(8, 15, 26, 0.94);
+      text-align: center;
+      box-shadow: 0 18px 60px rgba(0, 0, 0, 0.4);
+    }
+
+    .overlay-card h2 {
+      margin: 0 0 12px;
+      font-size: 26px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .overlay-card p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 14px;
+    }
+
+    .sidebar {
+      padding: 20px;
+      display: grid;
+      gap: 16px;
+      align-content: start;
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .metric {
+      padding: 14px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .metric-label {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .metric-value {
+      display: block;
+      margin-top: 8px;
+      font-size: 28px;
+      letter-spacing: -0.03em;
+    }
+
+    .section {
+      padding: 16px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .section h3 {
+      margin: 0 0 14px;
+      font-size: 12px;
+      color: var(--muted);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .controls {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    button {
+      appearance: none;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      background: linear-gradient(180deg, rgba(89, 208, 255, 0.12), rgba(89, 208, 255, 0.04));
+      color: var(--text);
+      font: inherit;
+      padding: 12px 14px;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+    }
+
+    button:hover,
+    button:focus-visible {
+      outline: none;
+      transform: translateY(-1px);
+      border-color: rgba(89, 208, 255, 0.5);
+      background: linear-gradient(180deg, rgba(89, 208, 255, 0.2), rgba(89, 208, 255, 0.08));
+    }
+
+    .key-grid,
+    .log-grid {
+      display: grid;
+      gap: 10px;
+    }
+
+    .log-item,
+    .key-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    kbd {
+      min-width: 72px;
+      display: inline-flex;
+      justify-content: center;
+      align-items: center;
+      padding: 6px 10px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .emphasis {
+      color: var(--accent-2);
+    }
+
+    .danger {
+      color: var(--danger);
+    }
+
+    @media (max-width: 920px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .header {
+        align-items: start;
+        flex-direction: column;
+      }
+    }
+
+    @media (max-width: 560px) {
+      body {
+        padding: 14px 0;
+      }
+
+      .shell {
+        width: min(100vw - 16px, 1080px);
+      }
+
+      .board-panel,
+      .sidebar {
+        padding: 14px;
+      }
+
+      .controls,
+      .metric-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="panel board-panel">
+      <header class="header">
+        <div>
+          <h1 class="title">Snake Grid</h1>
+          <p class="subtitle">固定步长、单页零依赖、带输入缓冲与本地最高分的可玩贪吃蛇。</p>
+        </div>
+        <div class="status-badge">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="status-text">Idle</span>
+        </div>
+      </header>
+
+      <div class="board-shell">
+        <canvas id="board" width="600" height="600" aria-label="Snake game board"></canvas>
+        <div class="overlay visible" id="overlay">
+          <div class="overlay-card">
+            <h2 id="overlay-title">Ready</h2>
+            <p id="overlay-text">按 <span class="emphasis">Space</span> 开始，方向键或 <span class="emphasis">WASD</span> 控制移动，<span class="emphasis">R</span> 随时重开。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="panel sidebar">
+      <section class="metric-grid">
+        <div class="metric">
+          <span class="metric-label">Score</span>
+          <span class="metric-value" id="score">0</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Best</span>
+          <span class="metric-value" id="best">0</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Length</span>
+          <span class="metric-value" id="length">3</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Tick</span>
+          <span class="metric-value" id="tick">110ms</span>
+        </div>
+      </section>
+
+      <section class="section">
+        <h3>Controls</h3>
+        <div class="controls">
+          <button id="start-button" type="button">Start / Pause</button>
+          <button id="restart-button" type="button">Restart</button>
+        </div>
+      </section>
+
+      <section class="section">
+        <h3>Bindings</h3>
+        <div class="key-grid">
+          <div class="key-row"><span>移动</span><kbd>Arrows / WASD</kbd></div>
+          <div class="key-row"><span>开始 / 暂停</span><kbd>Space</kbd></div>
+          <div class="key-row"><span>重开</span><kbd>R</kbd></div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h3>Runtime</h3>
+        <div class="log-grid">
+          <div class="log-item"><span>State</span><span id="state-value" class="emphasis">IDLE</span></div>
+          <div class="log-item"><span>Vector</span><span id="vector-value">0, 0</span></div>
+          <div class="log-item"><span>Food</span><span id="food-value">--</span></div>
+          <div class="log-item"><span>Collision</span><span id="collision-value">none</span></div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h3>Rules</h3>
+        <div class="log-grid">
+          <div class="log-item"><span>Wall hit</span><span class="danger">Game Over</span></div>
+          <div class="log-item"><span>Self hit</span><span class="danger">Game Over</span></div>
+          <div class="log-item"><span>Food eat</span><span class="emphasis">Grow + Score</span></div>
+          <div class="log-item"><span>Reverse turn</span><span>Blocked</span></div>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <script>
+    const GRID_SIZE = 20;
+    const CELL_SIZE = 30;
+    const TICK_MS = 110;
+    const BEST_SCORE_KEY = "ai-collab-snake-best";
+
+    const STATE = {
+      IDLE: "IDLE",
+      PLAYING: "PLAYING",
+      PAUSED: "PAUSED",
+      GAME_OVER: "GAME_OVER",
+    };
+
+    const canvas = document.getElementById("board");
+    const ctx = canvas.getContext("2d");
+    const overlay = document.getElementById("overlay");
+    const overlayTitle = document.getElementById("overlay-title");
+    const overlayText = document.getElementById("overlay-text");
+    const statusText = document.getElementById("status-text");
+    const statusDot = document.getElementById("status-dot");
+    const scoreEl = document.getElementById("score");
+    const bestEl = document.getElementById("best");
+    const lengthEl = document.getElementById("length");
+    const tickEl = document.getElementById("tick");
+    const stateValueEl = document.getElementById("state-value");
+    const vectorValueEl = document.getElementById("vector-value");
+    const foodValueEl = document.getElementById("food-value");
+    const collisionValueEl = document.getElementById("collision-value");
+
+    tickEl.textContent = `${TICK_MS}ms`;
+
+    function readBestScore() {
+      try {
+        const stored = Number.parseInt(window.localStorage.getItem(BEST_SCORE_KEY) || "0", 10);
+        return Number.isFinite(stored) ? stored : 0;
+      } catch {
+        return 0;
+      }
+    }
+
+    function writeBestScore(score) {
+      try {
+        window.localStorage.setItem(BEST_SCORE_KEY, String(score));
+      } catch {
+        // Ignore storage failures so the local page remains playable.
+      }
+    }
+
+    class SnakeGame {
+      constructor() {
+        this.bestScore = readBestScore();
+        this.animationFrameId = null;
+        this.lastFrameTime = 0;
+        this.accumulator = 0;
+        this.reset();
+      }
+
+      reset() {
+        this.stopLoop();
+        this.snake = [
+          { x: 10, y: 10 },
+          { x: 9, y: 10 },
+          { x: 8, y: 10 },
+        ];
+        this.direction = { x: 1, y: 0 };
+        this.nextDirection = { x: 1, y: 0 };
+        this.pendingTurn = false;
+        this.food = this.spawnFood();
+        this.score = 0;
+        this.state = STATE.IDLE;
+        this.lastCollision = "none";
+        this.accumulator = 0;
+        this.lastFrameTime = 0;
+        this.render();
+      }
+
+      restart() {
+        this.reset();
+        this.render();
+      }
+
+      toggleStartPause() {
+        if (this.state === STATE.IDLE) {
+          this.state = STATE.PLAYING;
+          this.startLoop();
+          this.render();
+          return;
+        }
+
+        if (this.state === STATE.PLAYING) {
+          this.state = STATE.PAUSED;
+          this.render();
+          return;
+        }
+
+        if (this.state === STATE.PAUSED) {
+          this.state = STATE.PLAYING;
+          this.startLoop();
+          this.render();
+          return;
+        }
+
+        if (this.state === STATE.GAME_OVER) {
+          this.restart();
+          this.state = STATE.PLAYING;
+          this.startLoop();
+          this.render();
+        }
+      }
+
+      startLoop() {
+        if (this.animationFrameId !== null) {
+          return;
+        }
+        this.animationFrameId = window.requestAnimationFrame((timestamp) => this.loop(timestamp));
+      }
+
+      stopLoop() {
+        if (this.animationFrameId !== null) {
+          window.cancelAnimationFrame(this.animationFrameId);
+          this.animationFrameId = null;
+        }
+      }
+
+      loop(timestamp) {
+        if (this.state !== STATE.PLAYING) {
+          this.animationFrameId = null;
+          return;
+        }
+
+        if (!this.lastFrameTime) {
+          this.lastFrameTime = timestamp;
+        }
+
+        this.accumulator += timestamp - this.lastFrameTime;
+        this.lastFrameTime = timestamp;
+
+        while (this.accumulator >= TICK_MS && this.state === STATE.PLAYING) {
+          this.accumulator -= TICK_MS;
+          this.tick();
+        }
+
+        this.render();
+        this.animationFrameId = window.requestAnimationFrame((nextTimestamp) => this.loop(nextTimestamp));
+      }
+
+      tick() {
+        this.direction = { ...this.nextDirection };
+        this.pendingTurn = false;
+
+        const head = this.snake[0];
+        const nextHead = {
+          x: head.x + this.direction.x,
+          y: head.y + this.direction.y,
+        };
+
+        if (this.isWallCollision(nextHead)) {
+          this.endGame("wall");
+          return;
+        }
+
+        const grew = nextHead.x === this.food.x && nextHead.y === this.food.y;
+        const bodyToCheck = grew ? this.snake : this.snake.slice(0, -1);
+        if (bodyToCheck.some((segment) => segment.x === nextHead.x && segment.y === nextHead.y)) {
+          this.endGame("self");
+          return;
+        }
+
+        this.snake.unshift(nextHead);
+
+        if (grew) {
+          this.score += 10;
+          this.bestScore = Math.max(this.bestScore, this.score);
+          writeBestScore(this.bestScore);
+          this.food = this.spawnFood();
+          return;
+        }
+
+        this.snake.pop();
+      }
+
+      endGame(reason) {
+        this.state = STATE.GAME_OVER;
+        this.lastCollision = reason;
+        this.stopLoop();
+      }
+
+      setDirection(direction) {
+        if (this.state === STATE.GAME_OVER) {
+          return;
+        }
+
+        if (this.pendingTurn) {
+          return;
+        }
+
+        const isReverse =
+          direction.x === -this.direction.x &&
+          direction.y === -this.direction.y;
+        if (isReverse) {
+          return;
+        }
+
+        this.nextDirection = direction;
+        this.pendingTurn = true;
+      }
+
+      isWallCollision(position) {
+        return (
+          position.x < 0 ||
+          position.x >= GRID_SIZE ||
+          position.y < 0 ||
+          position.y >= GRID_SIZE
+        );
+      }
+
+      spawnFood() {
+        const occupied = new Set(this.snake.map((segment) => `${segment.x},${segment.y}`));
+        if (occupied.size >= GRID_SIZE * GRID_SIZE) {
+          return { x: 0, y: 0 };
+        }
+
+        let candidate;
+        do {
+          candidate = {
+            x: Math.floor(Math.random() * GRID_SIZE),
+            y: Math.floor(Math.random() * GRID_SIZE),
+          };
+        } while (occupied.has(`${candidate.x},${candidate.y}`));
+
+        return candidate;
+      }
+
+      render() {
+        this.drawBoard();
+        this.drawFood();
+        this.drawSnake();
+        this.drawHud();
+      }
+
+      drawBoard() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#06101b";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--grid");
+        ctx.lineWidth = 1;
+        for (let index = 1; index < GRID_SIZE; index += 1) {
+          const offset = index * CELL_SIZE;
+          ctx.beginPath();
+          ctx.moveTo(offset, 0);
+          ctx.lineTo(offset, canvas.height);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(0, offset);
+          ctx.lineTo(canvas.width, offset);
+          ctx.stroke();
+        }
+      }
+
+      drawSnake() {
+        this.snake.forEach((segment, index) => {
+          const padding = index === 0 ? 3 : 4;
+          const x = segment.x * CELL_SIZE + padding;
+          const y = segment.y * CELL_SIZE + padding;
+          const size = CELL_SIZE - padding * 2;
+          ctx.fillStyle = index === 0 ? "#ffffff" : "#9bd2ff";
+          ctx.fillRect(x, y, size, size);
+          if (index === 0) {
+            ctx.strokeStyle = "#59d0ff";
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x + 1, y + 1, size - 2, size - 2);
+          }
+        });
+      }
+
+      drawFood() {
+        const centerX = this.food.x * CELL_SIZE + CELL_SIZE / 2;
+        const centerY = this.food.y * CELL_SIZE + CELL_SIZE / 2;
+        ctx.fillStyle = "#ff875f";
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, CELL_SIZE * 0.26, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "#ffd166";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      drawHud() {
+        const overlayVisible = this.state !== STATE.PLAYING;
+        overlay.classList.toggle("visible", overlayVisible);
+
+        if (this.state === STATE.IDLE) {
+          overlayTitle.textContent = "Ready";
+          overlayText.innerHTML = "按 <span class=\"emphasis\">Space</span> 开始，方向键或 <span class=\"emphasis\">WASD</span> 控制移动，<span class=\"emphasis\">R</span> 随时重开。";
+        } else if (this.state === STATE.PAUSED) {
+          overlayTitle.textContent = "Paused";
+          overlayText.innerHTML = "按 <span class=\"emphasis\">Space</span> 继续，或按 <span class=\"emphasis\">R</span> 重新部署战场。";
+        } else if (this.state === STATE.GAME_OVER) {
+          overlayTitle.textContent = "Game Over";
+          overlayText.innerHTML = `最终得分 <span class="danger">${this.score}</span>。碰撞原因：<span class="danger">${this.lastCollision}</span>。按 <span class="emphasis">R</span> 或 <span class="emphasis">Space</span> 重开。`;
+        }
+
+        const visualState = this.state.replace("_", " ");
+        statusText.textContent = visualState;
+        stateValueEl.textContent = this.state;
+        vectorValueEl.textContent = `${this.direction.x}, ${this.direction.y}`;
+        foodValueEl.textContent = `${this.food.x}, ${this.food.y}`;
+        collisionValueEl.textContent = this.lastCollision;
+        scoreEl.textContent = String(this.score);
+        bestEl.textContent = String(this.bestScore);
+        lengthEl.textContent = String(this.snake.length);
+
+        if (this.state === STATE.PLAYING) {
+          statusDot.style.background = "var(--accent-2)";
+          statusDot.style.boxShadow = "0 0 18px rgba(124, 255, 176, 0.45)";
+        } else if (this.state === STATE.GAME_OVER) {
+          statusDot.style.background = "var(--danger)";
+          statusDot.style.boxShadow = "0 0 18px rgba(255, 107, 107, 0.45)";
+        } else {
+          statusDot.style.background = "var(--warning)";
+          statusDot.style.boxShadow = "0 0 18px rgba(255, 209, 102, 0.45)";
+        }
+      }
+    }
+
+    const game = new SnakeGame();
+
+    const directionMap = {
+      ArrowUp: { x: 0, y: -1 },
+      KeyW: { x: 0, y: -1 },
+      ArrowDown: { x: 0, y: 1 },
+      KeyS: { x: 0, y: 1 },
+      ArrowLeft: { x: -1, y: 0 },
+      KeyA: { x: -1, y: 0 },
+      ArrowRight: { x: 1, y: 0 },
+      KeyD: { x: 1, y: 0 },
+    };
+
+    document.getElementById("start-button").addEventListener("click", () => {
+      game.toggleStartPause();
+    });
+
+    document.getElementById("restart-button").addEventListener("click", () => {
+      game.restart();
+    });
+
+    window.addEventListener("keydown", (event) => {
+      if (event.code === "Space") {
+        event.preventDefault();
+        game.toggleStartPause();
+        return;
+      }
+
+      if (event.code === "KeyR") {
+        game.restart();
+        return;
+      }
+
+      const nextDirection = directionMap[event.code];
+      if (nextDirection) {
+        event.preventDefault();
+        if (game.state === STATE.IDLE) {
+          game.state = STATE.PLAYING;
+          game.startLoop();
+        }
+        if (game.state === STATE.PLAYING) {
+          game.setDirection(nextDirection);
+        }
+        game.render();
+      }
+    });
+
+    game.render();
+  </script>
+</body>
+</html>
