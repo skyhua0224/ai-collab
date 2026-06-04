@@ -146,6 +146,11 @@ def default_auto_collaboration_config() -> Dict[str, Any]:
     return {
         "enabled": True,
         "auto_orchestration_enabled": True,
+        "ai_routing": {
+            "enabled": True,
+            "provider": "current",
+            "timeout": 20,
+        },
         "preset": DEFAULT_COLLABORATION_PRESET,
         "default_session_preset": DEFAULT_SESSION_PRESET,
         "workflow_engine": DEFAULT_WORKFLOW_ENGINE,

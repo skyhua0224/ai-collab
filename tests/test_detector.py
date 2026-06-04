@@ -1,5 +1,7 @@
 """Tests for collaboration detection."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from ai_collab.core.config import Config
@@ -164,6 +166,40 @@ def test_no_collaboration_when_only_one_provider_enabled(config, monkeypatch):
 
     assert result.need_collaboration is False
     assert result.execution_mode == "single-agent"
+
+
+def test_ai_routing_can_force_multi_agent_review(config, monkeypatch):
+    """AI routing should be able to override a single-agent planner candidate."""
+    _mock_profile(monkeypatch, categories=["systems-tooling"])
+    config.auto_collaboration["ai_routing"] = {
+        "enabled": True,
+        "provider": "current",
+        "timeout": 3,
+    }
+
+    def fake_run(*_args, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"execution_mode":"multi-agent","intent":"documentation",'
+                '"trigger":"docs-writing","primary_agent":"codex",'
+                '"reviewer_agents":["claude"],"reason":"User asked for independent review."}'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("ai_collab.core.detector.subprocess.run", fake_run)
+
+    detector = CollaborationDetector(config)
+    result = detector.detect("扫描目录并写 md，最后让 Claude 独立审查", "codex")
+
+    assert result.need_collaboration is True
+    assert result.execution_mode == "multi-agent"
+    assert result.routing_decision_source == "ai"
+    assert result.primary == "codex"
+    assert result.reviewers == ["claude"]
+    assert {"codex", "claude"}.issubset(set(result.selected_agents))
+    assert any(step["role"] == "quality-review" for step in result.orchestration_plan)
 
 
 def test_collaboration_disabled(config):

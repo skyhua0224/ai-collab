@@ -728,6 +728,9 @@ def detect(ctx: click.Context, task: str, provider: Optional[str], output: str) 
             console.print(f"Project Categories: {', '.join(result.project_categories)}")
         if result.suggested_skills:
             console.print(f"Auto Skills: {', '.join(result.suggested_skills)}")
+        console.print(f"Routing Decision: {result.routing_decision_source}")
+        if result.routing_decision_reason:
+            console.print(f"Reason: {result.routing_decision_reason}")
     else:
         console.print("\n[yellow]Single AI can handle this task[/yellow]")
         if result.intent:
@@ -736,6 +739,9 @@ def detect(ctx: click.Context, task: str, provider: Optional[str], output: str) 
             console.print(f"Project Categories: {', '.join(result.project_categories)}")
         if result.suggested_skills:
             console.print(f"Suggested Skills: {', '.join(result.suggested_skills)}")
+        console.print(f"Routing Decision: {result.routing_decision_source}")
+        if result.routing_decision_reason:
+            console.print(f"Reason: {result.routing_decision_reason}")
 
 
 @main.command()

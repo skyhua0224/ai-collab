@@ -121,6 +121,11 @@
   "auto_collaboration": {
     "enabled": true,
     "auto_orchestration_enabled": true,
+    "ai_routing": {
+      "enabled": true,
+      "provider": "current",
+      "timeout": 20
+    },
     "default_session_preset": "auto",
     "workflow_engine": "v2",
     "controller_first": true,
