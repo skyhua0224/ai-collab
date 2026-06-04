@@ -5,12 +5,16 @@ Detects if a task needs multi-AI collaboration.
 
 from __future__ import annotations
 
+import json
 import re
+import shlex
+import subprocess
 from typing import Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
 from ai_collab.core.config import Config
+from ai_collab.core.environment import resolve_subprocess_command
 from ai_collab.core.orchestrator import OrchestrationPlanner
 from ai_collab.core.profiler import ProjectProfiler
 from ai_collab.core.workflow_v2 import (
@@ -140,6 +144,8 @@ class CollaborationResult(BaseModel):
     workflow_blueprint: Optional[str] = None
     compatibility_mode: Optional[str] = None
     responsibility_stages: List[str] = Field(default_factory=list)
+    routing_decision_source: str = "planner"
+    routing_decision_reason: Optional[str] = None
 
 
 class CollaborationDetector:
@@ -161,9 +167,12 @@ class CollaborationDetector:
         """
         auto_cfg = self.config.auto_collaboration or {}
         if not self._is_auto_collaboration_enabled(auto_cfg):
-            return CollaborationResult(need_collaboration=False)
-        if self._is_low_signal_task(task):
-            return CollaborationResult(need_collaboration=False)
+            return CollaborationResult(
+                need_collaboration=False,
+                routing_decision_source="disabled",
+                routing_decision_reason="auto collaboration is disabled",
+            )
+        low_signal_task = self._is_low_signal_task(task)
 
         profile = ProjectProfiler().detect()
         categories = list(profile.categories)
@@ -179,15 +188,59 @@ class CollaborationDetector:
             intent=None,
             trigger_name=None,
         )
-        intent = self._infer_intent(
-            orchestration_plan=seed_plan.get("orchestration_plan", []),
+        ai_decision = self._decide_route_with_ai(
+            task=task,
+            current_provider=current_provider,
             categories=categories,
+            seed_plan=seed_plan,
+            auto_cfg=auto_cfg,
         )
-        trigger, matched_patterns = self._select_trigger(
-            intent=intent,
-            categories=categories,
-            orchestration_plan=seed_plan.get("orchestration_plan", []),
+        ai_routing_enabled = self._is_ai_routing_enabled(auto_cfg)
+        routing_decision_source = "ai" if ai_decision else (
+            "planner-fallback" if ai_routing_enabled else "planner"
         )
+        routing_decision_reason = (
+            str(ai_decision.get("reason", "")).strip()
+            if ai_decision
+            else (
+                "AI routing was unavailable or returned invalid JSON; used planner rules"
+                if ai_routing_enabled
+                else "AI routing is disabled; used planner rules"
+            )
+        )
+        if not ai_decision and low_signal_task:
+            return CollaborationResult(
+                need_collaboration=False,
+                routing_decision_source=(
+                    "low-signal-fallback" if ai_routing_enabled else "low-signal"
+                ),
+                routing_decision_reason=(
+                    "AI routing did not produce a decision; task is too short or low-signal"
+                    if ai_routing_enabled
+                    else "task is too short or low-signal for orchestration"
+                ),
+            )
+
+        intent = self._normalize_ai_intent(ai_decision.get("intent")) if ai_decision else None
+        if not intent:
+            intent = self._infer_intent(
+                orchestration_plan=seed_plan.get("orchestration_plan", []),
+                categories=categories,
+            )
+
+        ai_trigger_name = (
+            self._normalize_ai_trigger_name(ai_decision.get("trigger"))
+            if ai_decision
+            else None
+        )
+        trigger = self._get_trigger_by_name(ai_trigger_name) if ai_trigger_name else None
+        matched_patterns = ["ai-routing"] if trigger and ai_decision else []
+        if not trigger:
+            trigger, matched_patterns = self._select_trigger(
+                intent=intent,
+                categories=categories,
+                orchestration_plan=seed_plan.get("orchestration_plan", []),
+            )
         resolved_session_preset = self._choose_session_preset(
             plan=seed_plan,
             trigger=trigger,
@@ -196,7 +249,8 @@ class CollaborationDetector:
             categories=categories,
         )
         plan = seed_plan
-        if intent or trigger or resolved_session_preset != str(seed_plan.get("session_preset", "")).strip():
+        seed_session_preset = str(seed_plan.get("session_preset", "")).strip()
+        if intent or trigger or resolved_session_preset != seed_session_preset:
             refined = planner.build_plan(
                 task=task,
                 current_provider=current_provider,
@@ -206,7 +260,22 @@ class CollaborationDetector:
             )
             if refined.get("orchestration_plan"):
                 plan = refined
-        if trigger and self._should_promote_to_fullstack(trigger=trigger, orchestration_plan=plan.get("orchestration_plan", [])):
+        if ai_decision and ai_decision.get("execution_mode") == "single-agent":
+            plan = self._collapse_to_single_agent_plan(
+                plan=plan,
+                current_provider=current_provider,
+            )
+        elif ai_decision and ai_decision.get("execution_mode") == "multi-agent":
+            plan = self._ensure_multi_agent_plan(
+                plan=plan,
+                decision=ai_decision,
+                trigger=trigger,
+                current_provider=current_provider,
+            )
+        if trigger and self._should_promote_to_fullstack(
+            trigger=trigger,
+            orchestration_plan=plan.get("orchestration_plan", []),
+        ):
             promoted = self._get_trigger_by_name("fullstack-superapp")
             if promoted:
                 trigger = promoted
@@ -227,6 +296,13 @@ class CollaborationDetector:
                     )
                     if promoted_plan.get("orchestration_plan"):
                         plan = promoted_plan
+                if ai_decision and ai_decision.get("execution_mode") == "multi-agent":
+                    plan = self._ensure_multi_agent_plan(
+                        plan=plan,
+                        decision=ai_decision,
+                        trigger=trigger,
+                        current_provider=current_provider,
+                    )
 
         planner_first = bool(auto_cfg.get("planner_first", True))
         if planner_first and self._is_planner_multi_agent(plan):
@@ -248,23 +324,41 @@ class CollaborationDetector:
                 categories=categories,
             )
             primary_from_plan = self._plan_primary_agent(plan, current_provider)
-            primary = (
-                str(selected_trigger.get("primary", primary_from_plan)).strip()
-                if selected_trigger
-                else primary_from_plan
-            )
-            reviewers = (
-                [str(item) for item in selected_trigger.get("reviewers", [])]
-                if selected_trigger and selected_trigger.get("reviewers")
-                else [item for item in plan.get("selected_agents", []) if item != primary]
-            )
+            ai_primary = str(ai_decision.get("primary_agent", "")).strip() if ai_decision else ""
+            ai_reviewers = [
+                str(item).strip()
+                for item in (ai_decision.get("reviewer_agents", []) if ai_decision else [])
+                if str(item).strip()
+            ]
+            if ai_primary:
+                primary = ai_primary
+            elif selected_trigger:
+                primary = str(selected_trigger.get("primary", primary_from_plan)).strip()
+            else:
+                primary = primary_from_plan
+
+            if ai_reviewers:
+                reviewers = ai_reviewers
+            elif selected_trigger and selected_trigger.get("reviewers"):
+                reviewers = [str(item) for item in selected_trigger.get("reviewers", [])]
+            else:
+                reviewers = [item for item in plan.get("selected_agents", []) if item != primary]
 
             return CollaborationResult(
                 need_collaboration=bool(route_meta["workflow_blueprint"] or route_meta["workflow"]),
-                trigger=selected_trigger.get("name", "planner-derived") if selected_trigger else "planner-derived",
-                description=selected_trigger.get("description", "Planner-derived multi-agent orchestration")
-                if selected_trigger
-                else "Planner-derived multi-agent orchestration",
+                trigger=(
+                    selected_trigger.get("name", "planner-derived")
+                    if selected_trigger
+                    else "planner-derived"
+                ),
+                description=(
+                    selected_trigger.get(
+                        "description",
+                        "Planner-derived multi-agent orchestration",
+                    )
+                    if selected_trigger
+                    else "Planner-derived multi-agent orchestration"
+                ),
                 primary=primary,
                 reviewers=reviewers,
                 workflow=route_meta["workflow"],
@@ -272,7 +366,10 @@ class CollaborationDetector:
                 intent=intent,
                 matched_patterns=matched_patterns,
                 project_categories=categories,
-                suggested_skills=self._suggest_skills(selected_trigger.get("name") if selected_trigger else None, categories),
+                suggested_skills=self._suggest_skills(
+                    selected_trigger.get("name") if selected_trigger else None,
+                    categories,
+                ),
                 available_agents=plan.get("available_agents", []),
                 orchestration_plan=plan.get("orchestration_plan", []),
                 selected_agents=plan.get("selected_agents", []),
@@ -282,6 +379,8 @@ class CollaborationDetector:
                 workflow_blueprint=route_meta["workflow_blueprint"],
                 compatibility_mode=route_meta["compatibility_mode"],
                 responsibility_stages=list(route_meta["responsibility_stages"]),
+                routing_decision_source=routing_decision_source,
+                routing_decision_reason=routing_decision_reason,
             )
 
         if not trigger:
@@ -324,6 +423,8 @@ class CollaborationDetector:
                 workflow_blueprint=route_meta["workflow_blueprint"],
                 compatibility_mode=route_meta["compatibility_mode"],
                 responsibility_stages=list(route_meta["responsibility_stages"]),
+                routing_decision_source=routing_decision_source,
+                routing_decision_reason=routing_decision_reason,
             )
 
         if not trigger:
@@ -348,6 +449,8 @@ class CollaborationDetector:
                 workflow_blueprint=route_meta["workflow_blueprint"],
                 compatibility_mode=route_meta["compatibility_mode"],
                 responsibility_stages=list(route_meta["responsibility_stages"]),
+                routing_decision_source=routing_decision_source,
+                routing_decision_reason=routing_decision_reason,
             )
 
         if not self._is_planner_multi_agent(plan):
@@ -374,6 +477,8 @@ class CollaborationDetector:
                 workflow_blueprint=route_meta["workflow_blueprint"],
                 compatibility_mode=route_meta["compatibility_mode"],
                 responsibility_stages=list(route_meta["responsibility_stages"]),
+                routing_decision_source=routing_decision_source,
+                routing_decision_reason=routing_decision_reason,
             )
 
         route_meta = self._resolve_route_metadata(
@@ -388,8 +493,16 @@ class CollaborationDetector:
             need_collaboration=True,
             trigger=trigger.get("name", ""),
             description=trigger.get("description", ""),
-            primary=trigger.get("primary", current_provider),
-            reviewers=trigger.get("reviewers", []),
+            primary=(
+                str(ai_decision.get("primary_agent", "")).strip()
+                if ai_decision and ai_decision.get("primary_agent")
+                else trigger.get("primary", current_provider)
+            ),
+            reviewers=[
+                str(item).strip()
+                for item in (ai_decision.get("reviewer_agents", []) if ai_decision else [])
+                if str(item).strip()
+            ] or trigger.get("reviewers", []),
             workflow=route_meta["workflow"],
             consensus_threshold=auto_cfg.get("consensus_threshold", 0.75),
             intent=intent,
@@ -405,7 +518,366 @@ class CollaborationDetector:
             workflow_blueprint=route_meta["workflow_blueprint"],
             compatibility_mode=route_meta["compatibility_mode"],
             responsibility_stages=list(route_meta["responsibility_stages"]),
+            routing_decision_source=routing_decision_source,
+            routing_decision_reason=routing_decision_reason,
         )
+
+    def _is_ai_routing_enabled(self, auto_cfg: Dict) -> bool:
+        ai_cfg = auto_cfg.get("ai_routing", {})
+        if not isinstance(ai_cfg, dict):
+            return False
+        return bool(ai_cfg.get("enabled", False))
+
+    def _decide_route_with_ai(
+        self,
+        *,
+        task: str,
+        current_provider: str,
+        categories: List[str],
+        seed_plan: Dict[str, object],
+        auto_cfg: Dict,
+    ) -> Optional[Dict[str, object]]:
+        if not self._is_ai_routing_enabled(auto_cfg):
+            return None
+
+        prompt = self._build_ai_route_prompt(
+            task=task,
+            current_provider=current_provider,
+            categories=categories,
+            seed_plan=seed_plan,
+        )
+        ai_cfg = auto_cfg.get("ai_routing", {})
+        provider_name = str(ai_cfg.get("provider", "current")).strip() or "current"
+        if provider_name == "current":
+            provider_name = current_provider
+
+        provider = self.config.providers.get(provider_name)
+        if not provider or not provider.enabled or not provider.cli:
+            return None
+
+        timeout = self._ai_route_timeout(ai_cfg)
+        try:
+            parts = shlex.split(provider.cli)
+        except ValueError:
+            parts = provider.cli.strip().split()
+        if not parts:
+            return None
+
+        command = resolve_subprocess_command(parts) + [prompt]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except Exception:
+            return None
+
+        if completed.returncode != 0:
+            return None
+        payload = self._parse_ai_route_json(completed.stdout or completed.stderr or "")
+        if not payload:
+            return None
+        return self._normalize_ai_route_decision(payload, seed_plan=seed_plan)
+
+    def _ai_route_timeout(self, ai_cfg: Dict) -> int:
+        try:
+            timeout = int(ai_cfg.get("timeout", 20))
+        except (TypeError, ValueError):
+            timeout = 20
+        return max(3, min(timeout, 120))
+
+    def _build_ai_route_prompt(
+        self,
+        *,
+        task: str,
+        current_provider: str,
+        categories: List[str],
+        seed_plan: Dict[str, object],
+    ) -> str:
+        trigger_names = [
+            str(item.get("name"))
+            for item in self.config.auto_collaboration.get("triggers", [])
+            if isinstance(item, dict) and item.get("name")
+        ]
+        available_agents = [
+            {
+                "agent": item.get("agent", ""),
+                "strengths": item.get("strengths", ""),
+            }
+            for item in seed_plan.get("available_agents", [])
+            if isinstance(item, dict)
+        ]
+        planner_steps = [
+            {
+                "role": item.get("role", ""),
+                "agent": item.get("agent", ""),
+                "reason": item.get("reason", ""),
+            }
+            for item in seed_plan.get("orchestration_plan", [])
+            if isinstance(item, dict)
+        ]
+        context = {
+            "task": task,
+            "current_provider": current_provider,
+            "project_categories": categories,
+            "available_agents": available_agents,
+            "candidate_triggers": trigger_names,
+            "planner_candidate": {
+                "mode": seed_plan.get("mode", "single-agent"),
+                "selected_agents": seed_plan.get("selected_agents", []),
+                "steps": planner_steps,
+            },
+        }
+        return (
+            "You are the routing judge for a terminal multi-agent coding orchestrator.\n"
+            "Decide whether this task should run as single-agent or multi-agent.\n"
+            "Return only one compact JSON object and no markdown.\n\n"
+            "Rules:\n"
+            "- Choose multi-agent when the user explicitly asks for multi-agent, an independent "
+            "reviewer, cross-model review, parallel specialist work, or complex work.\n"
+            "- Choose single-agent for bounded scanning, reporting, simple edits, simple docs, "
+            "or ordinary self-review that one controller can finish safely.\n"
+            "- If multi-agent, choose a primary_agent and at least one reviewer_agents entry "
+            "from available_agents.\n"
+            "- Use trigger only from candidate_triggers when one clearly fits; else null.\n"
+            "- intent must be one of: design, architecture, implementation, debug, security, "
+            "research, testing, documentation, gameplay, or null.\n\n"
+            "JSON schema:\n"
+            '{"execution_mode":"single-agent|multi-agent","intent":"...|null","trigger":"...|null",'
+            '"primary_agent":"...|null","reviewer_agents":["..."],"reason":"short reason"}\n\n'
+            f"Context:\n{json.dumps(context, ensure_ascii=False)}"
+        )
+
+    def _parse_ai_route_json(self, text: str) -> Optional[Dict[str, object]]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+            return value if isinstance(value, dict) else None
+        except json.JSONDecodeError:
+            pass
+
+        start = raw.find("{")
+        while start >= 0:
+            depth = 0
+            for index in range(start, len(raw)):
+                char = raw[index]
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = raw[start : index + 1]
+                        try:
+                            value = json.loads(candidate)
+                        except json.JSONDecodeError:
+                            break
+                        return value if isinstance(value, dict) else None
+            start = raw.find("{", start + 1)
+        return None
+
+    def _normalize_ai_route_decision(
+        self,
+        payload: Dict[str, object],
+        *,
+        seed_plan: Dict[str, object],
+    ) -> Optional[Dict[str, object]]:
+        mode = str(payload.get("execution_mode", "")).strip().lower()
+        if mode in {"single", "single_agent", "single agent"}:
+            mode = "single-agent"
+        if mode in {"multi", "multi_agent", "multi agent"}:
+            mode = "multi-agent"
+        if mode not in {"single-agent", "multi-agent"}:
+            return None
+
+        available_agents = {
+            str(item.get("agent", "")).strip()
+            for item in seed_plan.get("available_agents", [])
+            if isinstance(item, dict) and str(item.get("agent", "")).strip()
+        }
+        primary = str(payload.get("primary_agent") or "").strip()
+        if primary and primary not in available_agents:
+            primary = ""
+
+        reviewers: List[str] = []
+        raw_reviewers = payload.get("reviewer_agents", [])
+        if isinstance(raw_reviewers, list):
+            for item in raw_reviewers:
+                name = str(item or "").strip()
+                if name in available_agents and name != primary and name not in reviewers:
+                    reviewers.append(name)
+
+        return {
+            "execution_mode": mode,
+            "intent": self._normalize_ai_intent(payload.get("intent")),
+            "trigger": self._normalize_ai_trigger_name(payload.get("trigger")),
+            "primary_agent": primary,
+            "reviewer_agents": reviewers,
+            "reason": str(payload.get("reason") or "").strip(),
+        }
+
+    def _normalize_ai_intent(self, value: object) -> Optional[str]:
+        intent = str(value or "").strip().lower()
+        if intent in {"", "none", "null"}:
+            return None
+        allowed = {
+            "design",
+            "architecture",
+            "implementation",
+            "debug",
+            "security",
+            "research",
+            "testing",
+            "documentation",
+            "gameplay",
+        }
+        return intent if intent in allowed else None
+
+    def _normalize_ai_trigger_name(self, value: object) -> Optional[str]:
+        trigger_name = str(value or "").strip()
+        if trigger_name.lower() in {"", "none", "null"}:
+            return None
+        return trigger_name if self._get_trigger_by_name(trigger_name) else None
+
+    def _collapse_to_single_agent_plan(
+        self,
+        *,
+        plan: Dict[str, object],
+        current_provider: str,
+    ) -> Dict[str, object]:
+        available = {
+            str(item.get("agent", "")): item
+            for item in plan.get("available_agents", [])
+            if isinstance(item, dict) and item.get("agent")
+        }
+        agent = (
+            current_provider
+            if current_provider in available
+            else next(iter(available), current_provider)
+        )
+        available_item = available.get(agent, {})
+        collapsed = dict(plan)
+        collapsed["mode"] = "single-agent"
+        collapsed["selected_agents"] = [agent] if agent else []
+        collapsed["orchestration_plan"] = [
+            {
+                "role": "implementation",
+                "agent": agent,
+                "selected_model": str(available_item.get("selected_model", "")),
+                "selected_cli": str(available_item.get("selected_cli", "")),
+                "profile": str(available_item.get("model_profile", "default")),
+                "reason": "ai-routing",
+            }
+        ] if agent else []
+        return collapsed
+
+    def _ensure_multi_agent_plan(
+        self,
+        *,
+        plan: Dict[str, object],
+        decision: Dict[str, object],
+        trigger: Optional[Dict],
+        current_provider: str,
+    ) -> Dict[str, object]:
+        if self._is_planner_multi_agent(plan):
+            return plan
+
+        available = [
+            item for item in plan.get("available_agents", [])
+            if isinstance(item, dict) and item.get("agent")
+        ]
+        available_by_agent = {str(item.get("agent")): item for item in available}
+        if len(available_by_agent) < 2:
+            return plan
+
+        steps = [
+            dict(item) for item in plan.get("orchestration_plan", [])
+            if isinstance(item, dict)
+        ]
+        primary = str(decision.get("primary_agent") or "").strip()
+        if not primary:
+            primary = self._plan_primary_agent(plan, current_provider)
+        if primary not in available_by_agent:
+            primary = (
+                current_provider
+                if current_provider in available_by_agent
+                else next(iter(available_by_agent))
+            )
+
+        reviewer = self._choose_ai_reviewer(
+            decision=decision,
+            trigger=trigger,
+            primary=primary,
+            available_agents=set(available_by_agent),
+        )
+        if not reviewer:
+            return plan
+
+        if not steps:
+            primary_item = available_by_agent.get(primary, {})
+            steps.append(
+                {
+                    "role": "implementation",
+                    "agent": primary,
+                    "selected_model": str(primary_item.get("selected_model", "")),
+                    "selected_cli": str(primary_item.get("selected_cli", "")),
+                    "profile": str(primary_item.get("model_profile", "default")),
+                    "reason": "ai-routing",
+                }
+            )
+
+        reviewer_item = available_by_agent.get(reviewer, {})
+        steps.append(
+            {
+                "role": "quality-review",
+                "agent": reviewer,
+                "selected_model": str(reviewer_item.get("selected_model", "")),
+                "selected_cli": str(reviewer_item.get("selected_cli", "")),
+                "profile": str(reviewer_item.get("model_profile", "default")),
+                "reason": "ai-routing",
+            }
+        )
+
+        selected_agents: List[str] = []
+        for step in steps:
+            agent = str(step.get("agent", "")).strip()
+            if agent and agent not in selected_agents:
+                selected_agents.append(agent)
+
+        updated = dict(plan)
+        updated["mode"] = "multi-agent" if len(selected_agents) > 1 else "single-agent"
+        updated["selected_agents"] = selected_agents
+        updated["orchestration_plan"] = steps
+        return updated
+
+    def _choose_ai_reviewer(
+        self,
+        *,
+        decision: Dict[str, object],
+        trigger: Optional[Dict],
+        primary: str,
+        available_agents: set[str],
+    ) -> str:
+        for item in decision.get("reviewer_agents", []):
+            name = str(item).strip()
+            if name in available_agents and name != primary:
+                return name
+        if trigger:
+            for item in trigger.get("reviewers", []):
+                name = str(item).strip()
+                if name in available_agents and name != primary:
+                    return name
+        for preferred in ("claude", "gemini", "codex"):
+            if preferred in available_agents and preferred != primary:
+                return preferred
+        for name in sorted(available_agents):
+            if name != primary:
+                return name
+        return ""
 
     def _is_auto_collaboration_enabled(self, auto_cfg: Dict) -> bool:
         if "enabled" in auto_cfg:
