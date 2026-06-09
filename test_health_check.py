@@ -7,7 +7,7 @@ import subprocess
 from ai_collab.core.config import Config
 from ai_collab.core.environment import resolve_executable
 
-def test_health_check(provider: str):
+def test_health_check(provider: str = "codex"):
     """测试单个 provider 的健康检查"""
     config = Config.load()
     provider_config = config.providers.get(provider)

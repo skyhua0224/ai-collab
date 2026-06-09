@@ -97,6 +97,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.local
+.env.*.local
 .venv
 env/
 venv/
@@ -135,6 +137,16 @@ dmypy.json
 # Project specific
 *.bak
 *.tmp
+
+# Web frontend
+node_modules/
+web/node_modules/
+web/dist/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # Local runtime/workspace artifacts
 .ai-collab/

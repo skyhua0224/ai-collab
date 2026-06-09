@@ -902,14 +902,22 @@ def _provider_rich_style(provider: str | None, *, bold: bool = False) -> str:
 
 
 def _configured_model_label(config: Config, provider: str) -> str:
+    provider_key = str(provider or "").strip().lower()
+    if provider_key == "codex":
+        provider_config = config.providers.get(provider_key)
+        models = provider_config.models if provider_config is not None else {}
+        default_model = str(models.get("default_model", "")).strip()
+        if default_model:
+            return default_model
+
     try:
-        selection = ModelSelector(config).select_model(provider, "", "default")
+        selection = ModelSelector(config).select_model(provider_key, "", "default")
     except Exception:  # noqa: BLE001
         return ""
     model = str(selection.model or "").strip()
     if not model:
         return ""
-    if provider == "codex" and str(selection.thinking or "").strip():
+    if provider_key == "codex" and str(selection.thinking or "").strip():
         return f"{model} · {selection.thinking}"
     return model
 
