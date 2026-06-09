@@ -80,6 +80,69 @@ SMALL_BOUNDED_TASK_CUES = (
     "注释",
 )
 
+GAMEPLAY_MULTI_AGENT_CUES = (
+    "snake",
+    "贪吃蛇",
+    "小游戏",
+    "游戏",
+    "game",
+    "canvas",
+    "pygame",
+    "phaser",
+    "pixi",
+    "碰撞",
+    "键盘控制",
+    "交互动画",
+    "scoreboard",
+    "game loop",
+)
+
+COMPLETE_DELIVERY_CUES = (
+    "完整",
+    "完整实现",
+    "完整交付",
+    "完整流程",
+    "端到端",
+    "end-to-end",
+    "e2e",
+    "从零",
+    "从0",
+    "一整套",
+    "设计 制作 测试",
+    "设计、制作、测试",
+    "design build test",
+)
+
+COMPLETE_DELIVERY_ARTIFACT_CUES = (
+    "系统",
+    "应用",
+    "平台",
+    "网站",
+    "web app",
+    "app",
+    "后台",
+    "管理端",
+    "dashboard",
+    "控制台",
+    "工作台",
+)
+
+COMPLETE_DELIVERY_ACTION_CUES = (
+    "完成",
+    "做",
+    "实现",
+    "开发",
+    "制作",
+    "生成",
+    "搭建",
+    "build",
+    "make",
+    "create",
+    "implement",
+    "develop",
+    "ship",
+)
+
 
 class OrchestrationPlanner:
     """Builds controller-visible agent roster and role assignments."""
@@ -201,6 +264,8 @@ class OrchestrationPlanner:
     ) -> List[str]:
         roles: List[str] = []
         small_bounded_task = self._is_small_bounded_task(task)
+        gameplay_task = self._is_gameplay_multi_agent_task(task)
+        complete_delivery_task = self._is_complete_delivery_task(task)
         enabled_agents = {item.get("agent", "") for item in available_agents if item.get("agent")}
         configured_defaults = self._configured_default_roles(enabled_agents=enabled_agents)
 
@@ -217,13 +282,19 @@ class OrchestrationPlanner:
             roles.extend(["ecosystem-research", "tech-selection", "quality-review"])
         elif trigger_name == "testing":
             roles.extend(["implementation", "testing", "quality-review"])
+        elif trigger_name == "game-dev":
+            roles.extend(["tech-selection", "implementation", "quality-review"])
         else:
             if intent == "research":
                 roles.append("ecosystem-research")
             if intent == "architecture":
                 roles.append("tech-selection")
+            if (gameplay_task or complete_delivery_task) and intent not in {"debug", "testing", "security"}:
+                roles.append("tech-selection")
             roles.append("implementation")
-            if intent in {"implementation", "debug", "testing", "security"} and not small_bounded_task:
+            if gameplay_task or complete_delivery_task:
+                roles.append("quality-review")
+            elif intent in {"implementation", "debug", "testing", "security"} and not small_bounded_task:
                 roles.append("quality-review")
 
         if not roles:
@@ -237,7 +308,7 @@ class OrchestrationPlanner:
             "implementation" in roles
             and "quality-review" not in roles
             and len(enabled_agents) > 1
-            and not small_bounded_task
+            and (not small_bounded_task or gameplay_task or complete_delivery_task)
         ):
             roles.append("quality-review")
 
@@ -267,6 +338,29 @@ class OrchestrationPlanner:
         if ascii_tokens and len(ascii_tokens) <= 2 and len(lower) <= 12:
             return True
         return False
+
+    def _is_gameplay_multi_agent_task(self, task: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(task or "").strip())
+        if not normalized:
+            return False
+        lower = normalized.lower()
+        if any(cue in lower for cue in GAMEPLAY_MULTI_AGENT_CUES):
+            return True
+        return False
+
+    def _is_complete_delivery_task(self, task: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(task or "").strip())
+        if not normalized:
+            return False
+        lower = normalized.lower()
+        if any(cue in lower for cue in ("小改", "微调", "小功能", "修复", "fix ", "typo", "rename")):
+            return False
+        has_action = any(cue in lower for cue in COMPLETE_DELIVERY_ACTION_CUES)
+        has_artifact = any(cue in lower for cue in COMPLETE_DELIVERY_ARTIFACT_CUES)
+        has_complete_scope = any(cue in lower for cue in COMPLETE_DELIVERY_CUES)
+        if has_complete_scope and (has_action or has_artifact):
+            return True
+        return has_action and has_artifact and not self._is_small_bounded_task(task)
 
     def _configured_default_roles(self, *, enabled_agents: Set[str]) -> List[str]:
         auto_cfg = self.config.auto_collaboration or {}

@@ -36,6 +36,20 @@ TEXT = {
         "task_help": "Edit the task in the main editor. Use the command bar for `/plan`, `/nano`, `/vim`, `/back`.",
         "planning_title": "Step 4 · Planning",
         "planning_help": "The controller is being asked for structured JSON. No implicit fallback is allowed.",
+        "planning_summary_title": "Planning request",
+        "planning_status_title": "Status",
+        "planning_events_title": "Recent events",
+        "planning_task_label": "Task",
+        "planning_workspace_label": "Workspace",
+        "planning_controller_label": "Controller",
+        "planning_elapsed_label": "Elapsed",
+        "planning_steps_label": "Planned steps",
+        "planning_next_label": "Next",
+        "planning_stage_prepare": "Preparing prompt",
+        "planning_stage_call": "Calling controller",
+        "planning_stage_wait": "Waiting for structured plan",
+        "planning_stage_done": "Plan received",
+        "planning_escape_hint": "Esc returns to the task screen after planning finishes. Ctrl-C exits immediately.",
         "review_title": "Step 5 · Review Plan",
         "review_help": "Use Up/Down to select steps. Use `/title`, `/done`, `/eta`, `/agent`, `/create`, `/delete`, `/send`.",
         "error_title": "Step 4 · Planning Failed",
@@ -101,6 +115,20 @@ TEXT = {
         "task_help": "在主编辑区编写任务。底部命令栏用于 `/plan`、`/nano`、`/vim`、`/back`。",
         "planning_title": "第 4 步 · 主控规划",
         "planning_help": "正在请求主控返回结构化 JSON。不会发生隐式 fallback。",
+        "planning_summary_title": "本次规划请求",
+        "planning_status_title": "当前状态",
+        "planning_events_title": "最近事件",
+        "planning_task_label": "任务",
+        "planning_workspace_label": "工作目录",
+        "planning_controller_label": "主控",
+        "planning_elapsed_label": "耗时",
+        "planning_steps_label": "计划步骤数",
+        "planning_next_label": "下一步",
+        "planning_stage_prepare": "准备提示词",
+        "planning_stage_call": "调用主控",
+        "planning_stage_wait": "等待结构化计划返回",
+        "planning_stage_done": "已收到计划",
+        "planning_escape_hint": "规划完成后可用 Esc 返回任务页。Ctrl-C 会立即退出。",
         "review_title": "第 5 步 · 检查计划",
         "review_help": "上下键选择步骤。使用 `/title`、`/done`、`/eta`、`/agent`、`/create`、`/delete`、`/send`。",
         "error_title": "第 4 步 · 规划失败",
@@ -665,6 +693,60 @@ def build_review_list_lines(items: Sequence[LabPlanItem], selected_index: int, w
         if index != len(items) - 1:
             result.append("")
     return result
+
+
+def build_planning_panel_lines(
+    *,
+    task: str,
+    workspace: Path,
+    controller: str,
+    planner_mode: str,
+    lang: str,
+    width: int,
+    elapsed_seconds: float,
+    log_lines: Sequence[str],
+    plan_count: int = 0,
+) -> list[str]:
+    runtime_lang = resolve_v3_language(lang)
+    safe_width = max(36, int(width))
+    elapsed = max(0.0, float(elapsed_seconds))
+    spinner = SPINNER_FRAMES[int(elapsed * 8) % len(SPINNER_FRAMES)] if elapsed > 0 else "•"
+    task_preview = _task_preview(task)
+    planner_label = TEXT[runtime_lang]["planner_live"] if planner_mode == "live" else TEXT[runtime_lang]["planner_mock"]
+    if plan_count > 0:
+        stage = TEXT[runtime_lang]["planning_stage_done"]
+        next_step = TEXT[runtime_lang]["planning_ready"]
+    elif len(log_lines) >= 2:
+        stage = TEXT[runtime_lang]["planning_stage_wait"]
+        next_step = TEXT[runtime_lang]["planning_escape_hint"]
+    elif log_lines:
+        stage = TEXT[runtime_lang]["planning_stage_call"]
+        next_step = TEXT[runtime_lang]["planning_stage_wait"]
+    else:
+        stage = TEXT[runtime_lang]["planning_stage_prepare"]
+        next_step = TEXT[runtime_lang]["planning_stage_call"]
+
+    lines = [
+        TEXT[runtime_lang]["planning_help"],
+        "",
+        f"[{TEXT[runtime_lang]['planning_summary_title']}]",
+        _fit_width(f"{TEXT[runtime_lang]['planning_task_label']}: {task_preview}", safe_width),
+        _fit_width(f"{TEXT[runtime_lang]['planning_workspace_label']}: {Path(workspace).expanduser().resolve()}", safe_width),
+        _fit_width(f"{TEXT[runtime_lang]['planning_controller_label']}: {_agent_label(controller, runtime_lang)}  ·  {planner_label}", safe_width),
+        "",
+        f"[{TEXT[runtime_lang]['planning_status_title']}]",
+        _fit_width(f"{spinner} {stage}", safe_width),
+        _fit_width(f"{TEXT[runtime_lang]['planning_elapsed_label']}: {elapsed:.1f}s", safe_width),
+        _fit_width(f"{TEXT[runtime_lang]['planning_steps_label']}: {plan_count if plan_count > 0 else '-'}", safe_width),
+        _fit_width(f"{TEXT[runtime_lang]['planning_next_label']}: {next_step}", safe_width),
+        "",
+        f"[{TEXT[runtime_lang]['planning_events_title']}]",
+    ]
+    if log_lines:
+        lines.extend(_fit_width(f"• {line}", safe_width) for line in log_lines[-8:])
+    else:
+        lines.append(_fit_width(f"• {TEXT[runtime_lang]['planning_stage_prepare']}", safe_width))
+    return lines
 
 
 def build_command_bar_state(screen: str, lang: str, raw: str = "") -> CommandBarState:
@@ -1924,14 +2006,26 @@ class _UxLabV3PromptToolkitApp:
         ]
 
     def _planning_fragments(self) -> list[tuple[str, str]]:
+        width = shutil.get_terminal_size((100, 40)).columns
         elapsed = max(0.0, time.monotonic() - self.planning_started_at)
-        spinner = SPINNER_FRAMES[int(elapsed * 8) % len(SPINNER_FRAMES)]
-        fragments: list[tuple[str, str]] = [
-            ("class:muted", self._t("planning_help") + "\n\n"),
-            ("class:status", f"{spinner} {self._planner_notice()} · {elapsed:.1f}s\n\n"),
-        ]
-        for line in self.planning_log[-8:]:
-            fragments.append(("class:hint", f"• {line}\n"))
+        fragments: list[tuple[str, str]] = []
+        for index, line in enumerate(
+            build_planning_panel_lines(
+                task=self.task_value,
+                workspace=self.workspace,
+                controller=self.controller,
+                planner_mode=self.planner_mode,
+                lang=self.lang,
+                width=max(36, width - 6),
+                elapsed_seconds=elapsed,
+                log_lines=self.planning_log,
+                plan_count=len(self.plan),
+            )
+        ):
+            style = "class:muted" if index == 0 else "class:hint"
+            if line.startswith("["):
+                style = "class:status"
+            fragments.append((style, f"{line}\n"))
         return fragments
 
     def _review_list_fragments(self) -> list[tuple[str, str]]:

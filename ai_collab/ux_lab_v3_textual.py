@@ -37,6 +37,7 @@ from ai_collab.ux_lab_v3 import (
     build_workspace_preview_lines,
     build_workspace_session_lines,
     build_mock_plan_v3,
+    build_planning_panel_lines,
     build_review_list_lines,
     build_step_track,
     choose_review_layout,
@@ -606,6 +607,7 @@ class UxLabV3TextualApp(App[UxLabV3Result]):
             planner_mode=self.planner_mode,
             plan=[],
         )
+        self._planning_timer = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="brand")
@@ -671,6 +673,7 @@ class UxLabV3TextualApp(App[UxLabV3Result]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._planning_timer = self.set_interval(0.15, self._tick_planning_panel, pause=False)
         self.query_one("#task-editor", TextArea).load_text(self.task_value)
         self._refresh_all()
         self._focus_workspace_mode()
@@ -1071,10 +1074,24 @@ class UxLabV3TextualApp(App[UxLabV3Result]):
 
     def _refresh_planning_panel(self) -> None:
         elapsed = max(0.0, time.monotonic() - self.planning_started_at)
-        spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(elapsed * 8) % 10] if self.planning_started_at else "•"
-        lines = [self._t("planning_help"), "", f"{spinner} {self._planner_notice()} · {elapsed:.1f}s", ""]
-        lines.extend(f"• {line}" for line in self.planning_log[-8:])
-        self.query_one("#planning-log", Static).update("\n".join(lines))
+        widget = self.query_one("#planning-log", Static)
+        content_width = max(36, widget.region.width - 2 if widget.region.width else self.size.width - 8)
+        lines = build_planning_panel_lines(
+            task=self.task_value,
+            workspace=self.workspace,
+            controller=self.controller,
+            planner_mode=self.planner_mode,
+            lang=self.lang,
+            width=content_width,
+            elapsed_seconds=elapsed,
+            log_lines=self.planning_log,
+            plan_count=len(self.plan),
+        )
+        widget.update("\n".join(lines))
+
+    def _tick_planning_panel(self) -> None:
+        if self.screen_name == "planning" and self.planning_started_at:
+            self._refresh_planning_panel()
 
     def _refresh_review_layout(self) -> None:
         container = self.query_one("#review-main", Horizontal)

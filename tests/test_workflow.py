@@ -514,3 +514,43 @@ def test_live_stream_renderer_collapses_multiline_code_dump() -> None:
     assert "manager = WorkflowManager(config)" not in output
     assert "[verbose code/search output suppressed: 4 lines]" in output
     assert "Collecting only the final progress update." in output
+
+
+def test_live_stream_renderer_suppresses_fenced_file_fragments() -> None:
+    buffer = StringIO()
+    renderer = _LiveStreamRenderer(target=buffer, line_prefix="│ codex/direct │ ")
+
+    renderer.feed("Here is the relevant file fragment:\n")
+    renderer.feed("```python\n")
+    renderer.feed("def noisy_fragment():\n")
+    renderer.feed("    return 'do not print file bodies in direct mode'\n")
+    renderer.feed("```\n")
+    renderer.feed("STEP_DONE: S1 concise implementation summary\n")
+    renderer.finish()
+
+    output = buffer.getvalue()
+
+    assert "Here is the relevant file fragment:" in output
+    assert "def noisy_fragment" not in output
+    assert "do not print file bodies" not in output
+    assert "[verbose code/search output suppressed: 4 lines]" in output
+    assert "STEP_DONE: S1 concise implementation summary" in output
+
+
+def test_live_stream_renderer_suppresses_codex_tool_output_blocks() -> None:
+    buffer = StringIO()
+    renderer = _LiveStreamRenderer(target=buffer, line_prefix="│ codex/execute │ ")
+
+    renderer.feed("Ran sed -n '1,120p' ai_collab/core/workflow.py\n")
+    renderer.feed("  └ def noisy_tool_dump():\n")
+    renderer.feed("      return 'hidden source fragment'\n")
+    renderer.feed("Validated route metadata and moving to the next phase.\n")
+    renderer.finish()
+
+    output = buffer.getvalue()
+
+    assert "sed -n" not in output
+    assert "noisy_tool_dump" not in output
+    assert "hidden source fragment" not in output
+    assert "[verbose code/search output suppressed: 3 lines]" in output
+    assert "Validated route metadata and moving to the next phase." in output

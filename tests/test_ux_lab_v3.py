@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import json
+import time
 from pathlib import Path
 
 import ai_collab.cli as cli
@@ -10,6 +11,7 @@ from ai_collab.ux_lab_v3 import (
     build_brand_banner,
     build_command_bar_state,
     build_controller_cards,
+    build_planning_panel_lines,
     export_launch_bundle_v3,
     build_workspace_preview_lines,
     build_workspace_session_lines,
@@ -106,6 +108,28 @@ def test_build_workspace_preview_lines_show_children_and_metadata(tmp_path) -> N
     assert "README.md" in joined
     assert "src/" in joined
     assert "2 项" in joined
+
+
+def test_build_planning_panel_lines_show_structured_progress_sections() -> None:
+    lines = build_planning_panel_lines(
+        task="直接改 planning 页面，把日志块改成进度面板",
+        workspace=Path("/Users/skyhua/ai-collab"),
+        controller="codex",
+        planner_mode="live",
+        lang="zh-CN",
+        width=72,
+        elapsed_seconds=12.4,
+        log_lines=["正在准备主控规划提示词", "正在以非交互 JSON 模式调用主控"],
+        plan_count=0,
+    )
+
+    joined = "\n".join(lines)
+    assert "本次规划请求" in joined
+    assert "当前状态" in joined
+    assert "最近事件" in joined
+    assert "等待结构化计划返回" in joined
+    assert "12.4s" in joined
+    assert "直接改 planning 页面" in joined
 
 
 def test_load_workspace_session_records_reads_recent_runs_and_task_preview(tmp_path) -> None:
@@ -1339,6 +1363,42 @@ def test_textual_workspace_recent_empty_state_is_visible(tmp_path) -> None:
             assert recent_list.display is False
             assert empty_state.display is True
             assert "暂无最近使用的目录" in str(empty_state.render())
+
+    asyncio.run(_run())
+
+
+def test_textual_planning_screen_renders_structured_progress_panel(tmp_path) -> None:
+    import ai_collab.ux_lab_v3_textual as textual_module
+    from textual.widgets import Static
+
+    async def _run() -> None:
+        app = textual_module.UxLabV3TextualApp(
+            config=Config.create_default(),
+            cwd=tmp_path,
+            workspace=tmp_path,
+            controller="codex",
+            task="直接改 planning 页面，把日志块改成进度面板",
+            lang="zh-CN",
+            skip_review=False,
+            planner_mode="live",
+            output_bundle=None,
+        )
+        async with app.run_test(size=(120, 36)) as pilot:
+            app.screen_name = "planning"
+            app.task_value = "直接改 planning 页面，把日志块改成进度面板"
+            app.planning_started_at = time.monotonic() - 3.2
+            app.planning_log = ["正在准备主控规划提示词", "正在以非交互 JSON 模式调用主控"]
+            app._refresh_all()
+            await pilot.pause()
+
+            panel = app.query_one("#planning-log", Static)
+            rendered = str(panel.render())
+
+            assert "本次规划请求" in rendered
+            assert "当前状态" in rendered
+            assert "最近事件" in rendered
+            assert "等待结构化计划返回" in rendered
+            assert "直接改 planning 页面" in rendered
 
     asyncio.run(_run())
 

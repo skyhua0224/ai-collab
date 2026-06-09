@@ -145,6 +145,102 @@ def test_detect_implementation(config, monkeypatch):
     assert result.responsibility_stages == ["collect", "model", "plan", "execute", "validate", "correct", "deliver"]
 
 
+def test_detector_promotes_gameplay_build_task_to_multi_agent(config, monkeypatch):
+    _mock_profile(monkeypatch, categories=["systems-tooling"])
+    config.auto_collaboration["ai_routing"] = {"enabled": False}
+    detector = CollaborationDetector(config)
+
+    result = detector.detect("实现一个贪吃蛇小游戏，支持键盘控制、碰撞检测和计分板", "codex")
+
+    assert result.need_collaboration is True
+    assert result.intent == "gameplay"
+    assert result.execution_mode == "multi-agent"
+    assert result.session_preset == "design-first"
+    assert result.workflow_blueprint == "design-led-loop"
+    roles = {item["role"] for item in result.orchestration_plan}
+    assert {"tech-selection", "implementation", "quality-review"}.issubset(roles)
+
+
+def test_detector_keeps_gameplay_build_task_multi_agent_after_ai_single_agent_vote(config, monkeypatch):
+    _mock_profile(monkeypatch, categories=["systems-tooling"])
+    config.auto_collaboration["ai_routing"] = {
+        "enabled": True,
+        "provider": "current",
+        "timeout": 3,
+    }
+
+    def fake_run(*_args, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"execution_mode":"single-agent","intent":"implementation",'
+                '"trigger":null,"primary_agent":"codex","reviewer_agents":[],'
+                '"reason":"One controller can implement it."}'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("ai_collab.core.detector.subprocess.run", fake_run)
+
+    detector = CollaborationDetector(config)
+    result = detector.detect("做一个贪吃蛇小游戏，使用 canvas 渲染并支持碰撞计分", "codex")
+
+    assert result.need_collaboration is True
+    assert result.intent == "gameplay"
+    assert result.execution_mode == "multi-agent"
+    assert result.routing_decision_source == "policy-override"
+    assert {"codex", "claude"}.issubset(set(result.selected_agents))
+    assert len(result.selected_agents) >= 2
+
+
+def test_detector_promotes_complete_system_delivery_to_design_first_multi_agent(config, monkeypatch):
+    _mock_profile(monkeypatch, categories=["systems-tooling"])
+    config.auto_collaboration["ai_routing"] = {"enabled": False}
+    detector = CollaborationDetector(config)
+
+    result = detector.detect("完成一个 AI 协作管理系统，包含完整设计、制作和测试流程", "codex")
+
+    assert result.need_collaboration is True
+    assert result.intent == "implementation"
+    assert result.execution_mode == "multi-agent"
+    assert "complete-delivery" in result.project_categories
+    assert result.session_preset == "design-first"
+    assert result.workflow_blueprint == "design-led-loop"
+    roles = {item["role"] for item in result.orchestration_plan}
+    assert {"tech-selection", "implementation", "quality-review"}.issubset(roles)
+
+
+def test_detector_keeps_complete_delivery_multi_agent_after_ai_single_agent_vote(config, monkeypatch):
+    _mock_profile(monkeypatch, categories=["systems-tooling"])
+    config.auto_collaboration["ai_routing"] = {
+        "enabled": True,
+        "provider": "current",
+        "timeout": 3,
+    }
+
+    def fake_run(*_args, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"execution_mode":"single-agent","intent":"implementation",'
+                '"trigger":"implementation","primary_agent":"codex","reviewer_agents":[],'
+                '"reason":"Looks like a straightforward build."}'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("ai_collab.core.detector.subprocess.run", fake_run)
+
+    detector = CollaborationDetector(config)
+    result = detector.detect("做一个完整的后台管理系统，从设计到制作再到测试", "codex")
+
+    assert result.need_collaboration is True
+    assert result.execution_mode == "multi-agent"
+    assert result.routing_decision_source == "policy-override"
+    assert result.session_preset == "design-first"
+    assert {"codex", "claude"}.issubset(set(result.selected_agents))
+
+
 @pytest.mark.parametrize("task", ["hello", "1", "sb"])
 def test_detector_skips_low_signal_tasks(config, monkeypatch, task):
     _mock_profile(monkeypatch, categories=["systems-tooling"])

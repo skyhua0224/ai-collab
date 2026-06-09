@@ -120,6 +120,84 @@ LOW_SIGNAL_TASK_LITERALS = {
     "...",
 }
 
+GAMEPLAY_MULTI_AGENT_CUES = (
+    "snake",
+    "贪吃蛇",
+    "小游戏",
+    "game loop",
+    "canvas",
+    "pygame",
+    "phaser",
+    "pixi",
+    "collision",
+    "碰撞",
+    "keyboard control",
+    "键盘控制",
+    "scoreboard",
+    "计分",
+)
+
+GAMEPLAY_BUILD_ACTION_CUES = (
+    "build",
+    "make",
+    "create",
+    "implement",
+    "develop",
+    "做",
+    "实现",
+    "开发",
+    "制作",
+    "生成",
+    "编写",
+)
+
+COMPLETE_DELIVERY_CUES = (
+    "完整",
+    "完整的",
+    "完整实现",
+    "完整交付",
+    "完整流程",
+    "端到端",
+    "end-to-end",
+    "e2e",
+    "从零",
+    "从0",
+    "一整套",
+    "设计 制作 测试",
+    "设计、制作、测试",
+    "design build test",
+)
+
+COMPLETE_DELIVERY_ARTIFACT_CUES = (
+    "系统",
+    "应用",
+    "平台",
+    "网站",
+    "web app",
+    "app",
+    "后台",
+    "管理端",
+    "dashboard",
+    "控制台",
+    "工作台",
+)
+
+COMPLETE_DELIVERY_ACTION_CUES = (
+    "完成",
+    "做",
+    "实现",
+    "开发",
+    "制作",
+    "生成",
+    "搭建",
+    "build",
+    "make",
+    "create",
+    "implement",
+    "develop",
+    "ship",
+)
+
 
 class CollaborationResult(BaseModel):
     """Result of collaboration detection."""
@@ -173,9 +251,13 @@ class CollaborationDetector:
                 routing_decision_reason="auto collaboration is disabled",
             )
         low_signal_task = self._is_low_signal_task(task)
+        gameplay_task = self._is_gameplay_multi_agent_task(task)
+        complete_delivery_task = self._is_complete_delivery_task(task)
 
         profile = ProjectProfiler().detect()
         categories = list(profile.categories)
+        if complete_delivery_task and "complete-delivery" not in categories:
+            categories.append("complete-delivery")
         enabled_categories = auto_cfg.get("enabled_project_categories", [])
         if isinstance(enabled_categories, list) and enabled_categories:
             filtered = [item for item in categories if item in enabled_categories]
@@ -223,10 +305,14 @@ class CollaborationDetector:
 
         intent = self._normalize_ai_intent(ai_decision.get("intent")) if ai_decision else None
         if not intent:
-            intent = self._infer_intent(
+            intent = self._infer_task_intent_from_text(task) or self._infer_intent(
                 orchestration_plan=seed_plan.get("orchestration_plan", []),
                 categories=categories,
             )
+        elif gameplay_task and intent == "implementation":
+            intent = "gameplay"
+        elif complete_delivery_task and intent in {None, "design"}:
+            intent = "implementation"
 
         ai_trigger_name = (
             self._normalize_ai_trigger_name(ai_decision.get("trigger"))
@@ -261,10 +347,16 @@ class CollaborationDetector:
             if refined.get("orchestration_plan"):
                 plan = refined
         if ai_decision and ai_decision.get("execution_mode") == "single-agent":
-            plan = self._collapse_to_single_agent_plan(
-                plan=plan,
-                current_provider=current_provider,
-            )
+            if (gameplay_task or complete_delivery_task) and self._is_planner_multi_agent(plan):
+                routing_decision_source = "policy-override"
+                routing_decision_reason = (
+                    "Complete delivery tasks keep planner-derived design, build, and review stages."
+                )
+            else:
+                plan = self._collapse_to_single_agent_plan(
+                    plan=plan,
+                    current_provider=current_provider,
+                )
         elif ai_decision and ai_decision.get("execution_mode") == "multi-agent":
             plan = self._ensure_multi_agent_plan(
                 plan=plan,
@@ -638,6 +730,8 @@ class CollaborationDetector:
             "Rules:\n"
             "- Choose multi-agent when the user explicitly asks for multi-agent, an independent "
             "reviewer, cross-model review, parallel specialist work, or complex work.\n"
+            "- Choose multi-agent for interactive mini-games or playable UI demos that mix "
+            "visual behavior, state logic, and independent acceptance checking.\n"
             "- Choose single-agent for bounded scanning, reporting, simple edits, simple docs, "
             "or ordinary self-review that one controller can finish safely.\n"
             "- If multi-agent, choose a primary_agent and at least one reviewer_agents entry "
@@ -908,6 +1002,38 @@ class CollaborationDetector:
         token = ascii_tokens[0] if ascii_tokens else "".join(cjk_chars)
         return bool(token) and len(token) <= 3
 
+    def _is_gameplay_multi_agent_task(self, task: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(task or "").strip())
+        if not normalized:
+            return False
+        lower = normalized.lower()
+        if not any(cue in lower for cue in GAMEPLAY_MULTI_AGENT_CUES):
+            return False
+        if any(word in lower for word in ("fix ", "bug", "修复", "排查")):
+            return False
+        return any(cue in lower for cue in GAMEPLAY_BUILD_ACTION_CUES) or "snake" in lower or "贪吃蛇" in lower
+
+    def _is_complete_delivery_task(self, task: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(task or "").strip())
+        if not normalized:
+            return False
+        lower = normalized.lower()
+        if any(cue in lower for cue in ("小改", "微调", "小功能", "修复", "fix ", "typo", "rename")):
+            return False
+        has_action = any(cue in lower for cue in COMPLETE_DELIVERY_ACTION_CUES)
+        has_artifact = any(cue in lower for cue in COMPLETE_DELIVERY_ARTIFACT_CUES)
+        has_complete_scope = any(cue in lower for cue in COMPLETE_DELIVERY_CUES)
+        if has_complete_scope and (has_action or has_artifact):
+            return True
+        return has_action and has_artifact and not self._is_low_signal_task(task)
+
+    def _infer_task_intent_from_text(self, task: str) -> Optional[str]:
+        if self._is_gameplay_multi_agent_task(task):
+            return "gameplay"
+        if self._is_complete_delivery_task(task):
+            return "implementation"
+        return None
+
     def _is_planner_multi_agent(self, plan: Dict[str, object]) -> bool:
         mode = str(plan.get("mode", "single-agent"))
         if mode == "multi-agent":
@@ -948,7 +1074,8 @@ class CollaborationDetector:
         if explicit:
             try:
                 resolve_session_preset(explicit)
-                return explicit
+                if explicit != "auto" or "complete-delivery" not in categories:
+                    return explicit
             except KeyError:
                 pass
 
@@ -962,12 +1089,12 @@ class CollaborationDetector:
 
         if trigger_name:
             mapped = TRIGGER_SESSION_PRESET_MAP.get(trigger_name)
-            if mapped:
+            if mapped and (mapped != "auto" or "complete-delivery" not in categories):
                 return mapped
 
         if "docs-text" in categories:
             return "document-first"
-        if any(category in {"superapp-fullstack", "game-dev"} for category in categories):
+        if any(category in {"superapp-fullstack", "game-dev", "complete-delivery"} for category in categories):
             return "design-first"
 
         intent_map = {
@@ -977,6 +1104,7 @@ class CollaborationDetector:
             "debug": "debug-priority",
             "testing": "validation-first",
             "documentation": "document-first",
+            "gameplay": "design-first",
         }
         if intent:
             mapped = intent_map.get(intent)
@@ -1003,6 +1131,8 @@ class CollaborationDetector:
             categories=categories,
         )
         trigger_blueprint = self._trigger_workflow_blueprint(trigger)
+        if "complete-delivery" in categories and trigger_name == "implementation":
+            trigger_blueprint = ""
         plan_blueprint = str(plan.get("workflow_blueprint", "")).strip()
         workflow_blueprint = trigger_blueprint or plan_blueprint
 

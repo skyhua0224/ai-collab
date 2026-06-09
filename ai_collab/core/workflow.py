@@ -177,12 +177,18 @@ def _looks_like_verbose_code_line(line: str) -> bool:
     if not stripped:
         return False
     patterns = (
+        r"^```",
+        r"^(?:diff --git|index [0-9a-f]+\.\.|@@\s|---\s|\+\+\+\s|\*\*\* (?:Begin Patch|Update File|Add File|Delete File|End Patch))",
+        r"^\s*(?:\d+\s*[|:]\s*)?(?:def |class |from [\w.]+ import |import [\w.]+|return |if __name__ == \"__main__\":)",
         r"^[\w./-]+\.(?:py|md|json|toml|yaml|yml|rs|ts|tsx|js|jsx|java|kt|go|c|cc|cpp|h):\d+:",
-        r'^\s*(?:def |class |from [\w.]+ import |import [\w.]+|return |if __name__ == "__main__":)',
         r"^\s*@(?:pytest|click)\.",
         r'^\s*(?:"""|\'\'\')',
         r"^\s*(?:exec|succeeded in \d+ms:|failed in \d+ms:)$",
+        r"^\s*(?:\$|>)?\s*(?:rg|grep|sed|cat|awk|find|ls|tree|nl)\b.+",
         r"^\s*/bin/(?:zsh|bash)\s+-lc\b",
+        r'^\s*\{.*"(?:cmd|command|stdout|stderr|tool|path)"\s*:',
+        r"^\s*(?:[-*+]\s*)?(?:Ran|Read|Opened|Listed|Searched|Updated|Edited|Wrote|Executed)\s+.+",
+        r"^\s*[└├│|]\s*.+",
         r"^\s*(?:assert |raise |except |try:|with |for |while )",
         r"^\s*[A-Za-z_][\w.]*\s*=\s*.+$",
         r'^\s*["\'][^"\']+["\']\s*:\s*.+$',
@@ -203,6 +209,9 @@ def _looks_like_verbose_code_continuation(line: str) -> bool:
     if _looks_like_verbose_code_line(raw_line):
         return True
     leading_spaces = len(raw_line) - len(raw_line.lstrip(" "))
+    if re.match(r"^\s*(?:[+\-]\s*)?(?:\d+\s*[|:]\s*)?[\w.#@\"'/<>{}\[\]().,:;=-].*$", stripped):
+        if any(token in stripped for token in ("=", ":", "(", ")", "{", "}", "[", "]", ";", "<", ">", "->")):
+            return True
     if stripped[:1] in {'"', "'", "{", "}", "[", "]", "(", ")", "@", "#"}:
         return True
     if re.match(r"^[A-Za-z_][\w.]*\s*[:=].+$", stripped):
@@ -216,6 +225,32 @@ def _looks_like_verbose_code_continuation(line: str) -> bool:
     return False
 
 
+def _looks_like_live_control_line(line: str) -> bool:
+    """Keep explicit orchestration markers and short failure summaries visible."""
+    stripped = str(line or "").strip()
+    if not stripped:
+        return False
+    if re.match(
+        r"^(?:AI_COLLAB_EVENT|STEP_START|STEP_DONE|HANDOFF_TO|SPAWN_AGENT|NEED_ELEVATION|RESULT|SUBTASK_RESULT)\s*:",
+        stripped,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    if re.match(r"^===\s*(?:SUBAGENT_COMPLETE|TASK_COMPLETE)\s*===$", stripped, flags=re.IGNORECASE):
+        return True
+    if len(stripped) <= 220 and re.match(
+        r"^(?:error|fatal|failed|timeout|permission denied|command not found)\b[: -]",
+        stripped,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+def _is_markdown_fence_line(line: str) -> bool:
+    return bool(re.match(r"^\s*```", str(line or "").strip()))
+
+
 class _LiveStreamRenderer:
     """Render live provider output with optional suppression for noisy code dumps."""
 
@@ -227,6 +262,7 @@ class _LiveStreamRenderer:
         self.suppressed_lines = 0
         self.compact = bool(line_prefix) and _compact_live_output_enabled()
         self.in_verbose_block = False
+        self.in_fenced_block = False
 
     def _write_line(self, text: str, *, newline: bool) -> None:
         if self.at_line_start and self.line_prefix:
@@ -255,6 +291,24 @@ class _LiveStreamRenderer:
             raw_line = self.buffer[:newline_index]
             self.buffer = self.buffer[newline_index + 1 :]
             if self.compact:
+                if self.in_fenced_block:
+                    self.suppressed_lines += 1
+                    self.at_line_start = True
+                    if _is_markdown_fence_line(raw_line):
+                        self.in_fenced_block = False
+                        self.in_verbose_block = False
+                    continue
+                if _looks_like_live_control_line(raw_line):
+                    self.in_verbose_block = False
+                    self._flush_suppressed_summary()
+                    self._write_line(raw_line, newline=True)
+                    continue
+                if _is_markdown_fence_line(raw_line):
+                    self.suppressed_lines += 1
+                    self.at_line_start = True
+                    self.in_fenced_block = True
+                    self.in_verbose_block = True
+                    continue
                 if _looks_like_verbose_code_line(raw_line):
                     self.suppressed_lines += 1
                     self.at_line_start = True
@@ -275,7 +329,12 @@ class _LiveStreamRenderer:
         if self.buffer:
             trailing = self.buffer
             self.buffer = ""
-            if self.compact and (
+            if self.compact and self.in_fenced_block:
+                self.suppressed_lines += 1
+                if _is_markdown_fence_line(trailing):
+                    self.in_fenced_block = False
+                    self.in_verbose_block = False
+            elif self.compact and (
                 _looks_like_verbose_code_line(trailing)
                 or (self.in_verbose_block and _looks_like_verbose_code_continuation(trailing))
             ):
